@@ -1,0 +1,9 @@
+# ninja log v7
+2	131	8075240877904950	lstlib_autogen/timestamp	9ec46c0948dca25
+2	131	8075240877904950	lstlib_autogen/mocs_compilation.cpp	9ec46c0948dca25
+2	131	8075240877904950	G:/work/Qt/qml/LST/libs/lstlib/build/Desktop_Qt_6_5_3_MinGW_64_bit-Release/lstlib_autogen/timestamp	9ec46c0948dca25
+2	131	8075240877904950	G:/work/Qt/qml/LST/libs/lstlib/build/Desktop_Qt_6_5_3_MinGW_64_bit-Release/lstlib_autogen/mocs_compilation.cpp	9ec46c0948dca25
+133	203	8075240878250559	CMakeFiles/lstlib.dir/lstlib_autogen/mocs_compilation.cpp.obj	2e57e7e00e6adb9f
+135	499	8075240878280719	CMakeFiles/lstlib.dir/lstlib.cpp.obj	e9d46d79603f1431
+500	651	8075240883372040	liblstlib.dll	484b4694df1179a3
+500	651	8075240883372040	liblstlib.dll.a	484b4694df1179a3

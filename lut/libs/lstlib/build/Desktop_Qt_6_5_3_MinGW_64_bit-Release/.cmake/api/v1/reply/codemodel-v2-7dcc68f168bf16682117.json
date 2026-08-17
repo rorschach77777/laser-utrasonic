@@ -1,0 +1,78 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"jsonFile" : "directory-.-Release-d0094a50bb2071803777.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2
+					]
+				}
+			],
+			"name" : "Release",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "lstlib",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "lstlib::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-lstlib-Release-af89b7350e3dff580cc4.json",
+					"name" : "lstlib",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "lstlib_autogen::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-lstlib_autogen-Release-f8cc0b7dab13e22fe716.json",
+					"name" : "lstlib_autogen",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "lstlib_autogen_timestamp_deps::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-lstlib_autogen_timestamp_deps-Release-4aa5e49c06d353f5db92.json",
+					"name" : "lstlib_autogen_timestamp_deps",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "G:/work/Qt/qml/LST/libs/lstlib/build/Desktop_Qt_6_5_3_MinGW_64_bit-Release",
+		"source" : "G:/work/Qt/qml/LST/libs/lstlib"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 7
+	}
+}

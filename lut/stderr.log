@@ -1,0 +1,21 @@
+QML debugging is enabled. Only use this in a safe environment.
+=== APP START ===
+--- Phase 1: Creating communication layer ---
+[DIAG] DeviceComm signals (12 total):
+    [0] destroyed(QObject*)
+    [1] destroyed()
+    [2] objectNameChanged(QString)
+    [5] connectedChanged()
+    [6] slaveAddressChanged()
+    [7] commError(QString)
+    [8] responseTimeout()
+--- Phase 2: Creating controllers (DLL) ---
+>>> DIAGNOSTIC [14:00:47.736] [WARN]: QObject::connect: signal not found in DeviceComm
+    category: qt.core.qobject.connect
+--- Phase 2 done: If you see 'signal not found' ABOVE this line, it's from DLL ---
+--- Phase 3: Exposing to QML context ---
+--- Phase 4: Loading QML (QML signal bindings happen here) ---
+[14:00:48.450] [WARN]: Could not create pipeline cache lock file 'C:/Users/Administrator/AppData/Local/appLST/cache/qtpipelinecache-x86_64-little_endian-llp64/qqpc_d3d11.lck'
+--- Phase 4 done: If you see 'signal not found' BELOW phase 2 but ABOVE this line, it's from QML ---
+=== APP RUNNING ===
+[14:00:59.829] [WARN]: Could not create pipeline cache lock file 'C:/Users/Administrator/AppData/Local/appLST/cache/qtpipelinecache-x86_64-little_endian-llp64/qqpc_d3d11.lck'
