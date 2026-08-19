@@ -31,6 +31,8 @@ DataController::DataController(QObject *parent)
     , m_autoScale(true)
     , m_showOriginal(true)
     , m_savePerFrame(false)
+    , m_historyRecording(false)
+    , m_historyManager(nullptr)
     , m_waveformAiCtrl(nullptr)
     , m_scaledData(nullptr)
     , m_rawDataBufferLength(0)
@@ -330,6 +332,24 @@ void DataController::setSavePerFrame(bool enabled)
     }
 }
 
+void DataController::setHistoryRecording(bool enabled)
+{
+    qDebug() << "[DataController] setHistoryRecording called, enabled:" << enabled
+             << "current:" << m_historyRecording
+             << "historyMgr:" << (m_historyManager ? "set" : "null");
+    if (m_historyRecording != enabled) {
+        m_historyRecording = enabled;
+        emit historyRecordingChanged();
+        qDebug() << "[DataController] historyRecording changed to:" << m_historyRecording;
+    }
+}
+
+void DataController::setHistoryManager(QObject *manager)
+{
+    m_historyManager = qobject_cast<HistoryManager*>(manager);
+    qDebug() << "[DataController] setHistoryManager called, manager:" << (m_historyManager ? "valid" : "null");
+}
+
 void DataController::setTriggerSource(int index) { m_configure.triggerSourceIndex = index; }
 void DataController::setTriggerEdge(int index) { m_configure.triggerEdge = (index == 0) ? RisingEdge : FallingEdge; }
 void DataController::setDelayCount(int count) { m_configure.delayCount = count; }
@@ -499,11 +519,12 @@ void DataController::checkError(int errorCode)
 
 void DataController::startAcquisition()
 {
-    //qDebug() << "[DataController] startAcquisition() called";
+    qDebug() << "[DataController] startAcquisition() called, historyRecording:" << m_historyRecording
+             << "historyMgr:" << (m_historyManager ? "valid" : "null");
 
     WaveformAiCtrl *ctrl = static_cast<WaveformAiCtrl*>(m_waveformAiCtrl);
     if (!ctrl) {
-        //qDebug() << "[DataController] startAcquisition: m_waveformAiCtrl is null";
+        qDebug() << "[DataController] startAcquisition: m_waveformAiCtrl is null";
         return;
     }
 
@@ -514,6 +535,15 @@ void DataController::startAcquisition()
     m_running = true;
     m_paused = false;
     m_saveFrameCounter = 0;
+
+    // Start history session if recording is enabled
+    if (m_historyRecording && m_historyManager) {
+        qDebug() << "[DataController] startAcquisition: starting history session";
+        m_historyManager->startSession();
+    } else {
+        qDebug() << "[DataController] startAcquisition: NOT starting history session (recording="
+                 << m_historyRecording << "mgr=" << (m_historyManager ? "set" : "null") << ")";
+    }
 
     emit runningChanged();
     emit pausedChanged();
@@ -542,6 +572,9 @@ void DataController::pauseAcquisition()
 
 void DataController::stopAcquisition()
 {
+    qDebug() << "[DataController] stopAcquisition() called, sessionActive:"
+             << (m_historyManager ? (m_historyManager->isSessionActive() ? "true" : "false") : "no mgr");
+
     WaveformAiCtrl *ctrl = static_cast<WaveformAiCtrl*>(m_waveformAiCtrl);
     if (!ctrl) return;
 
@@ -549,6 +582,12 @@ void DataController::stopAcquisition()
     checkError(errorCode);
     m_running = false;
     m_paused = false;
+
+    // Finish history session
+    if (m_historyManager && m_historyManager->isSessionActive()) {
+        qDebug() << "[DataController] stopAcquisition: finishing history session, data count:" << m_historyManager->sessionDataCount();
+        m_historyManager->finishSession();
+    }
 
     {
         QMutexLocker locker(&m_thicknessMutex);
@@ -1207,6 +1246,16 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
             QMetaObject::invokeMethod(p, [p, thickness]() {
                 emit p->thicknessHistoryUpdated(thickness);
             }, Qt::QueuedConnection);
+
+            // Append thickness to history manager session
+            if (p->m_historyManager && p->m_historyManager->isSessionActive()) {
+                static int histLogCounter = 0;
+                histLogCounter++;
+                if (histLogCounter % 100 == 1) {
+                    qDebug() << "[DataController] OnDataReady: appending thickness to session, total appended:" << histLogCounter;
+                }
+                p->m_historyManager->appendThickness(thickness);
+            }
         }
 
     } while (remainingCount > 0);

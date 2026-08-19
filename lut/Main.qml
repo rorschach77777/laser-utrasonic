@@ -72,6 +72,7 @@ ApplicationWindow {
                         ListElement { label: "主板";   icon: "🖥" }
                         ListElement { label: "从板";   icon: "📡" }
                         ListElement { label: "数据";   icon: "📈" }
+                        ListElement { label: "历史";   icon: "📜" }
                         ListElement { label: "设置";   icon: "⚙" }
                         ListElement { label: "命令";   icon: "▶" }
                     }
@@ -80,7 +81,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 64
                         highlighted: stackLayout.currentIndex === index
-                        enabled: index === 0 || index === 4 || deviceComm.connected
+                        enabled: index === 0 || index === 4 || index === 5 || deviceComm.connected
 
                         contentItem: ColumnLayout {
                             spacing: 2
@@ -121,6 +122,9 @@ ApplicationWindow {
             MainBoardPage {}
             SlaveBoardPage {}
             DataPage {}
+            HistoryPage {
+                historyMgr: historyManager
+            }
             SystemSettingsPage {}
             CommandPage {}
         }

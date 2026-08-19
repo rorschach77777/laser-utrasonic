@@ -602,20 +602,15 @@ ScrollView {
                             }
                         }
 
-                        Button {
-                            text: "厚度保存"
-                            Layout.preferredWidth: 80
-                            Layout.preferredHeight: 50
-                            font.pixelSize: 12
-                            Material.background: "#3F51B5"
-                            Material.foreground: "white"
-                            enabled: dataController != null
-                            onClicked: {
-                                if (dataController) {
-                                    var now = new Date()
-                                    var ts = Qt.formatDateTime(now, "MMdd_hhmmss")
-                                    dataController.saveThicknessData("Thickness_" + ts + ".csv")
-                                }
+                        Comp.SwitchControl {
+                            id: historySwitch
+                            label: "历史记录"
+                            onToggled: (checked) => {
+                                console.log("[DataPage] historySwitch onToggled, checked:", checked)
+                                if (dataController) dataController.setHistoryRecording(checked)
+                            }
+                            Component.onCompleted: {
+                                historySwitch.checked = dataController ? dataController.historyRecording : false
                             }
                         }
 
@@ -659,6 +654,11 @@ ScrollView {
         }
         function onErrorOccurred(message) {
             console.log("Data Error:", message)
+        }
+        function onHistoryRecordingChanged() {
+            if (historySwitch && dataController) {
+                historySwitch.checked = dataController.historyRecording
+            }
         }
         function onGraphConfigReady(xCordTimeDiv, xCordTimeOffset, timeUnit, yMin, yMax, yUnit) {
             if (graphItem) {

@@ -7,6 +7,7 @@
 #include <QString>
 #include <vector>
 #include "bdaqctrl.h"
+#include "HistoryManager.h"
 
 // 配置参数结构体
 struct ConfigureParameter
@@ -56,6 +57,7 @@ class DataController : public QObject
     Q_PROPERTY(bool autoScale READ autoScale WRITE setAutoScale NOTIFY autoScaleChanged)
     Q_PROPERTY(bool showOriginal READ showOriginal WRITE setShowOriginal NOTIFY showOriginalChanged)
     Q_PROPERTY(bool savePerFrame READ savePerFrame WRITE setSavePerFrame NOTIFY savePerFrameChanged)
+    Q_PROPERTY(bool historyRecording READ historyRecording WRITE setHistoryRecording NOTIFY historyRecordingChanged)
     Q_PROPERTY(QString detectionRateText READ detectionRateText NOTIFY detectionRateChanged)
     Q_PROPERTY(QString thicknessText READ thicknessText NOTIFY thicknessChanged)
     Q_PROPERTY(QStringList deviceList READ deviceList NOTIFY deviceListChanged)
@@ -125,6 +127,11 @@ public:
     Q_INVOKABLE void setShowOriginal(bool enabled);
     Q_INVOKABLE void setSavePerFrame(bool enabled);
 
+    // History recording
+    bool historyRecording() const { return m_historyRecording; }
+    Q_INVOKABLE void setHistoryRecording(bool enabled);
+    void setHistoryManager(QObject *manager);
+
     // Configure parameters
     Q_INVOKABLE void setTriggerSource(int index);
     Q_INVOKABLE void setTriggerEdge(int index);
@@ -175,6 +182,9 @@ signals:
     // Thickness history update
     void thicknessHistoryUpdated(double thickness);
 
+    // History recording
+    void historyRecordingChanged();
+
     // Device list updated
     void deviceListChanged();
     void triggerSourceListChanged();
@@ -203,6 +213,8 @@ private:
     bool m_autoScale;
     bool m_showOriginal;
     bool m_savePerFrame;
+    bool m_historyRecording; // Whether to record for history - default false
+    HistoryManager *m_historyManager;
 
     ConfigureParameter m_configure;
     void *m_waveformAiCtrl;  // Automation::BDaq::WaveformAiCtrl*

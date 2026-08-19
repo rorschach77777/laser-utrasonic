@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Quick QuickControls2 SerialBus SerialPort)
+find_package(Qt6 REQUIRED COMPONENTS Core Quick QuickControls2 SerialBus SerialPort Concurrent)
 
 qt_standard_project_setup(REQUIRES 6.5)
 
@@ -56,9 +56,10 @@ qt_add_library(lst_communication SHARED
     src/data/SimpleGraphItem.h
     src/data/ThicknessHistoryItem.cpp
     src/data/ThicknessHistoryItem.h
-
-
-
+    src/data/HistoryManager.cpp
+    src/data/HistoryManager.h
+    src/data/HistoryGraphItem.cpp
+    src/data/HistoryGraphItem.h
 )
 
 set_target_properties(lst_communication PROPERTIES
@@ -77,6 +78,7 @@ target_link_libraries(lst_communication
         Qt6::SerialBus
         Qt6::SerialPort
         Qt6::Quick
+        Qt6::Concurrent
 )
 
 set(CONTROLLER_HEADERS
@@ -95,12 +97,17 @@ set(DATA_SOURCES
     src/data/DataController.cpp
     src/data/SimpleGraphItem.cpp
     src/data/ThicknessHistoryItem.cpp
+    src/data/HistoryManager.cpp
+    src/data/HistoryGraphItem.cpp
 )
 
 set(DATA_HEADERS
     src/data/DataController.h
     src/data/SimpleGraphItem.h
     src/data/ThicknessHistoryItem.h
+    src/data/HistoryRecord.h
+    src/data/HistoryManager.h
+    src/data/HistoryGraphItem.h
 )
 
 add_library(lst_controllers SHARED IMPORTED GLOBAL)
@@ -150,7 +157,12 @@ qt_add_qml_module(appLST
         qml/pages/SystemSettingsPage.qml
         qml/pages/CommandPage.qml
         qml/pages/DataPage.qml
-        SOURCES src/data/bdaqctrl.h
+        qml/pages/HistoryPage.qml
+        SOURCES
+            src/data/bdaqctrl.h
+            src/data/HistoryRecord.h
+            src/data/HistoryManager.h
+            src/data/HistoryGraphItem.h
 )
 
 set_target_properties(appLST PROPERTIES

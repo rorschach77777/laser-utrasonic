@@ -2,6 +2,7 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QDir>
 
 #include "communication/DeviceComm.h"
 #include "communication/PollingService.h"
@@ -18,6 +19,8 @@
 #include "data/DataController.h"
 #include "data/SimpleGraphItem.h"
 #include "data/ThicknessHistoryItem.h"
+#include "data/HistoryManager.h"
+#include "data/HistoryGraphItem.h"
 
 int main(int argc, char *argv[])
 {
@@ -27,6 +30,7 @@ int main(int argc, char *argv[])
     // Register custom QML types
     qmlRegisterType<SimpleGraphItem>("LST.Data", 1, 0, "SimpleGraphItem");
     qmlRegisterType<ThicknessHistoryItem>("LST.Data", 1, 0, "ThicknessHistoryItem");
+    qmlRegisterType<HistoryGraphItem>("LST.Data", 1, 0, "HistoryGraphItem");
 
     QQmlApplicationEngine engine;
 
@@ -68,6 +72,13 @@ int main(int argc, char *argv[])
     auto *sysSetCtrl    = new SystemSettingsController(comm, &app);
     auto *cmdCtrl       = new CommandController(comm, &app);
     auto *dataCtrl      = new DataController(&app);
+    auto *historyMgr    = new HistoryManager(&app);
+
+    // Wire history manager to data controller
+    dataCtrl->setHistoryManager(historyMgr);
+
+    // Load existing history from disk
+    historyMgr->loadFromDisk(QDir::currentPath() + "/HistoryData");
 
     dashCtrl->setSystemStatusModel(pollingService->systemStatusModel());
     dashCtrl->setSlaveStatusModel(pollingService->slaveStatusModel());
@@ -108,6 +119,7 @@ int main(int argc, char *argv[])
     ctx->setContextProperty("systemSettingsController", sysSetCtrl);
     ctx->setContextProperty("commandController", cmdCtrl);
     ctx->setContextProperty("dataController", dataCtrl);
+    ctx->setContextProperty("historyManager", historyMgr);
 
     // Initialize data controller
     dataCtrl->initialize();

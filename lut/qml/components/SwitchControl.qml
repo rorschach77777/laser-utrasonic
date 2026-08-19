@@ -7,7 +7,7 @@ RowLayout {
     id: root
 
     property string label: ""
-    property bool checked: false
+    property alias checked: switchControl.checked
 
     signal toggled(bool checked)
 
@@ -21,8 +21,11 @@ RowLayout {
     }
 
     Switch {
-        checked: root.checked
+        id: switchControl
         Material.accent: "#009688"
-        onToggled: root.toggled(checked)
+        onToggled: {
+            console.log("[SwitchControl] toggled, checked:", switchControl.checked)
+            root.toggled(switchControl.checked)
+        }
     }
 }
