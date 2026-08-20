@@ -213,21 +213,126 @@ void HistoryManager::exportToCsv(const QList<int> &indices, const QString &fileP
         int total = indices.size();
         int current = 0;
 
+        if (mergeToSingleFile) {
+            struct ExportRecord {
+                QString title;
+                QString sourcePath;
+                QVector<double> data;
+            };
+
+            QVector<ExportRecord> records;
+            {
+                QMutexLocker locker(&m_mutex);
+                records.reserve(indices.size());
+                for (int idx : indices) {
+                    if (idx < 0 || idx >= m_records.size()) continue;
+                    const auto &rec = m_records[idx];
+                    records.append({rec.displayTitle(), rec.filePath, rec.thicknessData});
+                }
+            }
+
+            // Records loaded from metadata after application startup keep thicknessData empty
+            // until they are opened in the history view. Load missing data directly from
+            // each record file so all selected records are included in a merged export.
+            auto loadRecordFile = [](const QString &sourcePath) {
+                QVector<double> data;
+                QFile sourceFile(sourcePath);
+                if (!sourceFile.open(QIODevice::ReadOnly | QIODevice::Text))
+                    return data;
+
+                QTextStream in(&sourceFile);
+                bool firstLine = true;
+                while (!in.atEnd()) {
+                    QString line = in.readLine().trimmed();
+                    if (line.isEmpty()) continue;
+
+                    if (firstLine) {
+                        firstLine = false;
+                        if (line.startsWith("Index", Qt::CaseInsensitive))
+                            continue;
+                    }
+
+                    QString valueText = line;
+                    if (line.contains(',')) {
+                        const QStringList parts = line.split(',');
+                        if (parts.size() >= 2)
+                            valueText = parts[1].trimmed();
+                    }
+
+                    if (valueText.compare("NaN", Qt::CaseInsensitive) == 0) {
+                        data.append(std::numeric_limits<double>::quiet_NaN());
+                    } else {
+                        bool ok = false;
+                        const double value = valueText.toDouble(&ok);
+                        if (ok)
+                            data.append(value);
+                    }
+                }
+                return data;
+            };
+
+            qsizetype maxPointCount = 0;
+            for (auto &rec : records) {
+                if (rec.data.isEmpty() && !rec.sourcePath.isEmpty())
+                    rec.data = loadRecordFile(rec.sourcePath);
+
+                maxPointCount = qMax(maxPointCount, rec.data.size());
+                ++current;
+                QMetaObject::invokeMethod(this, [this, current, total]() {
+                    emit exportProgress(current, total);
+                }, Qt::QueuedConnection);
+            }
+
+            auto csvCell = [](QString text) {
+                if (text.contains('"'))
+                    text.replace("\"", "\"\"");
+                if (text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r'))
+                    return QString("\"%1\"").arg(text);
+                return text;
+            };
+
+            // Row 1: one title for each two-column record group.
+            QStringList titleRow;
+            for (const auto &rec : records) {
+                titleRow << csvCell(rec.title) << QString();
+            }
+            out << titleRow.join(',') << "\n";
+
+            // Row 2: column names for every selected record.
+            QStringList headerRow;
+            for (qsizetype i = 0; i < records.size(); ++i) {
+                headerRow << QStringLiteral("数据点") << QStringLiteral("厚度点");
+            }
+            out << headerRow.join(',') << "\n";
+
+            // Remaining rows: records are arranged horizontally, two columns per record.
+            for (qsizetype point = 0; point < maxPointCount; ++point) {
+                QStringList row;
+                for (const auto &rec : records) {
+                    if (point < rec.data.size()) {
+                        row << QString::number(point + 1);
+                        const double value = rec.data[point];
+                        row << (std::isnan(value) ? QStringLiteral("NaN")
+                                                  : QString::number(value, 'f', 6));
+                    } else {
+                        row << QString() << QString();
+                    }
+                }
+                out << row.join(',') << "\n";
+            }
+
+            file.close();
+            return;
+        }
+
+        // Keep the existing single-record export layout unchanged.
         for (int idx : indices) {
             QMutexLocker locker(&m_mutex);
             if (idx < 0 || idx >= m_records.size()) continue;
 
             const auto &rec = m_records[idx];
-
-            if (mergeToSingleFile && total > 1) {
-                out << "=== Record: " << rec.displayTitle()
-                    << " | Points: " << rec.totalPoints << " ===\n";
-            }
-
-            // Header
             out << "Index,Thickness(mm)\n";
 
-            // Data
             const auto &data = rec.thicknessData;
             for (int i = 0; i < data.size(); ++i) {
                 double val = data[i];
@@ -236,10 +341,6 @@ void HistoryManager::exportToCsv(const QList<int> &indices, const QString &fileP
                 } else {
                     out << (i + 1) << "," << QString::number(val, 'f', 6) << "\n";
                 }
-            }
-
-            if (mergeToSingleFile && total > 1) {
-                out << "\n";
             }
 
             locker.unlock();

@@ -89,6 +89,7 @@ public:
     // Acquisition control
     Q_INVOKABLE void startAcquisition();
     Q_INVOKABLE void pauseAcquisition();
+    Q_INVOKABLE void resumeAcquisition();
     Q_INVOKABLE void stopAcquisition();
 
     // Filter
@@ -151,11 +152,6 @@ public:
     const ConfigureParameter &configure() const { return m_configure; }
     double *scaledData() const { return m_scaledData; }
     int rawDataBufferLength() const { return m_rawDataBufferLength; }
-
-    // Callbacks from data ready event
-    void onDataReady(const QVector<double> &displayData, int plotCount, int pointsPerChan,
-                     double xInc, bool recordEnd, double peakTimeSec, double peakVoltage,
-                     double thickness);
 
     // BDAQ static callback
     static void OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEventArgs *args, void *userParam);

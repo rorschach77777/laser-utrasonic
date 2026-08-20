@@ -50,11 +50,11 @@ DataController::DataController(QObject *parent)
     m_configure.clockRatePerChan = 160000000.0;
     m_configure.sectionLength = 1600;
     m_configure.cycles = 0;
-    m_configure.profilePath = "";
+    m_configure.profilePath = "/qml/pages/profile.xml";
     m_configure.detectMode = "auto";
-    m_configure.thicknessStd = 5.0;
-    m_configure.thicknessTolerance = 0.5;
-    m_configure.structLen = 7;
+    m_configure.thicknessStd = 6.5;
+    m_configure.thicknessTolerance = 0.8;
+    m_configure.structLen = 9;
     m_configure.minWidth = 1;
     m_configure.triggerAction = DelayToStart;
     m_configure.delayCount = 160;
@@ -65,7 +65,7 @@ DataController::DataController(QObject *parent)
 
     //m_triggerEdgeList << "RisingEdge" << "FallingEdge";
 
-    updateFilterCoefficients(1e6, 30e6);
+    updateFilterCoefficients(3e6, 30e6);
 }
 
 DataController::~DataController()
@@ -92,7 +92,7 @@ void DataController::initialize()
         ctrl->addDataReadyHandler(OnDataReadyEvent, this);
         //qDebug() << "[DataController] DataReady handler registered";
     }
-    updateFilterCoefficients(1e6, 30e6);
+    updateFilterCoefficients(3e6, 30e6);
     refreshDeviceList();
 }
 
@@ -562,11 +562,30 @@ void DataController::startAcquisition()
 void DataController::pauseAcquisition()
 {
     WaveformAiCtrl *ctrl = static_cast<WaveformAiCtrl*>(m_waveformAiCtrl);
-    if (!ctrl) return;
+    if (!ctrl || !m_running || m_paused) return;
 
     ErrorCode errorCode = ctrl->Stop();
-    checkError(errorCode);
+    if (BioFailed(errorCode)) {
+        checkError(errorCode);
+        return;
+    }
+
     m_paused = true;
+    emit pausedChanged();
+}
+
+void DataController::resumeAcquisition()
+{
+    WaveformAiCtrl *ctrl = static_cast<WaveformAiCtrl*>(m_waveformAiCtrl);
+    if (!ctrl || !m_running || !m_paused) return;
+
+    ErrorCode errorCode = ctrl->Start();
+    if (BioFailed(errorCode)) {
+        checkError(errorCode);
+        return;
+    }
+
+    m_paused = false;
     emit pausedChanged();
 }
 
@@ -671,56 +690,6 @@ QVector<double> DataController::getThicknessHistory() const
 }
 
 void *DataController::waveformAiCtrl() const { return m_waveformAiCtrl; }
-
-void DataController::onDataReady(const QVector<double> &displayData, int plotCount, int pointsPerChan,
-                                  double xInc, bool recordEnd, double peakTimeSec, double peakVoltage,
-                                  double thickness)
-{
-    m_thickness = thickness;
-    emit thicknessChanged();
-
-    m_totalAttempts++;
-    if (!std::isnan(thickness)) {
-        m_validDetections++;
-        // Thickness statistics
-        if (thickness > m_thicknessMax) m_thicknessMax = thickness;
-        if (thickness < m_thicknessMin) m_thicknessMin = thickness;
-        m_thicknessSum += thickness;
-        m_thicknessCount++;
-        emit thicknessStatsChanged();
-    }
-
-    m_detectionRate = m_totalAttempts > 0 ? (double)m_validDetections / m_totalAttempts * 100.0 : 0.0;
-    emit detectionRateChanged();
-
-    {
-        QMutexLocker locker(&m_thicknessMutex);
-        m_thicknessHistory.append(thickness);
-    }
-
-    emit dataReady(displayData, plotCount, pointsPerChan, xInc, recordEnd);
-    emit markerReady(peakTimeSec, peakVoltage);
-    emit thicknessHistoryUpdated(thickness);
-
-    // Save per frame
-    if (m_savePerFrame) {
-        QMutexLocker locker(&m_fileMutex);
-        m_saveFrameCounter++;
-        QString fileName = QString("%1/Frame_%2.csv")
-            .arg(m_saveFolder)
-            .arg(m_saveFrameCounter, 4, 10, QChar('0'));
-        QFile file(fileName);
-        if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QTextStream out(&file);
-            out << "Index,Data,Thickness\n";
-            QString thickStr = std::isnan(thickness) ? "NaN" : QString::number(thickness, 'f', 6);
-            for (int i = 0; i < pointsPerChan; ++i) {
-                out << i << "," << displayData[i] << "," << thickStr << "\n";
-            }
-            file.close();
-        }
-    }
-}
 
 void DataController::designBandpassFilter(double lowFreq, double highFreq,
                                            double sampleRate, int order,
@@ -1159,7 +1128,9 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
                                                    peakTimeSec,
                                                    peakVoltage);
 
-            // Compute SNR: noise RMS from first part of signal (delay region)
+            // Compute SNR in the acquisition callback, but update QObject-owned state
+            // only on DataController's Qt thread.
+            double snr = 0.0;
             int noiseLen = std::min(200, pointsPerChan / 4);
             if (noiseLen > 0 && std::fabs(peakVoltage) > 1e-9) {
                 double noiseSumSq = 0.0;
@@ -1168,52 +1139,39 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
                 }
                 double noiseRms = std::sqrt(noiseSumSq / noiseLen);
                 if (noiseRms > 1e-12) {
-                    p->m_snr = 20.0 * std::log10(std::fabs(peakVoltage) / noiseRms);
-                } else {
-                    p->m_snr = 0.0;
+                    snr = 20.0 * std::log10(std::fabs(peakVoltage) / noiseRms);
                 }
-            } else {
-                p->m_snr = 0.0;
             }
 
-
-            QMetaObject::invokeMethod(p, [p]() {
-                emit p->clearMarkersRequested();
-            }, Qt::QueuedConnection);
-
-            QMetaObject::invokeMethod(p, [p, thickness]() {
+            QMetaObject::invokeMethod(p, [p, thickness, peakTimeSec, peakVoltage, snr]() {
                 p->m_thickness = thickness;
+                p->m_snr = snr;
+                p->m_totalAttempts++;
+
+                if (!std::isnan(thickness)) {
+                    p->m_validDetections++;
+                    if (thickness > p->m_thicknessMax) p->m_thicknessMax = thickness;
+                    if (thickness < p->m_thicknessMin) p->m_thicknessMin = thickness;
+                    p->m_thicknessSum += thickness;
+                    p->m_thicknessCount++;
+                }
+
+                {
+                    QMutexLocker locker(&p->m_thicknessMutex);
+                    p->m_thicknessHistory.append(thickness);
+                }
+
+                if (p->m_historyManager && p->m_historyManager->isSessionActive()) {
+                    p->m_historyManager->appendThickness(thickness);
+                }
+
+                emit p->clearMarkersRequested();
                 emit p->thicknessChanged();
-            }, Qt::QueuedConnection);
-
-            QMetaObject::invokeMethod(p, [p, peakTimeSec, peakVoltage]() {
                 emit p->markerReady(peakTimeSec, peakVoltage);
-            }, Qt::QueuedConnection);
-
-            p->m_totalAttempts++;
-            if (!std::isnan(thickness)) {
-                p->m_validDetections++;
-                if (thickness > p->m_thicknessMax) p->m_thicknessMax = thickness;
-                if (thickness < p->m_thicknessMin) p->m_thicknessMin = thickness;
-                p->m_thicknessSum += thickness;
-                p->m_thicknessCount++;
-            }
-
-            {
-                QMutexLocker locker(&p->m_thicknessMutex);
-                p->m_thicknessHistory.append(thickness);
-            }
-
-            QMetaObject::invokeMethod(p, [p]() {
-                p->updateDetectionRate();
-            }, Qt::QueuedConnection);
-
-            QMetaObject::invokeMethod(p, [p]() {
                 emit p->snrChanged();
-            }, Qt::QueuedConnection);
-
-            QMetaObject::invokeMethod(p, [p]() {
                 emit p->thicknessStatsChanged();
+                emit p->thicknessHistoryUpdated(thickness);
+                p->updateDetectionRate();
             }, Qt::QueuedConnection);
 
             // 波形数据保存
@@ -1242,20 +1200,6 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
                 }
             }
 
-            // 厚度历史更新
-            QMetaObject::invokeMethod(p, [p, thickness]() {
-                emit p->thicknessHistoryUpdated(thickness);
-            }, Qt::QueuedConnection);
-
-            // Append thickness to history manager session
-            if (p->m_historyManager && p->m_historyManager->isSessionActive()) {
-                static int histLogCounter = 0;
-                histLogCounter++;
-                if (histLogCounter % 100 == 1) {
-                    qDebug() << "[DataController] OnDataReady: appending thickness to session, total appended:" << histLogCounter;
-                }
-                p->m_historyManager->appendThickness(thickness);
-            }
         }
 
     } while (remainingCount > 0);

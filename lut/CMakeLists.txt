@@ -50,16 +50,6 @@ qt_add_library(lst_communication SHARED
     ${COMMUNICATION_HEADERS}
     src/models/GateModel.cpp
     src/controllers/GateController.cpp
-    src/data/DataController.cpp
-    src/data/DataController.h
-    src/data/SimpleGraphItem.cpp
-    src/data/SimpleGraphItem.h
-    src/data/ThicknessHistoryItem.cpp
-    src/data/ThicknessHistoryItem.h
-    src/data/HistoryManager.cpp
-    src/data/HistoryManager.h
-    src/data/HistoryGraphItem.cpp
-    src/data/HistoryGraphItem.h
 )
 
 set_target_properties(lst_communication PROPERTIES
@@ -110,6 +100,27 @@ set(DATA_HEADERS
     src/data/HistoryGraphItem.h
 )
 
+qt_add_library(lst_data SHARED
+    ${DATA_SOURCES}
+    ${DATA_HEADERS}
+)
+
+set_target_properties(lst_data PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+)
+
+target_include_directories(lst_data
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(lst_data
+    PUBLIC
+        Qt6::Core
+        Qt6::Quick
+        Qt6::Concurrent
+)
+
 add_library(lst_controllers SHARED IMPORTED GLOBAL)
 
 set_target_properties(lst_controllers PROPERTIES
@@ -129,8 +140,6 @@ set(PREBUILT_IMPORT_LIBS
 
 qt_add_executable(appLST
     main.cpp
-    ${DATA_SOURCES}
-    ${DATA_HEADERS}
 )
 
 qt_add_qml_module(appLST
@@ -182,6 +191,7 @@ target_link_libraries(appLST
         lst_models
         lst_communication
         lst_controllers
+        lst_data
         Qt6::Quick
         Qt6::QuickControls2
 )
@@ -195,7 +205,7 @@ if(DEFINED BDAQ_SDK_ROOT)
             NO_DEFAULT_PATH
         )
         if(BDAQ_LIBRARY)
-            target_link_libraries(appLST PRIVATE ${BDAQ_LIBRARY})
+            target_link_libraries(lst_data PRIVATE ${BDAQ_LIBRARY})
             message(STATUS "BDAQ library found: ${BDAQ_LIBRARY}")
         else()
             message(WARNING "BDAQ library not found in BDAQ_SDK_ROOT=${BDAQ_SDK_ROOT}")
@@ -204,7 +214,7 @@ if(DEFINED BDAQ_SDK_ROOT)
 else()
     find_library(BDAQ_LIBRARY NAMES biodaq libbiodaq)
     if(BDAQ_LIBRARY)
-        target_link_libraries(appLST PRIVATE ${BDAQ_LIBRARY})
+        target_link_libraries(lst_data PRIVATE ${BDAQ_LIBRARY})
         message(STATUS "BDAQ library found: ${BDAQ_LIBRARY}")
     else()
         message(STATUS "BDAQ library (biodaq) not found. Set BDAQ_SDK_ROOT to the Advantech BDAQ SDK path.")
@@ -223,7 +233,7 @@ add_custom_command(TARGET appLST POST_BUILD
 )
 
 include(GNUInstallDirs)
-install(TARGETS appLST lst_communication
+install(TARGETS appLST lst_communication lst_data
     BUNDLE DESTINATION .
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

@@ -194,6 +194,17 @@ Rectangle {
 
             property var recordData: historyMgr ? historyMgr.getRecord(index) : ({})
 
+            function refreshRecordData() {
+                recordData = historyMgr ? historyMgr.getRecord(index) : ({})
+            }
+
+            Connections {
+                target: historyMgr
+                function onRecordListChanged() {
+                    refreshRecordData()
+                }
+            }
+
             RowLayout {
                 anchors.fill: parent
                 anchors.leftMargin: 12

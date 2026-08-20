@@ -316,7 +316,7 @@ ScrollView {
 
                         Item { Layout.preferredWidth: 8 }
 
-                        Label { text: "串口地址:"; font.pixelSize: 12; color: "#424242" }
+                        Label { text: "XML 地址:"; font.pixelSize: 12; color: "#424242" }
                         TextField {
                             id: txtProfilePath
                             Layout.fillWidth: true
@@ -463,16 +463,20 @@ ScrollView {
                         }
                         Button {
                             id: btnPause
-                            text: "暂停"
+                            text: dataController && dataController.paused ? "继续" : "暂停"
                             Layout.preferredWidth: 80
                             Layout.preferredHeight: 50
                             font.pixelSize: 13
                             font.bold: true
                             Material.background: "#2196F3"
                             Material.foreground: "white"
-                            enabled: dataController && dataController.running && !dataController.paused
+                            enabled: dataController && dataController.running
                             onClicked: {
-                                if (dataController) dataController.pauseAcquisition()
+                                if (!dataController) return
+                                if (dataController.paused)
+                                    dataController.resumeAcquisition()
+                                else
+                                    dataController.pauseAcquisition()
                             }
                         }
                         Button {
