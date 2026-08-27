@@ -124,7 +124,7 @@ Rectangle {
             Item { Layout.fillWidth: true }
 
             Button {
-                text: qsTr("保存")
+                text: qsTr("导出")
                 Layout.preferredWidth: 80
                 Layout.preferredHeight: 45
                 font.pixelSize: 12
@@ -146,7 +146,7 @@ Rectangle {
             }
 
             Button {
-                text: qsTr("浏览")
+                text: qsTr("导入")
                 Layout.preferredWidth: 80
                 Layout.preferredHeight: 45
                 font.pixelSize: 12

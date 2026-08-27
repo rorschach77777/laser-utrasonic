@@ -12,6 +12,7 @@
 #include "../models/MultiModePumpModel.h"
 #include "../models/PumpModel.h"
 #include "../models/TemperatureModel.h"
+#include "../models/WaterCoolerModel.h"
 #include "../models/PulseChannelModel.h"
 
 class DeviceComm;
@@ -38,6 +39,8 @@ public:
     PumpModel*          slavePump1Model()    const { return m_slavePump1; }
     PumpModel*          slavePump2Model()    const { return m_slavePump2; }
     TemperatureModel*   temperatureModel()   const { return m_temperature; }
+    WaterCoolerModel*   waterCoolerModel()   const { return m_waterCooler; }
+    WaterCoolerModel*   slaveWaterCoolerModel() const { return m_slaveWaterCooler; }
     PulseTimingModel*   mainTimingModel()    const { return m_mainTiming; }
     PulseTimingModel*   slaveTimingModel()   const { return m_slaveTiming; }
 
@@ -57,6 +60,8 @@ private:
     void parsePumpStatus(PumpModel *model, const QVector<uint16_t> &regs, int offset);
     void parseTemperature(const QVector<uint16_t> &regs);
     void parseSlavePumps(const QVector<uint16_t> &regs);
+    void parseWaterCoolerStatus(WaterCoolerModel *model, const QVector<uint16_t> &regs);
+    void parseWaterCoolerControl(WaterCoolerModel *model, const QVector<uint16_t> &regs);
     void parseDfbControl(const QVector<uint16_t> &regs);
     void parseGateControl(GateModel *model, const QVector<uint16_t> &regs);
     void parseMpumpControl(const QVector<uint16_t> &regs);
@@ -95,6 +100,8 @@ private:
     PumpModel          *m_slavePump1  = nullptr;
     PumpModel          *m_slavePump2  = nullptr;
     TemperatureModel   *m_temperature = nullptr;
+    WaterCoolerModel   *m_waterCooler = nullptr;
+    WaterCoolerModel   *m_slaveWaterCooler = nullptr;
     PulseTimingModel   *m_mainTiming  = nullptr;
     PulseTimingModel   *m_slaveTiming = nullptr;
 };

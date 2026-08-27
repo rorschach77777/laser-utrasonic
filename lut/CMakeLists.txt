@@ -50,6 +50,11 @@ qt_add_library(lst_communication SHARED
     ${COMMUNICATION_HEADERS}
     src/models/GateModel.cpp
     src/controllers/GateController.cpp
+    src/models/WaterCoolerModel.h
+    src/communication/DeviceComm.cpp src/communication/DeviceComm.h   src/communication/PollingService.cpp src/communication/PollingService.h
+    src/models/DeviceInfoModel.h src/models/DfbModel.h src/models/GateModel.cpp src/models/GateModel.h src/models/MultiModePumpModel.h src/models/PendingWriteSupport.h src/models/PulseChannelModel.h src/models/PumpModel.h src/models/RegisterDefs.h src/models/SlaveStatusModel.h src/models/SystemStatusModel.h src/models/TemperatureModel.h src/models/WaterCoolerModel.h
+    src/controllers/CommandController.h src/controllers/ConnectionController.h src/controllers/DashboardController.h src/controllers/DfbController.h src/controllers/GateController.cpp src/controllers/GateController.h src/controllers/MultiModePumpController.h src/controllers/PumpController.h src/controllers/SystemSettingsController.h src/controllers/TimingController.h src/controllers/WaterCoolerController.h
+
 )
 
 set_target_properties(lst_communication PROPERTIES
@@ -172,6 +177,9 @@ qt_add_qml_module(appLST
             src/data/HistoryRecord.h
             src/data/HistoryManager.h
             src/data/HistoryGraphItem.h
+            QML_FILES
+            QML_FILES
+            QML_FILES qml/components/WaterCoolerCard.qml
 )
 
 set_target_properties(appLST PROPERTIES

@@ -79,12 +79,24 @@ namespace Input {
     constexpr uint16_t TEMP_COUNT        = 8;
     constexpr uint16_t TEMP_BLOCK_COUNT  = 16;
 
+    // Water Cooler Status (0x00D0-0x00D1)
+    constexpr uint16_t WATER_COOLER_STATUS_BASE   = 0x00D0;
+    constexpr uint16_t WATER_COOLER_ONLINE        = 0x00D0;
+    constexpr uint16_t WATER_COOLER_TEMP          = 0x00D1;
+    constexpr uint16_t WATER_COOLER_STATUS_COUNT  = 2;
+
     // Slave Pump1 Status (0x0400-0x040F)
     constexpr uint16_t SLAVE_PUMP1_STATUS_BASE  = 0x0400;
     constexpr uint16_t SLAVE_PUMP1_STATUS_COUNT = 16;
     // Slave Pump2 Status (0x0410-0x041F)
     constexpr uint16_t SLAVE_PUMP2_STATUS_BASE  = 0x0410;
     constexpr uint16_t SLAVE_PUMP2_STATUS_COUNT = 16;
+
+    // Slave Water Cooler Status (0x0420-0x0421)
+    constexpr uint16_t SLAVE_WATER_COOLER_STATUS_BASE   = 0x0420;
+    constexpr uint16_t SLAVE_WATER_COOLER_ONLINE        = 0x0420;
+    constexpr uint16_t SLAVE_WATER_COOLER_TEMP          = 0x0421;
+    constexpr uint16_t SLAVE_WATER_COOLER_STATUS_COUNT  = 2;
 }
 
 // === Holding Registers (FC 0x03/0x06/0x10) ===
@@ -201,10 +213,16 @@ namespace Hold {
     constexpr uint16_t MAIN_TIMING_BASE  = 0x0200;
     constexpr uint16_t TIMING_CH_STRIDE  = 18;   // 0x12
 
+    // Water Cooler Control (0x00D0)
+    constexpr uint16_t WATER_COOLER_TEMP_SET = 0x00D0;
+
     // Slave Pump1 Control (0x0400-0x040F)
     constexpr uint16_t SLAVE_PUMP1_CTRL_BASE = 0x0400;
     // Slave Pump2 Control (0x0410-0x041F)
     constexpr uint16_t SLAVE_PUMP2_CTRL_BASE = 0x0410;
+
+    // Slave Water Cooler Control (0x0420)
+    constexpr uint16_t SLAVE_WATER_COOLER_TEMP_SET = 0x0420;
 
     // Slave Pulse Timing (0x0500-0x061F)
     constexpr uint16_t SLAVE_TIMING_BASE = 0x0500;

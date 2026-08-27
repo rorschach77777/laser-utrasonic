@@ -12,6 +12,7 @@
 #include "controllers/GateController.h"
 #include "controllers/PumpController.h"
 #include "controllers/MultiModePumpController.h"
+#include "controllers/WaterCoolerController.h"
 #include "controllers/TimingController.h"
 #include "controllers/SystemSettingsController.h"
 #include "controllers/CommandController.h"
@@ -67,6 +68,14 @@ int main(int argc, char *argv[])
                                              Reg::Hold::SLAVE_GATE_POLARITY,
                                              &app);
     auto *mpumpCtrl     = new MultiModePumpController(comm, &app);
+    auto *waterCoolerCtrl = new WaterCoolerController(comm,
+                                                      Reg::Input::WATER_COOLER_STATUS_BASE,
+                                                      Reg::Hold::WATER_COOLER_TEMP_SET,
+                                                      &app);
+    auto *slaveWaterCoolerCtrl = new WaterCoolerController(comm,
+                                                           Reg::Input::SLAVE_WATER_COOLER_STATUS_BASE,
+                                                           Reg::Hold::SLAVE_WATER_COOLER_TEMP_SET,
+                                                           &app);
     auto *mainTimingCtrl = new TimingController(comm, Reg::Hold::MAIN_TIMING_BASE, &app);
     auto *slaveTimingCtrl = new TimingController(comm, Reg::Hold::SLAVE_TIMING_BASE, &app);
     auto *sysSetCtrl    = new SystemSettingsController(comm, &app);
@@ -98,6 +107,8 @@ int main(int argc, char *argv[])
     slavePump2Ctrl->setModel(pollingService->slavePump2Model());
     slaveGateCtrl->setModel(pollingService->slaveGateModel());
     mpumpCtrl->setModel(pollingService->mpumpModel());
+    waterCoolerCtrl->setModel(pollingService->waterCoolerModel());
+    slaveWaterCoolerCtrl->setModel(pollingService->slaveWaterCoolerModel());
     mainTimingCtrl->setModel(pollingService->mainTimingModel());
     slaveTimingCtrl->setModel(pollingService->slaveTimingModel());
     // Expose to QML
@@ -114,6 +125,8 @@ int main(int argc, char *argv[])
     ctx->setContextProperty("slavePump2Controller", slavePump2Ctrl);
     ctx->setContextProperty("slaveGateController", slaveGateCtrl);
     ctx->setContextProperty("multiModePumpController", mpumpCtrl);
+    ctx->setContextProperty("waterCoolerController", waterCoolerCtrl);
+    ctx->setContextProperty("slaveWaterCoolerController", slaveWaterCoolerCtrl);
     ctx->setContextProperty("mainTimingController", mainTimingCtrl);
     ctx->setContextProperty("slaveTimingController", slaveTimingCtrl);
     ctx->setContextProperty("systemSettingsController", sysSetCtrl);

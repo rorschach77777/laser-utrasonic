@@ -1,4 +1,4 @@
-﻿import QtQuick
+import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -162,6 +162,14 @@ ScrollView {
                     onClicked: gateController.readControl()
                 }
             }
+        }
+
+        Comp.WaterCoolerCard {
+            controller: waterCoolerController
+            title: "水冷箱"
+            Layout.fillWidth: true
+            Layout.leftMargin: 16
+            Layout.rightMargin: 16
         }
 
         DeviceCard {

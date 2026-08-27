@@ -1,4 +1,4 @@
-﻿import QtQuick
+import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -94,6 +94,14 @@ ScrollView {
         }
 
         SlaveGateCard {
+            Layout.fillWidth: true
+            Layout.leftMargin: 16
+            Layout.rightMargin: 16
+        }
+
+        Comp.WaterCoolerCard {
+            controller: slaveWaterCoolerController
+            title: "从板水冷箱"
             Layout.fillWidth: true
             Layout.leftMargin: 16
             Layout.rightMargin: 16
