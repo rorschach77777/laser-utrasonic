@@ -94,6 +94,7 @@ set(DATA_SOURCES
     src/data/ThicknessHistoryItem.cpp
     src/data/HistoryManager.cpp
     src/data/HistoryGraphItem.cpp
+    src/data/ProcessAnalyzer.cpp
 )
 
 set(DATA_HEADERS
@@ -103,6 +104,7 @@ set(DATA_HEADERS
     src/data/HistoryRecord.h
     src/data/HistoryManager.h
     src/data/HistoryGraphItem.h
+    src/data/ProcessAnalyzer.h
 )
 
 qt_add_library(lst_data SHARED
@@ -172,11 +174,13 @@ qt_add_qml_module(appLST
         qml/pages/CommandPage.qml
         qml/pages/DataPage.qml
         qml/pages/HistoryPage.qml
+        qml/pages/ProcessAnalysisPage.qml
         SOURCES
             src/data/bdaqctrl.h
             src/data/HistoryRecord.h
             src/data/HistoryManager.h
             src/data/HistoryGraphItem.h
+            src/data/ProcessAnalyzer.h
             QML_FILES
             QML_FILES
             QML_FILES qml/components/WaterCoolerCard.qml

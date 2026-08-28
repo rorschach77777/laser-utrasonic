@@ -519,8 +519,7 @@ void DataController::checkError(int errorCode)
 
 void DataController::startAcquisition()
 {
-    qDebug() << "[DataController] startAcquisition() called, historyRecording:" << m_historyRecording
-             << "historyMgr:" << (m_historyManager ? "valid" : "null");
+    qDebug() << "[DataController] startAcquisition() called";
 
     WaveformAiCtrl *ctrl = static_cast<WaveformAiCtrl*>(m_waveformAiCtrl);
     if (!ctrl) {
@@ -535,15 +534,6 @@ void DataController::startAcquisition()
     m_running = true;
     m_paused = false;
     m_saveFrameCounter = 0;
-
-    // Start history session if recording is enabled
-    if (m_historyRecording && m_historyManager) {
-        qDebug() << "[DataController] startAcquisition: starting history session";
-        m_historyManager->startSession();
-    } else {
-        qDebug() << "[DataController] startAcquisition: NOT starting history session (recording="
-                 << m_historyRecording << "mgr=" << (m_historyManager ? "set" : "null") << ")";
-    }
 
     emit runningChanged();
     emit pausedChanged();
@@ -1162,7 +1152,7 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
                 }
 
                 if (p->m_historyManager && p->m_historyManager->isSessionActive()) {
-                    p->m_historyManager->appendThickness(thickness);
+                    p->m_historyManager->appendMeasurement(thickness, snr, std::isfinite(thickness));
                 }
 
                 emit p->clearMarkersRequested();

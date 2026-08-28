@@ -73,6 +73,7 @@ ApplicationWindow {
                         ListElement { label: "从板";   icon: "📡" }
                         ListElement { label: "数据";   icon: "📈" }
                         ListElement { label: "历史";   icon: "📜" }
+                        ListElement { label: "工艺";   icon: "🧭" }
                         ListElement { label: "设置";   icon: "⚙" }
                         ListElement { label: "命令";   icon: "▶" }
                     }
@@ -81,7 +82,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 64
                         highlighted: stackLayout.currentIndex === index
-                        enabled: index === 0 || index === 4 || index === 5 || deviceComm.connected
+                        enabled: index === 0 || index === 4 || index === 5 || index === 6 || deviceComm.connected
 
                         contentItem: ColumnLayout {
                             spacing: 2
@@ -124,7 +125,12 @@ ApplicationWindow {
             DataPage {}
             HistoryPage {
                 historyMgr: historyManager
+                onAnalysisRequested: function(recordIndex) {
+                    processAnalyzer.analyzeRecord(recordIndex)
+                    stackLayout.currentIndex = 6
+                }
             }
+            ProcessAnalysisPage {}
             SystemSettingsPage {}
             CommandPage {}
         }

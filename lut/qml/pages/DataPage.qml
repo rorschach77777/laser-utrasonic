@@ -25,6 +25,133 @@ ScrollView {
             Layout.topMargin: 12
         }
 
+        // Current pipe measurement task
+        Pane {
+            Layout.fillWidth: true
+            Layout.leftMargin: 16
+            Layout.rightMargin: 16
+            padding: 8
+            Material.elevation: 2
+
+            RowLayout {
+                anchors.fill: parent
+                spacing: 8
+
+                Label {
+                    text: "当前钢管"
+                    font.pixelSize: 14
+                    font.bold: true
+                    color: "#3F51B5"
+                }
+
+                Label { text: "编号:"; font.pixelSize: 12; color: "#424242" }
+                TextField {
+                    id: edtPipeId
+                    Layout.preferredWidth: 145
+                    placeholderText: "钢管编号"
+                    font.pixelSize: 12
+                    enabled: !historyManager.sessionActive
+                }
+
+                Label { text: "钢级:"; font.pixelSize: 12; color: "#424242" }
+                TextField {
+                    id: edtSteelGrade
+                    Layout.preferredWidth: 80
+                    placeholderText: "P110"
+                    font.pixelSize: 12
+                    enabled: !historyManager.sessionActive
+                }
+
+                Label { text: "公称壁厚:"; font.pixelSize: 12; color: "#424242" }
+                TextField {
+                    id: edtNominalThickness
+                    Layout.preferredWidth: 60
+                    text: "6.5"
+                    font.pixelSize: 12
+                    enabled: !historyManager.sessionActive
+                }
+                Label { text: "mm"; font.pixelSize: 11; color: "#757575" }
+
+                Label { text: "线速度:"; font.pixelSize: 12; color: "#424242" }
+                TextField {
+                    id: edtLineSpeed
+                    Layout.preferredWidth: 55
+                    text: "0"
+                    font.pixelSize: 12
+                    enabled: !historyManager.sessionActive
+                }
+                Label { text: "m/s"; font.pixelSize: 11; color: "#757575" }
+
+                Label { text: "测厚频率:"; font.pixelSize: 12; color: "#424242" }
+                TextField {
+                    id: edtThicknessRate
+                    Layout.preferredWidth: 55
+                    text: "100"
+                    font.pixelSize: 12
+                    enabled: !historyManager.sessionActive
+                }
+                Label { text: "Hz"; font.pixelSize: 11; color: "#757575" }
+
+                Item { Layout.fillWidth: true }
+
+                ColumnLayout {
+                    spacing: 0
+                    Label {
+                        text: historyManager.sessionActive ? "记录中" : "未记录"
+                        font.pixelSize: 12
+                        font.bold: true
+                        color: historyManager.sessionActive ? "#4CAF50" : "#757575"
+                    }
+                    Label {
+                        text: historyManager.sessionActive
+                              ? ("点数 " + historyManager.sessionDataCount
+                                 + " / 位置 " + historyManager.sessionPositionM.toFixed(2) + " m")
+                              : ""
+                        font.pixelSize: 10
+                        color: "#757575"
+                    }
+                }
+
+                Button {
+                    text: "开始本管"
+                    Layout.preferredWidth: 90
+                    Layout.preferredHeight: 44
+                    font.pixelSize: 12
+                    Material.background: "#4CAF50"
+                    Material.foreground: "white"
+                    enabled: dataController && dataController.running && !historyManager.sessionActive
+                    onClicked: {
+                        var nominal = parseFloat(edtNominalThickness.text)
+                        var speed = parseFloat(edtLineSpeed.text)
+                        var rate = parseFloat(edtThicknessRate.text)
+                        if (!isFinite(nominal) || nominal <= 0) nominal = 6.5
+                        if (!isFinite(speed) || speed < 0) speed = 0
+                        if (!isFinite(rate) || rate <= 0) rate = 100
+
+                        if (dataController)
+                            dataController.setThicknessStd(nominal)
+                        historyManager.startPipeSession(
+                            edtPipeId.text,
+                            edtSteelGrade.text,
+                            nominal,
+                            speed,
+                            rate)
+                    }
+                }
+
+                Button {
+                    text: "结束本管"
+                    Layout.preferredWidth: 90
+                    Layout.preferredHeight: 44
+                    font.pixelSize: 12
+                    Material.background: "#757575"
+                    Material.foreground: "white"
+                    enabled: historyManager.sessionActive
+                    onClicked: historyManager.finishSession()
+                }
+            }
+        }
+
         // Main content area: left panel + right panel
         RowLayout {
             Layout.fillWidth: true
@@ -606,18 +733,6 @@ ScrollView {
                             }
                         }
 
-                        Comp.SwitchControl {
-                            id: historySwitch
-                            label: "历史记录"
-                            onToggled: (checked) => {
-                                console.log("[DataPage] historySwitch onToggled, checked:", checked)
-                                if (dataController) dataController.setHistoryRecording(checked)
-                            }
-                            Component.onCompleted: {
-                                historySwitch.checked = dataController ? dataController.historyRecording : false
-                            }
-                        }
-
                         CheckBox {
                             id: chkSavePerFrame
                             text: "波形保存"
@@ -658,11 +773,6 @@ ScrollView {
         }
         function onErrorOccurred(message) {
             console.log("Data Error:", message)
-        }
-        function onHistoryRecordingChanged() {
-            if (historySwitch && dataController) {
-                historySwitch.checked = dataController.historyRecording
-            }
         }
         function onGraphConfigReady(xCordTimeDiv, xCordTimeOffset, timeUnit, yMin, yMax, yUnit) {
             if (graphItem) {

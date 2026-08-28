@@ -14,6 +14,9 @@ class HistoryManager : public QObject
     Q_PROPERTY(int recordCount READ recordCount NOTIFY recordListChanged)
     Q_PROPERTY(QStringList recordTitles READ recordTitles NOTIFY recordListChanged)
     Q_PROPERTY(bool historyEnabled READ historyEnabled WRITE setHistoryEnabled NOTIFY historyEnabledChanged)
+    Q_PROPERTY(bool sessionActive READ isSessionActive NOTIFY sessionActiveChanged)
+    Q_PROPERTY(int sessionDataCount READ sessionDataCount NOTIFY sessionProgressChanged)
+    Q_PROPERTY(double sessionPositionM READ sessionPositionM NOTIFY sessionProgressChanged)
 
 public:
     explicit HistoryManager(QObject *parent = nullptr);
@@ -28,14 +31,24 @@ public:
 
     // Session management
     Q_INVOKABLE void startSession();
+    Q_INVOKABLE void startPipeSession(const QString &pipeId,
+                                      const QString &steelGrade,
+                                      double nominalThicknessMm,
+                                      double lineSpeedMps,
+                                      double sampleRateHz);
     Q_INVOKABLE void appendThickness(double thickness);
+    Q_INVOKABLE void appendMeasurement(double thickness, double snrDb, bool valid);
     Q_INVOKABLE void finishSession();
     bool isSessionActive() const { return m_sessionActive; }
     int sessionDataCount() const { return m_sessionData.size(); }
+    double sessionPositionM() const;
 
     // Record management
     Q_INVOKABLE QVariantMap getRecord(int index) const;
     Q_INVOKABLE QVector<double> getRecordData(int index) const;
+    Q_INVOKABLE QVector<double> getRecordPositionData(int index) const;
+    Q_INVOKABLE QVector<double> getRecordSnrData(int index) const;
+    Q_INVOKABLE QVector<int> getRecordValidData(int index) const;
     Q_INVOKABLE void setRecordTitle(int index, const QString &title);
     Q_INVOKABLE void deleteRecord(int index);
     Q_INVOKABLE void deleteRecords(const QList<int> &indices);
@@ -58,6 +71,8 @@ public:
 signals:
     void recordListChanged();
     void historyEnabledChanged();
+    void sessionActiveChanged();
+    void sessionProgressChanged();
     void sessionFinished(const QString &recordId);
     void errorOccurred(const QString &message);
     void importProgress(int current, int total);
@@ -75,7 +90,16 @@ private:
     bool m_historyEnabled;
     bool m_sessionActive;
     QVector<double> m_sessionData;
+    QVector<double> m_sessionPositionData;
+    QVector<double> m_sessionSnrData;
+    QVector<quint8> m_sessionValidData;
     QString m_sessionId;
+    QString m_sessionPipeId;
+    QString m_sessionSteelGrade;
+    double m_sessionNominalThicknessMm;
+    double m_sessionLineSpeedMps;
+    double m_sessionSampleRateHz;
+    QDateTime m_sessionStartTime;
     mutable QMutex m_mutex;
 };
 

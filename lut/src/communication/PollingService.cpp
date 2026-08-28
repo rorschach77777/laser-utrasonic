@@ -44,6 +44,8 @@ PollingService::PollingService(DeviceComm *comm, QObject *parent)
     , m_slavePump1(new PumpModel(this))
     , m_slavePump2(new PumpModel(this))
     , m_temperature(new TemperatureModel(this))
+    , m_waterCooler(new WaterCoolerModel(this))
+    , m_slaveWaterCooler(new WaterCoolerModel(this))
     , m_mainTiming(new PulseTimingModel(this))
     , m_slaveTiming(new PulseTimingModel(this))
 {
@@ -104,6 +106,16 @@ void PollingService::onTick()
         // Slave pump1+2 status (input 0x0400, 32 regs)
         enqueue(PendingRead::InputRegs, Reg::Input::SLAVE_PUMP1_STATUS_BASE, 32,
                 [this](const QVector<uint16_t> &r) { parseSlavePumps(r); });
+
+        // Main / slave water cooler status
+        enqueue(PendingRead::InputRegs,
+                Reg::Input::WATER_COOLER_STATUS_BASE,
+                Reg::Input::WATER_COOLER_STATUS_COUNT,
+                [this](const QVector<uint16_t> &r) { parseWaterCoolerStatus(m_waterCooler, r); });
+        enqueue(PendingRead::InputRegs,
+                Reg::Input::SLAVE_WATER_COOLER_STATUS_BASE,
+                Reg::Input::SLAVE_WATER_COOLER_STATUS_COUNT,
+                [this](const QVector<uint16_t> &r) { parseWaterCoolerStatus(m_slaveWaterCooler, r); });
 
         // Holding readback: DFB control (0x0030, 6 regs)
         enqueue(PendingRead::HoldingRegs, Reg::Hold::DFB_CTRL_BASE, 6,
@@ -269,6 +281,21 @@ void PollingService::parseSlavePumps(const QVector<uint16_t> &regs)
     if (regs.size() < 32) return;
     parsePumpStatus(m_slavePump1, regs, 0);
     parsePumpStatus(m_slavePump2, regs, 16);
+}
+
+void PollingService::parseWaterCoolerStatus(WaterCoolerModel *model,
+                                            const QVector<uint16_t> &regs)
+{
+    if (!model || regs.size() < Reg::Input::WATER_COOLER_STATUS_COUNT) return;
+    model->setOnline(regs[0] != 0);
+    model->setTemperatureRaw(static_cast<int16_t>(regs[1]));
+}
+
+void PollingService::parseWaterCoolerControl(WaterCoolerModel *model,
+                                             const QVector<uint16_t> &regs)
+{
+    if (!model || regs.isEmpty()) return;
+    model->setTempSetRaw(static_cast<int16_t>(regs[0]));
 }
 
 void PollingService::parseDfbControl(const QVector<uint16_t> &regs)

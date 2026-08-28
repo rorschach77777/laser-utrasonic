@@ -10,6 +10,7 @@ Rectangle {
     color: "#FAFAFA"
 
     property var historyMgr: null
+    signal analysisRequested(int recordIndex)
 
     // Selection state
     property bool editMode: false
@@ -187,7 +188,7 @@ Rectangle {
 
         Rectangle {
             width: listView.width
-            height: 48
+            height: 62
             radius: 4
             color: mouseArea.containsMouse ? "#F5F5F5" : "#FFFFFF"
             border.color: "#E0E0E0"
@@ -281,10 +282,21 @@ Rectangle {
                     Label {
                         text: {
                             if (!recordData) return ""
-                            return qsTr("点数: %1").arg(recordData.totalPoints || 0)
+                            var parts = [qsTr("点数: %1").arg(recordData.totalPoints || 0)]
+                            if ((recordData.meanThicknessMm || 0) > 0)
+                                parts.push(qsTr("均值: %1 mm").arg(Number(recordData.meanThicknessMm).toFixed(3)))
+                            if ((recordData.thicknessRangeMm || 0) > 0)
+                                parts.push(qsTr("极差: %1 mm").arg(Number(recordData.thicknessRangeMm).toFixed(3)))
+                            if ((recordData.stdDevThicknessMm || 0) > 0)
+                                parts.push(qsTr("σ: %1 mm").arg(Number(recordData.stdDevThicknessMm).toFixed(3)))
+                            if ((recordData.validRatePercent || 0) > 0)
+                                parts.push(qsTr("有效率: %1%").arg(Number(recordData.validRatePercent).toFixed(1)))
+                            return parts.join("   ")
                         }
                         font.pixelSize: 11
-                        color: "#9E9E9E"
+                        color: "#757575"
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
                     }
                 }
 
@@ -305,6 +317,16 @@ Rectangle {
                             drawer.open()
                         }
                     }
+                }
+
+                Button {
+                    text: qsTr("分析")
+                    Layout.preferredWidth: 80
+                    Layout.preferredHeight: 45
+                    font.pixelSize: 12
+                    Material.background: "#009688"
+                    Material.foreground: "white"
+                    onClicked: root.analysisRequested(index)
                 }
 
                 Button {

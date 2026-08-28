@@ -22,6 +22,7 @@
 #include "data/ThicknessHistoryItem.h"
 #include "data/HistoryManager.h"
 #include "data/HistoryGraphItem.h"
+#include "data/ProcessAnalyzer.h"
 
 int main(int argc, char *argv[])
 {
@@ -82,9 +83,11 @@ int main(int argc, char *argv[])
     auto *cmdCtrl       = new CommandController(comm, &app);
     auto *dataCtrl      = new DataController(&app);
     auto *historyMgr    = new HistoryManager(&app);
+    auto *processAnalyzer = new ProcessAnalyzer(&app);
 
-    // Wire history manager to data controller
+    // Wire history / process analysis
     dataCtrl->setHistoryManager(historyMgr);
+    processAnalyzer->setHistoryManager(historyMgr);
 
     // Load existing history from disk
     historyMgr->loadFromDisk(QDir::currentPath() + "/HistoryData");
@@ -133,6 +136,7 @@ int main(int argc, char *argv[])
     ctx->setContextProperty("commandController", cmdCtrl);
     ctx->setContextProperty("dataController", dataCtrl);
     ctx->setContextProperty("historyManager", historyMgr);
+    ctx->setContextProperty("processAnalyzer", processAnalyzer);
 
     // Initialize data controller
     dataCtrl->initialize();

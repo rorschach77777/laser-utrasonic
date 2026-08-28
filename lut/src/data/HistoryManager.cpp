@@ -10,11 +10,15 @@
 #include <QtConcurrent>
 #include <QFileInfo>
 #include <cmath>
+#include <limits>
 
 HistoryManager::HistoryManager(QObject *parent)
     : QObject(parent)
     , m_historyEnabled(false)
     , m_sessionActive(false)
+    , m_sessionNominalThicknessMm(0.0)
+    , m_sessionLineSpeedMps(0.0)
+    , m_sessionSampleRateHz(0.0)
 {
     m_dataDir = QDir::currentPath() + "/HistoryData";
     ensureDataDir();
@@ -39,6 +43,14 @@ QStringList HistoryManager::recordTitles() const
     return titles;
 }
 
+double HistoryManager::sessionPositionM() const
+{
+    if (m_sessionPositionData.isEmpty())
+        return 0.0;
+    const double value = m_sessionPositionData.last();
+    return std::isfinite(value) ? value : 0.0;
+}
+
 void HistoryManager::setHistoryEnabled(bool enabled)
 {
     if (m_historyEnabled != enabled) {
@@ -49,25 +61,69 @@ void HistoryManager::setHistoryEnabled(bool enabled)
 
 void HistoryManager::startSession()
 {
-    qDebug() << "[HistoryManager] startSession() called, sessionActive:" << m_sessionActive;
+    startPipeSession(QString(), QString(), 0.0, 0.0, 0.0);
+}
+
+void HistoryManager::startPipeSession(const QString &pipeId,
+                                      const QString &steelGrade,
+                                      double nominalThicknessMm,
+                                      double lineSpeedMps,
+                                      double sampleRateHz)
+{
+    qDebug() << "[HistoryManager] startPipeSession() called, sessionActive:" << m_sessionActive;
     if (m_sessionActive) {
-        qDebug() << "[HistoryManager] startSession: session already active, finishing first";
+        qDebug() << "[HistoryManager] startPipeSession: session already active, finishing first";
         finishSession();
     }
+
     m_sessionActive = true;
     m_sessionData.clear();
+    m_sessionPositionData.clear();
+    m_sessionSnrData.clear();
+    m_sessionValidData.clear();
     m_sessionId = generateId();
-    qDebug() << "[HistoryManager] startSession: new session started, id:" << m_sessionId;
+    m_sessionPipeId = pipeId.trimmed();
+    m_sessionSteelGrade = steelGrade.trimmed();
+    m_sessionNominalThicknessMm = qMax(0.0, nominalThicknessMm);
+    m_sessionLineSpeedMps = qMax(0.0, lineSpeedMps);
+    m_sessionSampleRateHz = qMax(0.0, sampleRateHz);
+    m_sessionStartTime = QDateTime::currentDateTime();
+    emit sessionActiveChanged();
+    emit sessionProgressChanged();
+
+    qDebug() << "[HistoryManager] startPipeSession: new session started, id:" << m_sessionId
+             << "pipeId:" << m_sessionPipeId
+             << "speed:" << m_sessionLineSpeedMps
+             << "sampleRate:" << m_sessionSampleRateHz;
 }
 
 void HistoryManager::appendThickness(double thickness)
 {
+    appendMeasurement(thickness, std::numeric_limits<double>::quiet_NaN(), !std::isnan(thickness));
+}
+
+void HistoryManager::appendMeasurement(double thickness, double snrDb, bool valid)
+{
     if (!m_sessionActive) return;
+
+    const int pointIndex = m_sessionData.size();
+    double positionM = std::numeric_limits<double>::quiet_NaN();
+    if (m_sessionLineSpeedMps > 0.0 && m_sessionSampleRateHz > 0.0) {
+        positionM = m_sessionLineSpeedMps * static_cast<double>(pointIndex) / m_sessionSampleRateHz;
+    }
+
     m_sessionData.append(thickness);
-    // Log every 100th point to avoid flooding
+    m_sessionPositionData.append(positionM);
+    m_sessionSnrData.append(snrDb);
+    m_sessionValidData.append(valid ? 1 : 0);
+    emit sessionProgressChanged();
+
     if (m_sessionData.size() % 100 == 1) {
-        qDebug() << "[HistoryManager] appendThickness: count=" << m_sessionData.size()
-                 << "lastVal=" << thickness;
+        qDebug() << "[HistoryManager] appendMeasurement: count=" << m_sessionData.size()
+                 << "positionM=" << positionM
+                 << "thickness=" << thickness
+                 << "snrDb=" << snrDb
+                 << "valid=" << valid;
     }
 }
 
@@ -79,10 +135,21 @@ void HistoryManager::finishSession()
     if (!m_sessionActive) return;
 
     m_sessionActive = false;
+    emit sessionActiveChanged();
 
     if (m_sessionData.isEmpty()) {
         qDebug() << "[HistoryManager] finishSession: no data, skipping record creation";
         m_sessionData.clear();
+        m_sessionPositionData.clear();
+        m_sessionSnrData.clear();
+        m_sessionValidData.clear();
+        m_sessionPipeId.clear();
+        m_sessionSteelGrade.clear();
+        m_sessionNominalThicknessMm = 0.0;
+        m_sessionLineSpeedMps = 0.0;
+        m_sessionSampleRateHz = 0.0;
+        m_sessionStartTime = QDateTime();
+        emit sessionProgressChanged();
         return;
     }
 
@@ -90,10 +157,57 @@ void HistoryManager::finishSession()
 
     HistoryRecord record;
     record.id = m_sessionId;
-    record.startTime = QDateTime::currentDateTime();
-    record.title = record.startTime.toString("yyyy-MM-dd HH:mm:ss");
+    record.pipeId = m_sessionPipeId;
+    record.steelGrade = m_sessionSteelGrade;
+    record.nominalThicknessMm = m_sessionNominalThicknessMm;
+    record.lineSpeedMps = m_sessionLineSpeedMps;
+    record.sampleRateHz = m_sessionSampleRateHz;
+    record.startTime = m_sessionStartTime.isValid() ? m_sessionStartTime : QDateTime::currentDateTime();
+    record.endTime = QDateTime::currentDateTime();
+    record.title = record.pipeId.isEmpty()
+        ? record.startTime.toString("yyyy-MM-dd HH:mm:ss")
+        : record.pipeId;
     record.totalPoints = m_sessionData.size();
+    record.positionDataM = m_sessionPositionData;
     record.thicknessData = m_sessionData;
+    record.snrDataDb = m_sessionSnrData;
+    record.validData = m_sessionValidData;
+    if (!record.positionDataM.isEmpty() && std::isfinite(record.positionDataM.last())) {
+        record.pipeLengthM = record.positionDataM.last();
+    }
+
+    int validCount = 0;
+    double sum = 0.0;
+    double sumSq = 0.0;
+    double minVal = std::numeric_limits<double>::max();
+    double maxVal = -std::numeric_limits<double>::max();
+    for (int i = 0; i < record.thicknessData.size(); ++i) {
+        const double value = record.thicknessData[i];
+        const bool valid = i < record.validData.size()
+            ? record.validData[i] != 0
+            : std::isfinite(value);
+        if (!valid || !std::isfinite(value))
+            continue;
+
+        ++validCount;
+        sum += value;
+        sumSq += value * value;
+        minVal = qMin(minVal, value);
+        maxVal = qMax(maxVal, value);
+    }
+
+    if (validCount > 0) {
+        record.meanThicknessMm = sum / validCount;
+        record.minThicknessMm = minVal;
+        record.maxThicknessMm = maxVal;
+        record.thicknessRangeMm = maxVal - minVal;
+        const double variance = qMax(0.0, sumSq / validCount
+                                           - record.meanThicknessMm * record.meanThicknessMm);
+        record.stdDevThicknessMm = std::sqrt(variance);
+    }
+    record.validRatePercent = record.totalPoints > 0
+        ? static_cast<double>(validCount) / record.totalPoints * 100.0
+        : 0.0;
 
     // Save to disk
     saveRecordToDisk(record);
@@ -109,6 +223,18 @@ void HistoryManager::finishSession()
     emit recordListChanged();
     emit sessionFinished(record.id);
     qDebug() << "[HistoryManager] finishSession: record saved, file:" << record.filePath;
+
+    m_sessionData.clear();
+    m_sessionPositionData.clear();
+    m_sessionSnrData.clear();
+    m_sessionValidData.clear();
+    m_sessionPipeId.clear();
+    m_sessionSteelGrade.clear();
+    m_sessionNominalThicknessMm = 0.0;
+    m_sessionLineSpeedMps = 0.0;
+    m_sessionSampleRateHz = 0.0;
+    m_sessionStartTime = QDateTime();
+    emit sessionProgressChanged();
 }
 
 QVariantMap HistoryManager::getRecord(int index) const
@@ -119,9 +245,23 @@ QVariantMap HistoryManager::getRecord(int index) const
 
     const auto &rec = m_records[index];
     QVariantMap map;
+    map["schemaVersion"] = rec.schemaVersion;
     map["id"] = rec.id;
     map["title"] = rec.displayTitle();
+    map["pipeId"] = rec.pipeId;
+    map["steelGrade"] = rec.steelGrade;
+    map["nominalThicknessMm"] = rec.nominalThicknessMm;
+    map["lineSpeedMps"] = rec.lineSpeedMps;
+    map["sampleRateHz"] = rec.sampleRateHz;
+    map["pipeLengthM"] = rec.pipeLengthM;
+    map["meanThicknessMm"] = rec.meanThicknessMm;
+    map["maxThicknessMm"] = rec.maxThicknessMm;
+    map["minThicknessMm"] = rec.minThicknessMm;
+    map["thicknessRangeMm"] = rec.thicknessRangeMm;
+    map["stdDevThicknessMm"] = rec.stdDevThicknessMm;
+    map["validRatePercent"] = rec.validRatePercent;
     map["startTime"] = rec.startTime.toString("yyyy-MM-dd HH:mm:ss");
+    map["endTime"] = rec.endTime.isValid() ? rec.endTime.toString("yyyy-MM-dd HH:mm:ss") : QString();
     map["totalPoints"] = rec.totalPoints;
     map["filePath"] = rec.filePath;
     return map;
@@ -133,6 +273,35 @@ QVector<double> HistoryManager::getRecordData(int index) const
     if (index < 0 || index >= m_records.size())
         return {};
     return m_records[index].thicknessData;
+}
+
+QVector<double> HistoryManager::getRecordPositionData(int index) const
+{
+    QMutexLocker locker(&m_mutex);
+    if (index < 0 || index >= m_records.size())
+        return {};
+    return m_records[index].positionDataM;
+}
+
+QVector<double> HistoryManager::getRecordSnrData(int index) const
+{
+    QMutexLocker locker(&m_mutex);
+    if (index < 0 || index >= m_records.size())
+        return {};
+    return m_records[index].snrDataDb;
+}
+
+QVector<int> HistoryManager::getRecordValidData(int index) const
+{
+    QMutexLocker locker(&m_mutex);
+    if (index < 0 || index >= m_records.size())
+        return {};
+
+    QVector<int> result;
+    result.reserve(m_records[index].validData.size());
+    for (quint8 value : m_records[index].validData)
+        result.append(value ? 1 : 0);
+    return result;
 }
 
 void HistoryManager::setRecordTitle(int index, const QString &title)
@@ -448,40 +617,71 @@ void HistoryManager::loadRecordData(int index)
     auto &rec = m_records[index];
     if (!rec.thicknessData.isEmpty()) return; // Already loaded
 
-    // Load from CSV
     QFile file(rec.filePath);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return;
 
     QTextStream in(&file);
-    QVector<double> data;
+    QVector<double> thicknessData;
+    QVector<double> positionData;
+    QVector<double> snrData;
+    QVector<quint8> validData;
     bool firstLine = true;
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
 
     while (!in.atEnd()) {
         QString line = in.readLine().trimmed();
         if (line.isEmpty()) continue;
+
         if (firstLine) {
             firstLine = false;
-            if (line.startsWith("Index", Qt::CaseInsensitive)) continue;
+            if (line.startsWith("Index", Qt::CaseInsensitive))
+                continue;
         }
 
-        double val = 0.0;
-        if (line.compare("NaN", Qt::CaseInsensitive) == 0) {
-            val = std::numeric_limits<double>::quiet_NaN();
-        } else if (line.contains(',')) {
-            QStringList parts = line.split(',');
-            QString valStr = parts.size() >= 2 ? parts[1].trimmed() : parts[0].trimmed();
-            if (valStr.compare("NaN", Qt::CaseInsensitive) == 0) {
-                val = std::numeric_limits<double>::quiet_NaN();
-            } else {
-                val = valStr.toDouble();
-            }
-        } else {
-            val = line.toDouble();
+        const QStringList parts = line.split(',');
+        QString thicknessText;
+        if (parts.size() >= 2)
+            thicknessText = parts[1].trimmed();
+        else if (!parts.isEmpty())
+            thicknessText = parts[0].trimmed();
+
+        double thickness = nan;
+        if (thicknessText.compare("NaN", Qt::CaseInsensitive) != 0) {
+            bool ok = false;
+            const double parsed = thicknessText.toDouble(&ok);
+            if (ok) thickness = parsed;
         }
-        data.append(val);
+        thicknessData.append(thickness);
+
+        double position = nan;
+        if (parts.size() >= 3 && !parts[2].trimmed().isEmpty()) {
+            bool ok = false;
+            const double parsed = parts[2].trimmed().toDouble(&ok);
+            if (ok) position = parsed;
+        }
+        positionData.append(position);
+
+        double snr = nan;
+        if (parts.size() >= 4 && !parts[3].trimmed().isEmpty()) {
+            bool ok = false;
+            const double parsed = parts[3].trimmed().toDouble(&ok);
+            if (ok) snr = parsed;
+        }
+        snrData.append(snr);
+
+        bool valid = std::isfinite(thickness);
+        if (parts.size() >= 5 && !parts[4].trimmed().isEmpty()) {
+            const QString validText = parts[4].trimmed();
+            valid = validText == "1" || validText.compare("true", Qt::CaseInsensitive) == 0;
+        }
+        validData.append(valid ? 1 : 0);
     }
 
-    rec.thicknessData = data;
+    rec.thicknessData = thicknessData;
+    rec.positionDataM = positionData;
+    rec.snrDataDb = snrData;
+    rec.validData = validData;
 }
 
 QVector<double> HistoryManager::interpolateData(const QVector<double> &rawData) const
@@ -566,12 +766,28 @@ void HistoryManager::loadFromDisk(const QString &dataDir)
     for (const auto &recVal : records) {
         QJsonObject obj = recVal.toObject();
         HistoryRecord rec;
+        rec.schemaVersion = obj.contains("schemaVersion")
+            ? obj["schemaVersion"].toInt(1)
+            : 1;
         rec.id = obj["id"].toString();
         rec.title = obj["title"].toString();
+        rec.pipeId = obj["pipeId"].toString();
+        rec.steelGrade = obj["steelGrade"].toString();
+        rec.nominalThicknessMm = obj["nominalThicknessMm"].toDouble(0.0);
+        rec.lineSpeedMps = obj["lineSpeedMps"].toDouble(0.0);
+        rec.sampleRateHz = obj["sampleRateHz"].toDouble(0.0);
+        rec.pipeLengthM = obj["pipeLengthM"].toDouble(0.0);
+        rec.meanThicknessMm = obj["meanThicknessMm"].toDouble(0.0);
+        rec.maxThicknessMm = obj["maxThicknessMm"].toDouble(0.0);
+        rec.minThicknessMm = obj["minThicknessMm"].toDouble(0.0);
+        rec.thicknessRangeMm = obj["thicknessRangeMm"].toDouble(0.0);
+        rec.stdDevThicknessMm = obj["stdDevThicknessMm"].toDouble(0.0);
+        rec.validRatePercent = obj["validRatePercent"].toDouble(0.0);
         rec.startTime = QDateTime::fromString(obj["startTime"].toString(), Qt::ISODate);
+        rec.endTime = QDateTime::fromString(obj["endTime"].toString(), Qt::ISODate);
         rec.filePath = obj["filePath"].toString();
         rec.totalPoints = obj["totalPoints"].toInt();
-        // thicknessData is loaded on demand via loadRecordData()
+        // Point data is loaded on demand via loadRecordData().
         m_records.append(rec);
     }
 
@@ -586,9 +802,23 @@ void HistoryManager::saveMetadata()
     QJsonArray records;
     for (const auto &rec : m_records) {
         QJsonObject obj;
+        obj["schemaVersion"] = rec.schemaVersion;
         obj["id"] = rec.id;
         obj["title"] = rec.title;
+        obj["pipeId"] = rec.pipeId;
+        obj["steelGrade"] = rec.steelGrade;
+        obj["nominalThicknessMm"] = rec.nominalThicknessMm;
+        obj["lineSpeedMps"] = rec.lineSpeedMps;
+        obj["sampleRateHz"] = rec.sampleRateHz;
+        obj["pipeLengthM"] = rec.pipeLengthM;
+        obj["meanThicknessMm"] = rec.meanThicknessMm;
+        obj["maxThicknessMm"] = rec.maxThicknessMm;
+        obj["minThicknessMm"] = rec.minThicknessMm;
+        obj["thicknessRangeMm"] = rec.thicknessRangeMm;
+        obj["stdDevThicknessMm"] = rec.stdDevThicknessMm;
+        obj["validRatePercent"] = rec.validRatePercent;
         obj["startTime"] = rec.startTime.toString(Qt::ISODate);
+        obj["endTime"] = rec.endTime.isValid() ? rec.endTime.toString(Qt::ISODate) : QString();
         obj["filePath"] = rec.filePath;
         obj["totalPoints"] = rec.totalPoints;
         records.append(obj);
@@ -621,16 +851,31 @@ void HistoryManager::saveRecordToDisk(const HistoryRecord &record)
     }
 
     QTextStream out(&file);
-    out << "Index,Thickness(mm)\n";
+    // Keep Thickness as the second column for backward compatibility with
+    // existing import/export code. New point-quality fields are appended.
+    out << "Index,Thickness(mm),Position(m),SNR(dB),Valid\n";
 
     const auto &data = record.thicknessData;
     for (int i = 0; i < data.size(); ++i) {
-        double val = data[i];
-        if (std::isnan(val)) {
-            out << (i + 1) << ",NaN\n";
-        } else {
-            out << (i + 1) << "," << QString::number(val, 'f', 6) << "\n";
-        }
+        const double thickness = data[i];
+        const double position = i < record.positionDataM.size()
+            ? record.positionDataM[i]
+            : std::numeric_limits<double>::quiet_NaN();
+        const double snr = i < record.snrDataDb.size()
+            ? record.snrDataDb[i]
+            : std::numeric_limits<double>::quiet_NaN();
+        const bool valid = i < record.validData.size()
+            ? record.validData[i] != 0
+            : std::isfinite(thickness);
+
+        out << (i + 1) << ",";
+        out << (std::isfinite(thickness) ? QString::number(thickness, 'f', 6) : QStringLiteral("NaN")) << ",";
+        if (std::isfinite(position))
+            out << QString::number(position, 'f', 6);
+        out << ",";
+        if (std::isfinite(snr))
+            out << QString::number(snr, 'f', 3);
+        out << "," << (valid ? 1 : 0) << "\n";
     }
 
     file.close();
