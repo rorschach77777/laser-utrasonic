@@ -117,6 +117,16 @@ void PollingService::onTick()
                 Reg::Input::SLAVE_WATER_COOLER_STATUS_COUNT,
                 [this](const QVector<uint16_t> &r) { parseWaterCoolerStatus(m_slaveWaterCooler, r); });
 
+        // Water cooler target-temperature readback
+        enqueue(PendingRead::HoldingRegs,
+                Reg::Hold::WATER_COOLER_TEMP_SET,
+                1,
+                [this](const QVector<uint16_t> &r) { parseWaterCoolerControl(m_waterCooler, r); });
+        enqueue(PendingRead::HoldingRegs,
+                Reg::Hold::SLAVE_WATER_COOLER_TEMP_SET,
+                1,
+                [this](const QVector<uint16_t> &r) { parseWaterCoolerControl(m_slaveWaterCooler, r); });
+
         // Holding readback: DFB control (0x0030, 6 regs)
         enqueue(PendingRead::HoldingRegs, Reg::Hold::DFB_CTRL_BASE, 6,
                 [this](const QVector<uint16_t> &r) { parseDfbControl(r); });

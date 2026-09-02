@@ -297,7 +297,8 @@ bool ProcessAnalyzer::analyzeRecord(int index,
     m_result["longAbnormal"] = longAbnormal;
     m_result["shortAbnormal"] = shortAbnormal;
     m_result["diagnosis"] = diagnosis;
-    m_result["thresholdNote"] = tr("当前长/短周期分界及报警阈值为软件初始参数，不能替代现场工艺标定。");
+    //m_result["thresholdNote"] = tr("当前长/短周期分界及报警阈值为软件初始参数，不能替代现场工艺标定。");
+    m_result["thresholdNote"] = tr("");
 
     m_hasAnalysis = true;
     emit analysisChanged();

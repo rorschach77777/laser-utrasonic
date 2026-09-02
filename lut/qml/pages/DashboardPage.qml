@@ -6,12 +6,14 @@ import QtQuick.Controls.Material
 ScrollView {
     id: root
     contentWidth: availableWidth
+    contentHeight: dashboardContent.implicitHeight
     clip: true
 
     property var mainWaterCooler: waterCoolerController ? waterCoolerController.model : null
     property var slaveWaterCooler: slaveWaterCoolerController ? slaveWaterCoolerController.model : null
 
     ColumnLayout {
+        id: dashboardContent
         width: root.availableWidth
         spacing: 12
 
@@ -40,6 +42,87 @@ ScrollView {
                 text: pollingService.active ? "状态轮询中" : "轮询停止"
                 font.pixelSize: 12
                 color: pollingService.active ? "#4CAF50" : "#757575"
+            }
+
+            Rectangle {
+                width: 1
+                height: 18
+                color: "#E0E0E0"
+                Layout.leftMargin: 8
+                Layout.rightMargin: 8
+            }
+
+            Rectangle {
+                width: 10
+                height: 10
+                radius: 5
+                color: healthMonitor.overallLevel === 3 ? "#F44336"
+                      : healthMonitor.overallLevel === 2 ? "#FF9800"
+                      : healthMonitor.overallLevel === 1 ? "#4CAF50"
+                      : "#9E9E9E"
+            }
+            Label {
+                text: "系统健康: " + healthMonitor.overallStatus
+                font.pixelSize: 12
+                font.bold: true
+                color: healthMonitor.overallLevel === 3 ? "#F44336"
+                     : healthMonitor.overallLevel === 2 ? "#FF9800"
+                     : healthMonitor.overallLevel === 1 ? "#4CAF50"
+                     : "#757575"
+            }
+            Label {
+                visible: healthMonitor.warningCount + healthMonitor.alarmCount > 0
+                text: "报警 " + healthMonitor.alarmCount + " / 警告 " + healthMonitor.warningCount
+                font.pixelSize: 11
+                color: healthMonitor.alarmCount > 0 ? "#F44336" : "#FF9800"
+            }
+        }
+
+        Pane {
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            padding: 10
+            Material.elevation: 2
+            visible: healthMonitor.monitoring
+
+            RowLayout {
+                anchors.fill: parent
+                spacing: 12
+
+                Label {
+                    text: healthMonitor.overallLevel === 1 ? "✓" : healthMonitor.overallLevel === 2 ? "⚠" : "!"
+                    font.pixelSize: 24
+                    font.bold: true
+                    color: healthMonitor.overallLevel === 3 ? "#F44336"
+                         : healthMonitor.overallLevel === 2 ? "#FF9800"
+                         : "#4CAF50"
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 2
+                    Label {
+                        text: healthMonitor.overallLevel === 1
+                              ? "当前监控设备状态正常"
+                              : "检测到设备状态或参数异常"
+                        font.pixelSize: 14
+                        font.bold: true
+                    }
+                    Label {
+                        text: healthMonitor.thresholdNote
+                        font.pixelSize: 10
+                        color: "#757575"
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                }
+
+                Button {
+                    text: "立即检查"
+                    Layout.preferredWidth: 120
+                    onClicked: healthMonitor.evaluateNow()
+                }
             }
         }
 
@@ -471,6 +554,95 @@ ScrollView {
                             Label { text: pump ? Number(pump.voltageActual).toFixed(2) + " V" : "--"; font.bold: true }
                             Label { text: "频率"; color: "#757575" }
                             Label { text: pump ? pump.freqActual + " Hz" : "--"; font.bold: true }
+                        }
+                    }
+                }
+            }
+        }
+
+        Label {
+            text: "当前报警"
+            font.pixelSize: 16
+            font.bold: true
+            color: "#3F51B5"
+            Layout.leftMargin: 20
+        }
+
+        Pane {
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.preferredHeight: alarmListColumn.implicitHeight + topPadding + bottomPadding
+            padding: 10
+            Material.elevation: 2
+
+            ColumnLayout {
+                id: alarmListColumn
+                width: parent.width
+                spacing: 6
+
+                Label {
+                    visible: healthMonitor.alarms.length === 0
+                    text: healthMonitor.monitoring ? "当前无设备报警。" : "系统未进入健康监控状态。"
+                    color: healthMonitor.monitoring ? "#4CAF50" : "#757575"
+                    font.pixelSize: 12
+                }
+
+                Repeater {
+                    model: healthMonitor.alarms
+
+                    delegate: Rectangle {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        implicitHeight: alarmContent.implicitHeight + 16
+                        radius: 4
+                        color: modelData.severity >= 2 ? "#FFEBEE" : "#FFF8E1"
+                        border.color: modelData.severity >= 2 ? "#EF9A9A" : "#FFE082"
+
+                        ColumnLayout {
+                            id: alarmContent
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: 8
+                            spacing: 3
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Label {
+                                    text: modelData.severityText
+                                    font.bold: true
+                                    color: modelData.severity >= 2 ? "#D32F2F" : "#F57C00"
+                                }
+                                Label {
+                                    text: modelData.device
+                                    font.bold: true
+                                    color: "#212121"
+                                }
+                                Label {
+                                    text: "— " + modelData.message
+                                    color: "#424242"
+                                }
+                                Item { Layout.fillWidth: true }
+                                Label {
+                                    text: modelData.code
+                                    font.pixelSize: 9
+                                    color: "#9E9E9E"
+                                }
+                            }
+
+                            Label {
+                                text: "当前: " + modelData.value + "    正常: " + modelData.normal
+                                font.pixelSize: 11
+                                color: "#616161"
+                            }
+                            Label {
+                                text: "建议: " + modelData.suggestion
+                                font.pixelSize: 11
+                                color: "#616161"
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                         }
                     }
                 }

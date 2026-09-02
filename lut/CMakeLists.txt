@@ -147,6 +147,8 @@ set(PREBUILT_IMPORT_LIBS
 
 qt_add_executable(appLST
     main.cpp
+    src/monitor/HealthMonitor.cpp
+    src/monitor/HealthMonitor.h
 )
 
 qt_add_qml_module(appLST
