@@ -332,6 +332,25 @@ void DataController::setSavePerFrame(bool enabled)
     }
 }
 
+void DataController::setWaveformRefreshInterval(int interval)
+{
+    // 测量界面只提供 1 / 10 / 100 三档。该参数仅控制波形图和峰值标记的刷新抽帧，
+    // 不影响采集频率、每帧测厚计算、厚度历史更新和历史数据记录。
+    int normalized = 1;
+    if (interval == 10)
+        normalized = 10;
+    else if (interval == 100)
+        normalized = 100;
+
+    const int previous = m_waveformRefreshInterval.exchange(normalized, std::memory_order_relaxed);
+    if (previous == normalized)
+        return;
+
+    // 切换档位后从下一帧重新计数，保证新的刷新周期立即生效。
+    m_waveformFrameCounter.store(0, std::memory_order_relaxed);
+    emit waveformRefreshIntervalChanged();
+}
+
 void DataController::setHistoryRecording(bool enabled)
 {
     qDebug() << "[DataController] setHistoryRecording called, enabled:" << enabled
@@ -534,6 +553,7 @@ void DataController::startAcquisition()
     m_running = true;
     m_paused = false;
     m_saveFrameCounter = 0;
+    m_waveformFrameCounter.store(0, std::memory_order_relaxed);
 
     emit runningChanged();
     emit pausedChanged();
@@ -1074,34 +1094,57 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
 
         flagForRecordEnd = (errorCode == WarningRecordEnd) ? true : false;
         int pointsPerChan = returnedCount / p->m_configure.channelCount;
-        double* displayData = p->m_scaledData;
-        int plotCount = 1;
-
-        // 复用 filtered 向量
+        // 复用 filtered 向量。滤波和后续测厚仍然对每一帧执行，不能因为降低UI刷新率而抽掉测量帧。
         filtered.resize(pointsPerChan);
         p->applyBandpassFilter(p->m_scaledData, filtered.data(), pointsPerChan);
         p->detrendSignal(filtered);
 
-        // 根据开关决定显示内容
-        bool showOriginal = p->m_showOriginal;
-        if (showOriginal) {
-            combined.resize(2 * pointsPerChan);
-            for (int i = 0; i < pointsPerChan; ++i) {
-                combined[2 * i]     = p->m_scaledData[i];
-                combined[2 * i + 1] = filtered[i];
-            }
-            displayData = combined.data();
-            plotCount = 2;
-        } else {
-            displayData = filtered.data();
-            plotCount = 1;
+        // 波形图显示抽帧：只对“完整的一帧波形”计数。
+        // 注意：WarningRecordEnd 在当前 SectionCount=1 的触发采集中可能几乎每帧都会出现，
+        // 因此不能把 flagForRecordEnd 当作“强制刷新”条件，否则 10/100 档会退化为每帧刷新。
+        // 这里只限制 dataReady/marker 的UI刷新，不改变厚度历史、统计、历史记录和波形保存频率。
+        const bool completeWaveform = (pointsPerChan == p->m_configure.sectionLength);
+        bool refreshWaveform = false;
+        if (completeWaveform) {
+            const quint64 waveformFrame =
+                p->m_waveformFrameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+            const int waveformRefreshInterval =
+                std::max(1, p->m_waveformRefreshInterval.load(std::memory_order_relaxed));
+
+            // 首帧立即显示；之后每隔 N 个完整波形刷新一次。
+            // N=1  -> 1,2,3,4...
+            // N=10 -> 1,11,21,31...
+            // N=100-> 1,101,201,301...
+            refreshWaveform = waveformRefreshInterval == 1
+                || waveformFrame == 1
+                || ((waveformFrame - 1) % static_cast<quint64>(waveformRefreshInterval) == 0);
         }
 
-        double xInc = p->m_xInc;
-        QVector<double> qvDisplayData(displayData, displayData + plotCount * pointsPerChan);
-        QMetaObject::invokeMethod(p, [p, qvDisplayData, plotCount, pointsPerChan, xInc, flagForRecordEnd]() {
-            emit p->dataReady(qvDisplayData, plotCount, pointsPerChan, xInc, flagForRecordEnd);
-        }, Qt::QueuedConnection);
+        if (refreshWaveform) {
+            double* displayData = p->m_scaledData;
+            int plotCount = 1;
+
+            // 根据开关决定显示原始+滤波两条曲线，或仅显示滤波曲线。
+            if (p->m_showOriginal) {
+                combined.resize(2 * pointsPerChan);
+                for (int i = 0; i < pointsPerChan; ++i) {
+                    combined[2 * i]     = p->m_scaledData[i];
+                    combined[2 * i + 1] = filtered[i];
+                }
+                displayData = combined.data();
+                plotCount = 2;
+            } else {
+                displayData = filtered.data();
+            }
+
+            const double xInc = p->m_xInc;
+            QVector<double> qvDisplayData(displayData, displayData + plotCount * pointsPerChan);
+            QMetaObject::invokeMethod(p,
+                [p, qvDisplayData, plotCount, pointsPerChan, xInc, flagForRecordEnd]() {
+                    emit p->dataReady(qvDisplayData, plotCount, pointsPerChan, xInc, flagForRecordEnd);
+                },
+                Qt::QueuedConnection);
+        }
 
         if (pointsPerChan == p->m_configure.sectionLength)
         {
@@ -1133,7 +1176,7 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
                 }
             }
 
-            QMetaObject::invokeMethod(p, [p, thickness, peakTimeSec, peakVoltage, snr]() {
+            QMetaObject::invokeMethod(p, [p, thickness, peakTimeSec, peakVoltage, snr, refreshWaveform]() {
                 p->m_thickness = thickness;
                 p->m_snr = snr;
                 p->m_totalAttempts++;
@@ -1155,9 +1198,12 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
                     p->m_historyManager->appendMeasurement(thickness, snr, std::isfinite(thickness));
                 }
 
-                emit p->clearMarkersRequested();
+                // 峰值标记必须和当前实际刷新的波形属于同一帧，否则抽帧后会出现marker与曲线错位。
+                if (refreshWaveform) {
+                    emit p->clearMarkersRequested();
+                    emit p->markerReady(peakTimeSec, peakVoltage);
+                }
                 emit p->thicknessChanged();
-                emit p->markerReady(peakTimeSec, peakVoltage);
                 emit p->snrChanged();
                 emit p->thicknessStatsChanged();
                 emit p->thicknessHistoryUpdated(thickness);

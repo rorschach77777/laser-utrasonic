@@ -5,6 +5,7 @@
 #include <QMutex>
 #include <QVector>
 #include <QString>
+#include <atomic>
 #include <vector>
 #include "bdaqctrl.h"
 #include "HistoryManager.h"
@@ -57,6 +58,7 @@ class DataController : public QObject
     Q_PROPERTY(bool autoScale READ autoScale WRITE setAutoScale NOTIFY autoScaleChanged)
     Q_PROPERTY(bool showOriginal READ showOriginal WRITE setShowOriginal NOTIFY showOriginalChanged)
     Q_PROPERTY(bool savePerFrame READ savePerFrame WRITE setSavePerFrame NOTIFY savePerFrameChanged)
+    Q_PROPERTY(int waveformRefreshInterval READ waveformRefreshInterval WRITE setWaveformRefreshInterval NOTIFY waveformRefreshIntervalChanged)
     Q_PROPERTY(bool historyRecording READ historyRecording WRITE setHistoryRecording NOTIFY historyRecordingChanged)
     Q_PROPERTY(QString detectionRateText READ detectionRateText NOTIFY detectionRateChanged)
     Q_PROPERTY(QString thicknessText READ thicknessText NOTIFY thicknessChanged)
@@ -116,6 +118,7 @@ public:
     bool autoScale() const { return m_autoScale; }
     bool showOriginal() const { return m_showOriginal; }
     bool savePerFrame() const { return m_savePerFrame; }
+    int waveformRefreshInterval() const { return m_waveformRefreshInterval.load(std::memory_order_relaxed); }
     bool isTriggerSupported() const { return m_isTriggerSupported; }
     QString detectionRateText() const;
     QString thicknessText() const;
@@ -127,6 +130,7 @@ public:
     Q_INVOKABLE void setAutoScale(bool enabled);
     Q_INVOKABLE void setShowOriginal(bool enabled);
     Q_INVOKABLE void setSavePerFrame(bool enabled);
+    Q_INVOKABLE void setWaveformRefreshInterval(int interval);
 
     // History recording
     bool historyRecording() const { return m_historyRecording; }
@@ -166,6 +170,7 @@ signals:
     void autoScaleChanged();
     void showOriginalChanged();
     void savePerFrameChanged();
+    void waveformRefreshIntervalChanged();
 
     // Data ready signal for graph update
     void dataReady(const QVector<double> &data, int plotCount, int pointsPerChan,
@@ -209,6 +214,9 @@ private:
     bool m_autoScale;
     bool m_showOriginal;
     bool m_savePerFrame;
+    // 波形图只负责显示，可按1/10/100帧抽帧刷新；采集、测厚和厚度历史仍逐帧处理。
+    std::atomic<int> m_waveformRefreshInterval{1};
+    std::atomic<quint64> m_waveformFrameCounter{0};
     bool m_historyRecording; // Whether to record for history - default false
     HistoryManager *m_historyManager;
 

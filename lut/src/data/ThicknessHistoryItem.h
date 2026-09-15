@@ -19,7 +19,7 @@ public:
 
 private:
     QVector<double> m_thicknesses;
-    static const int MAX_POINTS = 100;
+    static const int MAX_POINTS = 1000;
     double m_minThickness;
     double m_maxThickness;
 

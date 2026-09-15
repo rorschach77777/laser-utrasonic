@@ -515,6 +515,30 @@ ScrollView {
                                 if (dataController) dataController.setShowOriginal(checked)
                             }
                         }
+                        Item { Layout.preferredWidth: 8 }
+                        Label {
+                            text: "波形刷新"
+                            font.pixelSize: 12
+                            color: "#424242"
+                        }
+                        ComboBox {
+                            id: cmbWaveformRefresh
+                            Layout.preferredWidth: 145
+                            model: ["每1个波形", "每10个波形", "每100个波形"]
+                            currentIndex: {
+                                if (!dataController) return 0
+                                if (dataController.waveformRefreshInterval === 100) return 2
+                                if (dataController.waveformRefreshInterval === 10) return 1
+                                return 0
+                            }
+                            onActivated: {
+                                if (!dataController) return
+                                var intervals = [1, 10, 100]
+                                dataController.setWaveformRefreshInterval(intervals[currentIndex])
+                            }
+                            ToolTip.visible: hovered
+                            ToolTip.text: "仅降低信号波形和峰值标记的界面刷新频率；100 Hz测厚和厚度历史仍逐帧更新"
+                        }
                         Item { Layout.fillWidth: true }
                     }
                 }

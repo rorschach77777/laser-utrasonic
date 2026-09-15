@@ -259,22 +259,23 @@ ScrollView {
                         label: "LD 开关"
                         editorType: "switch"
                         switchValue: dfbController.model.ldSwitch
-                        enabled: deviceComm.connected && !multiModePumpController.model.pumpSwitch
+                        // enabled: deviceComm.connected && !multiModePumpController.model.pumpSwitch
+                        enabled: deviceComm.connected
                         onValueCommitted: function(value) {
                             dfbController.writeLdSwitch(value)
                         }
                     }
 
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: multiModePumpController.model.pumpSwitch
-                        visible: enabled
-                        z: 1
-                        onClicked: {
-                            interlockDialog.message = "请先关闭多模泵，再关闭 LD"
-                            interlockDialog.open()
-                        }
-                    }
+                    // MouseArea {
+                    //     anchors.fill: parent
+                    //     enabled: multiModePumpController.model.pumpSwitch
+                    //     visible: enabled
+                    //     z: 1
+                    //     onClicked: {
+                    //         interlockDialog.message = "请先关闭多模泵，再关闭 LD"
+                    //         interlockDialog.open()
+                    //     }
+                    // }
                 }
 
                 Comp.InlineParamRow {
@@ -412,25 +413,26 @@ ScrollView {
                         label: "泵开关"
                         editorType: "switch"
                         switchValue: multiModePumpController.model.pumpSwitch
-                        enabled: deviceComm.connected && dfbController.model.online && dfbController.model.ldSwitch
+                        // enabled: deviceComm.connected && dfbController.model.online && dfbController.model.ldSwitch
+                        enabled: deviceComm.connected
                         onValueCommitted: function(value) {
                             multiModePumpController.writeSwitch(value)
                         }
                     }
 
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: !dfbController.model.online || !dfbController.model.ldSwitch
-                        visible: enabled
-                        z: 1
-                        onClicked: {
-                            if (!dfbController.model.online)
-                                interlockDialog.message = "DFB 离线，无法开启多模泵"
-                            else
-                                interlockDialog.message = "请先开启 LD，再开启多模泵"
-                            interlockDialog.open()
-                        }
-                    }
+                    // MouseArea {
+                    //     anchors.fill: parent
+                    //     enabled: !dfbController.model.online || !dfbController.model.ldSwitch
+                    //     visible: enabled
+                    //     z: 1
+                    //     onClicked: {
+                    //         if (!dfbController.model.online)
+                    //             interlockDialog.message = "DFB 离线，无法开启多模泵"
+                    //         else
+                    //             interlockDialog.message = "请先开启 LD，再开启多模泵"
+                    //         interlockDialog.open()
+                    //     }
+                    // }
                 }
 
                 Comp.InlineParamRow {
