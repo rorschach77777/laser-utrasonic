@@ -1,7 +1,10 @@
 #include "DataController.h"
 #include "bdaqctrl.h"
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
+#include <QEvent>
+#include <QThread>
 #include <QFile>
 #include <QTextStream>
 #include <QElapsedTimer>
@@ -16,6 +19,91 @@ using namespace Automation::BDaq;
 #endif
 
 #define LOCAL_EDGE "Local"
+
+namespace {
+
+// 与 LSTAlgorithmTest 保持一致：用 7 点局部交流能量计算信号/噪声功率，
+// 并用搜索窗外多个背景窗口能量的中位数作为噪声基线。
+constexpr int SNR_ENERGY_WINDOW_SAMPLES = 7;
+
+double snrLocalEnergy(const std::vector<double> &signal, int center, int halfWidth)
+{
+    if (center - halfWidth < 0
+        || center + halfWidth >= static_cast<int>(signal.size()))
+        return std::numeric_limits<double>::quiet_NaN();
+
+    double mean = 0.0;
+    for (int i = center - halfWidth; i <= center + halfWidth; ++i)
+        mean += signal[i];
+    const int count = 2 * halfWidth + 1;
+    mean /= count;
+
+    double energy = 0.0;
+    for (int i = center - halfWidth; i <= center + halfWidth; ++i) {
+        const double value = signal[i] - mean;
+        energy += value * value;
+    }
+    return energy / count;
+}
+
+double snrMedian(std::vector<double> &values)
+{
+    if (values.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+    const size_t middle = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + middle, values.end());
+    const double upper = values[middle];
+    if (values.size() % 2 != 0)
+        return upper;
+    const double lower = *std::max_element(values.begin(), values.begin() + middle);
+    return 0.5 * (lower + upper);
+}
+
+double calculateAlgorithmTestSnr(const std::vector<double> &signal,
+                                 int peakIndex,
+                                 int searchLeft,
+                                 int searchRight,
+                                 int filterOrder)
+{
+    const int half = SNR_ENERGY_WINDOW_SAMPLES / 2;
+    const int edge = filterOrder + half;
+    // 100 Hz实时路径复用背景能量缓冲区，避免每帧重新申请/释放堆内存。
+    // snrMedian() 会原地重排该临时数组，但不会改变输入波形或计算结果。
+    static thread_local std::vector<double> background;
+    background.clear();
+    const int estimatedWindows = (std::max)(1,
+        static_cast<int>(signal.size()) / SNR_ENERGY_WINDOW_SAMPLES);
+    if (static_cast<int>(background.capacity()) < estimatedWindows)
+        background.reserve(estimatedWindows);
+
+    // 与 LSTAlgorithmTest 的 estimateNoiseEnergy() 一致：
+    // 排除 FIR 边界和理论搜索窗，在剩余背景区按相同17点窗口取局部交流能量，
+    // 再以多个背景窗口能量的中位数作为 noiseEnergy。
+    for (int center = edge; center + edge < static_cast<int>(signal.size());
+         center += SNR_ENERGY_WINDOW_SAMPLES) {
+        if (center + half >= searchLeft - filterOrder
+            && center - half <= searchRight + filterOrder)
+            continue;
+
+        const double energy = snrLocalEnergy(signal, center, half);
+        if (std::isfinite(energy))
+            background.push_back(energy);
+    }
+
+    // LSTAlgorithmTest 在不足4个背景窗口时判 INSUFFICIENT_NOISE；
+    // 主 LST 此处只负责显示/记录 SNR，不改变原测厚判定，因此返回0 dB。
+    if (background.size() < 4)
+        return 0.0;
+
+    const double noiseEnergy = (std::max)(snrMedian(background), 1e-24);
+    const double signalEnergy = snrLocalEnergy(signal, peakIndex, half);
+    if (!std::isfinite(signalEnergy))
+        return 0.0;
+
+    return 10.0 * std::log10((std::max)(signalEnergy, 1e-24) / noiseEnergy);
+}
+
+} // namespace
 
 DataController::DataController(QObject *parent)
     : QObject(parent)
@@ -70,6 +158,15 @@ DataController::DataController(QObject *parent)
 
 DataController::~DataController()
 {
+    // 析构时先停DAQ，确保不会再有新帧进入处理队列；随后按“处理→保存”顺序排空。
+    if (m_waveformAiCtrl) {
+        WaveformAiCtrl *ctrl = static_cast<WaveformAiCtrl*>(m_waveformAiCtrl);
+        ctrl->Stop();
+    }
+    stopProcessingWorker();
+    flushPendingResultCommits();
+    stopSaveWorker();
+
     if (m_waveformAiCtrl) {
         WaveformAiCtrl *ctrl = static_cast<WaveformAiCtrl*>(m_waveformAiCtrl);
         ctrl->Release();
@@ -309,27 +406,135 @@ void DataController::setAutoScale(bool enabled)
 
 void DataController::setShowOriginal(bool enabled)
 {
-    if (m_showOriginal != enabled) {
-        m_showOriginal = enabled;
+    const bool previous = m_showOriginal.exchange(enabled, std::memory_order_relaxed);
+    if (previous != enabled)
         emit showOriginalChanged();
-    }
 }
 
 void DataController::setSavePerFrame(bool enabled)
 {
-    if (m_savePerFrame != enabled) {
-        m_savePerFrame = enabled;
-        if (enabled) {
-            QString timeStr = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-            m_saveFolder = QString("FrameData_%1").arg(timeStr);
-            QDir dir;
-            if (!dir.mkpath(m_saveFolder)) {
-                m_savePerFrame = false;
-                emit errorOccurred(tr("Cannot create save folder."));
-            }
+    if (m_savePerFrame.load(std::memory_order_acquire) == enabled)
+        return;
+
+    if (enabled) {
+        const QString timeStr = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+        const QString folder = QString("FrameData_%1").arg(timeStr);
+        QDir dir;
+        if (!dir.mkpath(folder)) {
+            m_savePerFrame.store(false, std::memory_order_release);
+            emit errorOccurred(tr("Cannot create save folder."));
+            emit savePerFrameChanged();
+            return;
         }
-        emit savePerFrameChanged();
+        {
+            QMutexLocker locker(&m_fileMutex);
+            m_saveFolder = folder;
+        }
+        ensureSaveWorkerStarted();
     }
+
+    // 关闭开关只停止新帧入队，已经入队的帧继续由写盘线程按FIFO完整保存。
+    m_savePerFrame.store(enabled, std::memory_order_release);
+    emit savePerFrameChanged();
+}
+
+void DataController::ensureSaveWorkerStarted()
+{
+    std::lock_guard<std::mutex> locker(m_saveQueueMutex);
+    if (m_saveWorker.joinable())
+        return;
+    m_saveWorkerStop = false;
+    m_saveWorkerBusy = false;
+    m_saveWorker = std::thread(&DataController::saveWorkerLoop, this);
+}
+
+void DataController::enqueueFrameSave(FrameSaveJob job)
+{
+    ensureSaveWorkerStarted();
+    quint64 queueSize = 0;
+    {
+        std::lock_guard<std::mutex> locker(m_saveQueueMutex);
+        m_saveQueue.push_back(std::move(job));
+        queueSize = static_cast<quint64>(m_saveQueue.size());
+    }
+
+    quint64 previousPeak = m_saveQueuePeak.load(std::memory_order_relaxed);
+    while (queueSize > previousPeak
+           && !m_saveQueuePeak.compare_exchange_weak(previousPeak, queueSize,
+                                                      std::memory_order_relaxed)) {
+    }
+    m_saveQueueCv.notify_one();
+}
+
+void DataController::drainSaveQueue()
+{
+    if (!m_saveWorker.joinable())
+        return;
+    std::unique_lock<std::mutex> locker(m_saveQueueMutex);
+    m_saveQueueDrainedCv.wait(locker, [this]() {
+        return m_saveQueue.empty() && !m_saveWorkerBusy;
+    });
+}
+
+void DataController::stopSaveWorker()
+{
+    if (!m_saveWorker.joinable())
+        return;
+    drainSaveQueue();
+    {
+        std::lock_guard<std::mutex> locker(m_saveQueueMutex);
+        m_saveWorkerStop = true;
+    }
+    m_saveQueueCv.notify_all();
+    m_saveWorker.join();
+}
+
+void DataController::saveWorkerLoop()
+{
+    for (;;) {
+        FrameSaveJob job;
+        {
+            std::unique_lock<std::mutex> locker(m_saveQueueMutex);
+            m_saveQueueCv.wait(locker, [this]() {
+                return m_saveWorkerStop || !m_saveQueue.empty();
+            });
+            if (m_saveWorkerStop && m_saveQueue.empty())
+                break;
+
+            job = std::move(m_saveQueue.front());
+            m_saveQueue.pop_front();
+            m_saveWorkerBusy = true;
+        }
+
+        QFile file(job.fileName);
+        if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream out(&file);
+            out << "Index,Original,Filtered,Thickness\n";
+            const QString thickStr = std::isnan(job.thickness)
+                ? QStringLiteral("NaN") : QString::number(job.thickness, 'f', 6);
+            const int count = static_cast<int>((std::min)(job.original.size(), job.filtered.size()));
+            for (int i = 0; i < count; ++i) {
+                out << i << ","
+                    << job.original[static_cast<size_t>(i)] << ","
+                    << job.filtered[static_cast<size_t>(i)] << ","
+                    << thickStr << "\n";
+            }
+            file.close();
+        } else {
+            qWarning() << "Cannot open file for writing:" << job.fileName;
+        }
+
+        {
+            std::lock_guard<std::mutex> locker(m_saveQueueMutex);
+            m_saveWorkerBusy = false;
+            if (m_saveQueue.empty())
+                m_saveQueueDrainedCv.notify_all();
+        }
+    }
+
+    std::lock_guard<std::mutex> locker(m_saveQueueMutex);
+    m_saveWorkerBusy = false;
+    m_saveQueueDrainedCv.notify_all();
 }
 
 void DataController::setWaveformRefreshInterval(int interval)
@@ -552,8 +757,14 @@ void DataController::startAcquisition()
 
     m_running = true;
     m_paused = false;
-    m_saveFrameCounter = 0;
+    {
+        QMutexLocker locker(&m_fileMutex);
+        m_saveFrameCounter = 0;
+    }
+    m_saveQueuePeak.store(0, std::memory_order_relaxed);
+    m_processingQueuePeak.store(0, std::memory_order_relaxed);
     m_waveformFrameCounter.store(0, std::memory_order_relaxed);
+    ensureProcessingWorkerStarted();
 
     emit runningChanged();
     emit pausedChanged();
@@ -579,6 +790,11 @@ void DataController::pauseAcquisition()
         checkError(errorCode);
         return;
     }
+
+    // Stop()返回后不再接收新采集帧；等待已经获取的帧按FIFO处理完，保证暂停点无遗漏。
+    drainProcessingQueue();
+    flushPendingResultCommits();
+    drainSaveQueue();
 
     m_paused = true;
     emit pausedChanged();
@@ -611,6 +827,17 @@ void DataController::stopAcquisition()
     checkError(errorCode);
     m_running = false;
     m_paused = false;
+
+    // DAQ已经停止后先排空处理队列；处理线程可能继续产生保存任务，因此随后再排空写盘队列。
+    drainProcessingQueue();
+    flushPendingResultCommits();
+    drainSaveQueue();
+    const quint64 processingQueuePeak = m_processingQueuePeak.load(std::memory_order_relaxed);
+    if (processingQueuePeak > 0)
+        qDebug() << "[DataController] processing peak queue depth:" << processingQueuePeak;
+    const quint64 saveQueuePeak = m_saveQueuePeak.load(std::memory_order_relaxed);
+    if (saveQueuePeak > 0)
+        qDebug() << "[DataController] per-frame save peak queue depth:" << saveQueuePeak;
 
     // Finish history session
     if (m_historyManager && m_historyManager->isSessionActive()) {
@@ -734,19 +961,28 @@ void DataController::updateFilterCoefficients(double lowFreqHz, double highFreqH
 
     QMutexLocker locker(&m_filterMutex);
     m_filterCoeffs.swap(newCoeffs);
+    m_filterRevision.fetch_add(1, std::memory_order_release);
 }
 
 void DataController::applyBandpassFilter(const double* input, double* output, int len)
 {
-    // 优化(锁范围): 仅在拷贝系数时持锁，O(N) 计算在锁外进行，避免阻塞其他线程
-    std::vector<double> coeffsCopy;
-    {
+    // FIR参数通常在采集开始前设置，100 Hz采集过程中不会逐帧变化。
+    // 用“对象+版本号”的线程局部快照避免每帧进入QMutex并复制系数；
+    // 用户修改滤波参数后版本号变化，下一帧自动刷新，数值系数保持完全一致。
+    static thread_local const DataController *cachedOwner = nullptr;
+    static thread_local quint64 cachedRevision = std::numeric_limits<quint64>::max();
+    static thread_local std::vector<double> coeffsCopy;
+
+    const quint64 revision = m_filterRevision.load(std::memory_order_acquire);
+    if (cachedOwner != this || cachedRevision != revision) {
         QMutexLocker locker(&m_filterMutex);
-        if (m_filterCoeffs.empty()) {
-            memcpy(output, input, len * sizeof(double));
-            return;
-        }
-        coeffsCopy = m_filterCoeffs;   // 拷贝后立即释放锁
+        coeffsCopy = m_filterCoeffs;
+        cachedOwner = this;
+        cachedRevision = m_filterRevision.load(std::memory_order_relaxed);
+    }
+    if (coeffsCopy.empty()) {
+        memcpy(output, input, len * sizeof(double));
+        return;
     }
     int order = (int)coeffsCopy.size() - 1;
     if (order < 1) {
@@ -934,10 +1170,20 @@ double DataController::detectFirstPeak(const std::vector<double>& signal,
     int erode_right = (std::min)(N - 1, morph_right + half_struct);
     int erode_len = erode_right - erode_left + 1;
 
-    std::vector<double> feature(morph_len);
+    // 100 Hz路径复用形态学/统计工作区；所有元素仍按原顺序逐一覆盖，计算结果不变。
+    static thread_local std::vector<double> feature;
+    static thread_local std::vector<double> morphologyA;
+    static thread_local std::vector<double> morphologyB;
+    static thread_local std::vector<double> sorted;
+    static thread_local std::vector<double> absDev;
+    static thread_local std::vector<int> candidates;
+    static thread_local std::vector<int> validCandidates;
+    feature.resize(morph_len);
+
     if (usePeakMode) {
         // 腐蚀: eroded[k] = min(signal[erode_left+k-half_struct .. +half_struct])
-        std::vector<double> eroded(erode_len);
+        morphologyA.resize(erode_len);
+        std::vector<double> &eroded = morphologyA;
         for (int k = 0; k < erode_len; ++k) {
             int gi = erode_left + k;  // 全局索引
             int left = (std::max)(0, gi - half_struct);
@@ -948,7 +1194,8 @@ double DataController::detectFirstPeak(const std::vector<double>& signal,
             eroded[k] = minVal;
         }
         // 开运算: opened[k] = max(eroded[对应窗口])
-        std::vector<double> opened(morph_len);
+        morphologyB.resize(morph_len);
+        std::vector<double> &opened = morphologyB;
         for (int k = 0; k < morph_len; ++k) {
             int gi = morph_left + k;
             int left = (std::max)(erode_left, gi - half_struct) - erode_left;
@@ -962,7 +1209,8 @@ double DataController::detectFirstPeak(const std::vector<double>& signal,
             feature[k] = signal[morph_left + k] - opened[k];
     } else {
         // 膨胀: dilated[k] = max(signal[窗口])
-        std::vector<double> dilated(erode_len);
+        morphologyA.resize(erode_len);
+        std::vector<double> &dilated = morphologyA;
         for (int k = 0; k < erode_len; ++k) {
             int gi = erode_left + k;
             int left = (std::max)(0, gi - half_struct);
@@ -973,7 +1221,8 @@ double DataController::detectFirstPeak(const std::vector<double>& signal,
             dilated[k] = maxVal;
         }
         // 闭运算: closed[k] = min(dilated[对应窗口])
-        std::vector<double> closed(morph_len);
+        morphologyB.resize(morph_len);
+        std::vector<double> &closed = morphologyB;
         for (int k = 0; k < morph_len; ++k) {
             int gi = morph_left + k;
             int left = (std::max)(erode_left, gi - half_struct) - erode_left;
@@ -992,37 +1241,37 @@ double DataController::detectFirstPeak(const std::vector<double>& signal,
     int win_right_local = right_win - morph_left;
     int win_len = win_right_local - win_left_local + 1;
 
-    std::vector<int> cand_local;
+    candidates.clear();
     for (int i = win_left_local + 1; i < win_right_local; ++i) {
         if (feature[i] > feature[i-1] && feature[i] > feature[i+1])
-            cand_local.push_back(i);
+            candidates.push_back(i);
     }
-    if (cand_local.empty()) return NAN;
+    if (candidates.empty()) return NAN;
 
-    std::vector<double> sorted(feature.begin() + win_left_local, feature.begin() + win_right_local + 1);
+    sorted.assign(feature.begin() + win_left_local, feature.begin() + win_right_local + 1);
     std::sort(sorted.begin(), sorted.end());
     double median = sorted[win_len/2];
-    std::vector<double> abs_dev;
-    for (int i = win_left_local; i <= win_right_local; ++i)
-        abs_dev.push_back(std::fabs(feature[i] - median));
-    std::sort(abs_dev.begin(), abs_dev.end());
-    double mad = abs_dev[win_len/2];
+    absDev.resize(win_len);
+    for (int i = 0; i < win_len; ++i)
+        absDev[static_cast<size_t>(i)] = std::fabs(feature[win_left_local + i] - median);
+    std::sort(absDev.begin(), absDev.end());
+    double mad = absDev[win_len/2];
     double dynamic_thresh = median + 2.0 * mad;
     double feat_max = 0.0;
     for (int i = win_left_local; i <= win_right_local; ++i)
         if (feature[i] > feat_max) feat_max = feature[i];
     dynamic_thresh = (std::max)(dynamic_thresh, 0.01 * feat_max);
 
-    std::vector<int> valid_local;
-    for (int idx : cand_local) {
+    validCandidates.clear();
+    for (int idx : candidates) {
         if (feature[idx] >= dynamic_thresh)
-            valid_local.push_back(idx);
+            validCandidates.push_back(idx);
     }
-    if (valid_local.empty()) return NAN;
+    if (validCandidates.empty()) return NAN;
 
-    int best_local = valid_local[0];
+    int best_local = validCandidates[0];
     double best_val = feature[best_local];
-    for (int idx : valid_local) {
+    for (int idx : validCandidates) {
         if (feature[idx] > best_val) {
             best_val = feature[idx];
             best_local = idx;
@@ -1054,6 +1303,248 @@ double DataController::detectFirstPeak(const std::vector<double>& signal,
     return thickness;
 }
 
+void DataController::ensureProcessingWorkerStarted()
+{
+    std::lock_guard<std::mutex> locker(m_processingQueueMutex);
+    if (m_processingWorker.joinable())
+        return;
+    m_processingWorkerStop = false;
+    m_processingWorkerBusy = false;
+    m_processingWorker = std::thread(&DataController::processingWorkerLoop, this);
+}
+
+void DataController::enqueueAcquiredFrame(AcquiredFrameJob job)
+{
+    ensureProcessingWorkerStarted();
+    quint64 queueSize = 0;
+    {
+        std::lock_guard<std::mutex> locker(m_processingQueueMutex);
+        m_processingQueue.push_back(std::move(job));
+        queueSize = static_cast<quint64>(m_processingQueue.size());
+    }
+    quint64 previousPeak = m_processingQueuePeak.load(std::memory_order_relaxed);
+    while (queueSize > previousPeak
+           && !m_processingQueuePeak.compare_exchange_weak(previousPeak, queueSize,
+                                                            std::memory_order_relaxed)) {
+    }
+    m_processingQueueCv.notify_one();
+}
+
+void DataController::drainProcessingQueue()
+{
+    if (!m_processingWorker.joinable())
+        return;
+    std::unique_lock<std::mutex> locker(m_processingQueueMutex);
+    m_processingQueueDrainedCv.wait(locker, [this]() {
+        return m_processingQueue.empty() && !m_processingWorkerBusy;
+    });
+}
+
+void DataController::stopProcessingWorker()
+{
+    if (!m_processingWorker.joinable())
+        return;
+    drainProcessingQueue();
+    {
+        std::lock_guard<std::mutex> locker(m_processingQueueMutex);
+        m_processingWorkerStop = true;
+    }
+    m_processingQueueCv.notify_all();
+    m_processingWorker.join();
+}
+
+void DataController::flushPendingResultCommits()
+{
+    // pause/stop由DataController所属Qt线程调用。处理线程已经排空后，不会再新增提交；
+    // 定向执行本对象的MetaCall，确保最后几帧先写入厚度历史/HistoryManager，再结束会话。
+    if (QThread::currentThread() != thread())
+        return;
+    while (m_pendingResultCommits.load(std::memory_order_acquire) > 0)
+        QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+}
+
+void DataController::processingWorkerLoop()
+{
+    for (;;) {
+        AcquiredFrameJob job;
+        {
+            std::unique_lock<std::mutex> locker(m_processingQueueMutex);
+            m_processingQueueCv.wait(locker, [this]() {
+                return m_processingWorkerStop || !m_processingQueue.empty();
+            });
+            if (m_processingWorkerStop && m_processingQueue.empty())
+                break;
+            job = std::move(m_processingQueue.front());
+            m_processingQueue.pop_front();
+            m_processingWorkerBusy = true;
+        }
+
+        processAcquiredFrame(std::move(job));
+
+        {
+            std::lock_guard<std::mutex> locker(m_processingQueueMutex);
+            m_processingWorkerBusy = false;
+            if (m_processingQueue.empty())
+                m_processingQueueDrainedCv.notify_all();
+        }
+    }
+
+    std::lock_guard<std::mutex> locker(m_processingQueueMutex);
+    m_processingWorkerBusy = false;
+    m_processingQueueDrainedCv.notify_all();
+}
+
+void DataController::processAcquiredFrame(AcquiredFrameJob job)
+{
+    QElapsedTimer processingTimer;
+    processingTimer.start();
+
+    const int pointsPerChan = static_cast<int>(job.original.size());
+    if (pointsPerChan <= 0)
+        return;
+    const ConfigureParameter &cfg = job.configure;
+
+    static thread_local std::vector<double> combined;
+    static thread_local std::vector<double> filtered;
+    if (combined.capacity() < static_cast<size_t>(2 * cfg.sectionLength))
+        combined.reserve(2 * cfg.sectionLength);
+    if (filtered.capacity() < static_cast<size_t>(cfg.sectionLength))
+        filtered.reserve(cfg.sectionLength);
+
+    filtered.resize(pointsPerChan);
+    applyBandpassFilter(job.original.data(), filtered.data(), pointsPerChan);
+    detrendSignal(filtered);
+
+    // UI只抽帧显示；每个完整采集帧仍然逐帧执行滤波、寻峰、SNR和历史记录。
+    const bool completeWaveform = (pointsPerChan == cfg.sectionLength);
+    bool refreshWaveform = false;
+    if (completeWaveform) {
+        const quint64 waveformFrame =
+            m_waveformFrameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int waveformRefreshInterval = (std::max)(1, job.waveformRefreshInterval);
+        refreshWaveform = waveformRefreshInterval == 1
+            || waveformFrame == 1
+            || ((waveformFrame - 1) % static_cast<quint64>(waveformRefreshInterval) == 0);
+    }
+
+    if (refreshWaveform) {
+        const double *displayData = filtered.data();
+        int plotCount = 1;
+        if (job.showOriginal) {
+            combined.resize(2 * pointsPerChan);
+            for (int i = 0; i < pointsPerChan; ++i) {
+                combined[2 * i] = job.original[static_cast<size_t>(i)];
+                combined[2 * i + 1] = filtered[static_cast<size_t>(i)];
+            }
+            displayData = combined.data();
+            plotCount = 2;
+        }
+
+        const double xInc = job.xInc;
+        const bool recordEnd = job.recordEnd;
+        QVector<double> qvDisplayData(displayData, displayData + plotCount * pointsPerChan);
+        QMetaObject::invokeMethod(this,
+            [this, qvDisplayData, plotCount, pointsPerChan, xInc, recordEnd]() {
+                emit dataReady(qvDisplayData, plotCount, pointsPerChan, xInc, recordEnd);
+            },
+            Qt::QueuedConnection);
+    }
+
+    if (completeWaveform) {
+        double peakTimeSec = 0.0, peakVoltage = 0.0;
+        const double thickness = detectFirstPeak(filtered,
+                                                 cfg.clockRatePerChan,
+                                                 cfg.detectMode,
+                                                 cfg.thicknessStd,
+                                                 cfg.thicknessTolerance,
+                                                 cfg.structLen,
+                                                 cfg.minWidth,
+                                                 cfg.delayCount,
+                                                 peakTimeSec,
+                                                 peakVoltage);
+
+        const double biasForSnr = 1.1;
+        const double thicknessForSnr = cfg.thicknessStd + biasForSnr;
+        const double thicknessMeterForSnr = thicknessForSnr * 1e-3;
+        const double velocityForSnr = 6459.7;
+        const double referenceTimeForSnr = 2.0 * thicknessMeterForSnr / velocityForSnr;
+        const int theoreticalIntervalForSnr = static_cast<int>(
+            std::round(referenceTimeForSnr * cfg.clockRatePerChan));
+        const int firstCenterForSnr = (std::max)(
+            1, theoreticalIntervalForSnr - cfg.delayCount);
+        const int searchHalfForSnr = static_cast<int>(
+            cfg.clockRatePerChan / 80000000.0 * 27.0);
+        const int searchLeftForSnr = (std::max)(0, firstCenterForSnr - searchHalfForSnr);
+        const int searchRightForSnr = (std::min)(
+            pointsPerChan - 1, firstCenterForSnr + searchHalfForSnr);
+        const int peakIndexForSnr = static_cast<int>(
+            std::round(peakTimeSec * cfg.clockRatePerChan));
+        const double snr = calculateAlgorithmTestSnr(
+            filtered, peakIndexForSnr, searchLeftForSnr, searchRightForSnr, job.filterOrder);
+
+        m_pendingResultCommits.fetch_add(1, std::memory_order_release);
+        const bool commitQueued = QMetaObject::invokeMethod(this,
+            [this, thickness, peakTimeSec, peakVoltage, snr, refreshWaveform]() {
+                m_thickness = thickness;
+                m_snr = snr;
+                ++m_totalAttempts;
+
+                if (!std::isnan(thickness)) {
+                    ++m_validDetections;
+                    if (thickness > m_thicknessMax) m_thicknessMax = thickness;
+                    if (thickness < m_thicknessMin) m_thicknessMin = thickness;
+                    m_thicknessSum += thickness;
+                    ++m_thicknessCount;
+                }
+
+                {
+                    QMutexLocker locker(&m_thicknessMutex);
+                    m_thicknessHistory.append(thickness);
+                }
+
+                if (m_historyManager && m_historyManager->isSessionActive())
+                    m_historyManager->appendMeasurement(thickness, snr, std::isfinite(thickness));
+
+                if (refreshWaveform) {
+                    emit clearMarkersRequested();
+                    emit markerReady(peakTimeSec, peakVoltage);
+                }
+                emit thicknessChanged();
+                emit snrChanged();
+                emit thicknessStatsChanged();
+                emit thicknessHistoryUpdated(thickness);
+                updateDetectionRate();
+                m_pendingResultCommits.fetch_sub(1, std::memory_order_release);
+            },
+            Qt::QueuedConnection);
+        if (!commitQueued)
+            m_pendingResultCommits.fetch_sub(1, std::memory_order_release);
+
+        if (!job.saveFileName.isEmpty()) {
+            FrameSaveJob saveJob;
+            saveJob.fileName = job.saveFileName;
+            saveJob.original = std::move(job.original);
+            saveJob.filtered.assign(filtered.begin(), filtered.end());
+            saveJob.thickness = thickness;
+            enqueueFrameSave(std::move(saveJob));
+        }
+    }
+
+    const qint64 elapsedUs = processingTimer.nsecsElapsed() / 1000;
+    static thread_local quint64 timingFrameCount = 0;
+    static thread_local qint64 timingAccumulatedUs = 0;
+    static thread_local qint64 timingMaxUs = 0;
+    ++timingFrameCount;
+    timingAccumulatedUs += elapsedUs;
+    timingMaxUs = (std::max)(timingMaxUs, elapsedUs);
+    if (timingFrameCount % 100 == 0) {
+        qDebug() << "[DataController] 100-frame processing timing: avg"
+                 << (timingAccumulatedUs / 100.0) << "us, max" << timingMaxUs << "us";
+        timingAccumulatedUs = 0;
+        timingMaxUs = 0;
+    }
+}
+
 void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEventArgs *args, void *userParam)
 {
     QElapsedTimer timer;
@@ -1068,14 +1559,7 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
     bool flagForRecordEnd = false;
     int32 bufSize = (p->m_configure.sectionLength * p->m_configure.channelCount);
 
-    // 预先分配最大容量（每个通道最大点数 = sectionLength）
-    static thread_local std::vector<double> combined;   // 线程局部，避免多线程冲突
-    static thread_local std::vector<double> filtered;   // 用于存储滤波结果
-    if (combined.capacity() < 2 * p->m_configure.sectionLength) {
-        combined.reserve(2 * p->m_configure.sectionLength);
-        filtered.reserve(p->m_configure.sectionLength);
-    }
-
+    // DAQ回调只负责取数并复制到处理FIFO。滤波、旧寻峰、SNR、UI和保存均在后续线程执行。
     do
     {
         getDataCount = qMin(bufSize, remainingCount);
@@ -1084,7 +1568,7 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
         remainingCount -= returnedCount;
         if (errorCode != Success && errorCode != WarningRecordEnd)
         {
-            QString message = QString("Sorry, there are some errors occurred, Error Code: 0x") +
+            const QString message = QString("Sorry, there are some errors occurred, Error Code: 0x") +
                 QString::number(errorCode, 16).right(8);
             QMetaObject::invokeMethod(p, [p, message]() {
                 emit p->errorOccurred(message);
@@ -1092,154 +1576,45 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
             return;
         }
 
-        flagForRecordEnd = (errorCode == WarningRecordEnd) ? true : false;
-        int pointsPerChan = returnedCount / p->m_configure.channelCount;
-        // 复用 filtered 向量。滤波和后续测厚仍然对每一帧执行，不能因为降低UI刷新率而抽掉测量帧。
-        filtered.resize(pointsPerChan);
-        p->applyBandpassFilter(p->m_scaledData, filtered.data(), pointsPerChan);
-        p->detrendSignal(filtered);
+        flagForRecordEnd = (errorCode == WarningRecordEnd);
+        const int pointsPerChan = returnedCount / p->m_configure.channelCount;
+        if (pointsPerChan > 0) {
+            AcquiredFrameJob job;
+            job.original.assign(p->m_scaledData, p->m_scaledData + pointsPerChan);
+            // 将采集时刻的处理配置随帧固化，避免FIFO存在短暂积压时被后续UI设置“穿越”影响旧帧。
+            job.configure = p->m_configure;
+            job.xInc = p->m_xInc;
+            job.filterOrder = p->m_filterOrder;
+            job.waveformRefreshInterval =
+                p->m_waveformRefreshInterval.load(std::memory_order_relaxed);
+            job.showOriginal = p->m_showOriginal.load(std::memory_order_relaxed);
+            job.recordEnd = flagForRecordEnd;
 
-        // 波形图显示抽帧：只对“完整的一帧波形”计数。
-        // 注意：WarningRecordEnd 在当前 SectionCount=1 的触发采集中可能几乎每帧都会出现，
-        // 因此不能把 flagForRecordEnd 当作“强制刷新”条件，否则 10/100 档会退化为每帧刷新。
-        // 这里只限制 dataReady/marker 的UI刷新，不改变厚度历史、统计、历史记录和波形保存频率。
-        const bool completeWaveform = (pointsPerChan == p->m_configure.sectionLength);
-        bool refreshWaveform = false;
-        if (completeWaveform) {
-            const quint64 waveformFrame =
-                p->m_waveformFrameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
-            const int waveformRefreshInterval =
-                std::max(1, p->m_waveformRefreshInterval.load(std::memory_order_relaxed));
-
-            // 首帧立即显示；之后每隔 N 个完整波形刷新一次。
-            // N=1  -> 1,2,3,4...
-            // N=10 -> 1,11,21,31...
-            // N=100-> 1,101,201,301...
-            refreshWaveform = waveformRefreshInterval == 1
-                || waveformFrame == 1
-                || ((waveformFrame - 1) % static_cast<quint64>(waveformRefreshInterval) == 0);
-        }
-
-        if (refreshWaveform) {
-            double* displayData = p->m_scaledData;
-            int plotCount = 1;
-
-            // 根据开关决定显示原始+滤波两条曲线，或仅显示滤波曲线。
-            if (p->m_showOriginal) {
-                combined.resize(2 * pointsPerChan);
-                for (int i = 0; i < pointsPerChan; ++i) {
-                    combined[2 * i]     = p->m_scaledData[i];
-                    combined[2 * i + 1] = filtered[i];
-                }
-                displayData = combined.data();
-                plotCount = 2;
-            } else {
-                displayData = filtered.data();
-            }
-
-            const double xInc = p->m_xInc;
-            QVector<double> qvDisplayData(displayData, displayData + plotCount * pointsPerChan);
-            QMetaObject::invokeMethod(p,
-                [p, qvDisplayData, plotCount, pointsPerChan, xInc, flagForRecordEnd]() {
-                    emit p->dataReady(qvDisplayData, plotCount, pointsPerChan, xInc, flagForRecordEnd);
-                },
-                Qt::QueuedConnection);
-        }
-
-        if (pointsPerChan == p->m_configure.sectionLength)
-        {
-            std::vector<double> signalSegment(filtered.begin(), filtered.begin() + pointsPerChan);
-            double peakTimeSec = 0.0, peakVoltage = 0.0;
-            double thickness = p->detectFirstPeak(signalSegment,
-                                                   p->m_configure.clockRatePerChan,
-                                                   p->m_configure.detectMode,
-                                                   p->m_configure.thicknessStd,
-                                                   p->m_configure.thicknessTolerance,
-                                                   p->m_configure.structLen,
-                                                   p->m_configure.minWidth,
-                                                   p->m_configure.delayCount,
-                                                   peakTimeSec,
-                                                   peakVoltage);
-
-            // Compute SNR in the acquisition callback, but update QObject-owned state
-            // only on DataController's Qt thread.
-            double snr = 0.0;
-            int noiseLen = std::min(200, pointsPerChan / 4);
-            if (noiseLen > 0 && std::fabs(peakVoltage) > 1e-9) {
-                double noiseSumSq = 0.0;
-                for (int i = 0; i < noiseLen; ++i) {
-                    noiseSumSq += filtered[i] * filtered[i];
-                }
-                double noiseRms = std::sqrt(noiseSumSq / noiseLen);
-                if (noiseRms > 1e-12) {
-                    snr = 20.0 * std::log10(std::fabs(peakVoltage) / noiseRms);
-                }
-            }
-
-            QMetaObject::invokeMethod(p, [p, thickness, peakTimeSec, peakVoltage, snr, refreshWaveform]() {
-                p->m_thickness = thickness;
-                p->m_snr = snr;
-                p->m_totalAttempts++;
-
-                if (!std::isnan(thickness)) {
-                    p->m_validDetections++;
-                    if (thickness > p->m_thicknessMax) p->m_thicknessMax = thickness;
-                    if (thickness < p->m_thicknessMin) p->m_thicknessMin = thickness;
-                    p->m_thicknessSum += thickness;
-                    p->m_thicknessCount++;
-                }
-
-                {
-                    QMutexLocker locker(&p->m_thicknessMutex);
-                    p->m_thicknessHistory.append(thickness);
-                }
-
-                if (p->m_historyManager && p->m_historyManager->isSessionActive()) {
-                    p->m_historyManager->appendMeasurement(thickness, snr, std::isfinite(thickness));
-                }
-
-                // 峰值标记必须和当前实际刷新的波形属于同一帧，否则抽帧后会出现marker与曲线错位。
-                if (refreshWaveform) {
-                    emit p->clearMarkersRequested();
-                    emit p->markerReady(peakTimeSec, peakVoltage);
-                }
-                emit p->thicknessChanged();
-                emit p->snrChanged();
-                emit p->thicknessStatsChanged();
-                emit p->thicknessHistoryUpdated(thickness);
-                p->updateDetectionRate();
-            }, Qt::QueuedConnection);
-
-            // 波形数据保存
-            if (p->m_savePerFrame) {
+            // 保存开关也按采集时刻固化；只在回调中生成文件名，不做任何磁盘I/O。
+            if (p->m_savePerFrame.load(std::memory_order_acquire)) {
                 QMutexLocker locker(&p->m_fileMutex);
-                p->m_saveFrameCounter++;
-                int frameNum = p->m_saveFrameCounter;
-
-                QString fileName = QString("%1/Frame_%2.csv")
+                ++p->m_saveFrameCounter;
+                job.saveFileName = QString("%1/Frame_%2.csv")
                     .arg(p->m_saveFolder)
-                    .arg(frameNum, 4, 10, QChar('0'));
-                QFile file(fileName);
-                if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-                    QTextStream out(&file);
-                    out << "Index,Original,Filtered,Thickness\n";
-                    QString thickStr = std::isnan(thickness) ? "NaN" : QString::number(thickness, 'f', 6);
-                    for (int i = 0; i < pointsPerChan; ++i) {
-                        out << i << ","
-                            << p->m_scaledData[i] << ","
-                            << filtered[i] << ","
-                            << thickStr << "\n";
-                    }
-                    file.close();
-                } else {
-                    qWarning() << "Cannot open file for writing:" << fileName;
-                }
+                    .arg(p->m_saveFrameCounter, 4, 10, QChar('0'));
             }
-
+            p->enqueueAcquiredFrame(std::move(job));
         }
-
     } while (remainingCount > 0);
 
-    qint64 elapsed_us = timer.nsecsElapsed() / 1000;
-    qDebug() << "Data processing took" << elapsed_us << "us";
+    const qint64 elapsedUs = timer.nsecsElapsed() / 1000;
+    static thread_local quint64 timingFrameCount = 0;
+    static thread_local qint64 timingAccumulatedUs = 0;
+    static thread_local qint64 timingMaxUs = 0;
+    ++timingFrameCount;
+    timingAccumulatedUs += elapsedUs;
+    timingMaxUs = (std::max)(timingMaxUs, elapsedUs);
+    if (timingFrameCount % 100 == 0) {
+        qDebug() << "[DataController] 100-frame DAQ callback timing: avg"
+                 << (timingAccumulatedUs / 100.0) << "us, max" << timingMaxUs
+                 << "us, processing queue peak"
+                 << p->m_processingQueuePeak.load(std::memory_order_relaxed);
+        timingAccumulatedUs = 0;
+        timingMaxUs = 0;
+    }
 }

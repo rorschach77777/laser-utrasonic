@@ -6,6 +6,11 @@
 #include <QVector>
 #include <QString>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <limits>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include "bdaqctrl.h"
 #include "HistoryManager.h"
@@ -116,8 +121,8 @@ public:
     double minThickness() const { return m_thicknessMin; }
     double avgThickness() const;
     bool autoScale() const { return m_autoScale; }
-    bool showOriginal() const { return m_showOriginal; }
-    bool savePerFrame() const { return m_savePerFrame; }
+    bool showOriginal() const { return m_showOriginal.load(std::memory_order_relaxed); }
+    bool savePerFrame() const { return m_savePerFrame.load(std::memory_order_relaxed); }
     int waveformRefreshInterval() const { return m_waveformRefreshInterval.load(std::memory_order_relaxed); }
     bool isTriggerSupported() const { return m_isTriggerSupported; }
     QString detectionRateText() const;
@@ -212,8 +217,8 @@ private:
     double m_thicknessSum;
     int m_thicknessCount;
     bool m_autoScale;
-    bool m_showOriginal;
-    bool m_savePerFrame;
+    std::atomic<bool> m_showOriginal{true};
+    std::atomic<bool> m_savePerFrame{false};
     // 波形图只负责显示，可按1/10/100帧抽帧刷新；采集、测厚和厚度历史仍逐帧处理。
     std::atomic<int> m_waveformRefreshInterval{1};
     std::atomic<quint64> m_waveformFrameCounter{0};
@@ -239,10 +244,50 @@ private:
     int m_filterOrder;
     std::vector<double> m_filterCoeffs;
     QMutex m_filterMutex;
+    // FIR参数变化版本号：采集线程仅在版本变化时重新拷贝系数，避免100 Hz下每帧加锁+复制。
+    std::atomic<quint64> m_filterRevision{0};
 
     int m_saveFrameCounter;
     QString m_saveFolder;
     QMutex m_fileMutex;
+
+    // 逐帧CSV写盘与DAQ回调解耦。队列不主动丢帧，停止采集后排空再结束。
+    struct FrameSaveJob {
+        QString fileName;
+        std::vector<double> original;
+        std::vector<double> filtered;
+        double thickness = std::numeric_limits<double>::quiet_NaN();
+    };
+    std::thread m_saveWorker;
+    std::mutex m_saveQueueMutex;
+    std::condition_variable m_saveQueueCv;
+    std::condition_variable m_saveQueueDrainedCv;
+    std::deque<FrameSaveJob> m_saveQueue;
+    bool m_saveWorkerStop = false;
+    bool m_saveWorkerBusy = false;
+    std::atomic<quint64> m_saveQueuePeak{0};
+
+    // DAQ回调与现有数据处理链解耦：回调只复制采集帧，单独线程按FIFO执行滤波/旧寻峰/SNR。
+    struct AcquiredFrameJob {
+        std::vector<double> original;
+        ConfigureParameter configure;
+        QString saveFileName;
+        double xInc = 0.0;
+        int filterOrder = 0;
+        int waveformRefreshInterval = 1;
+        bool showOriginal = true;
+        bool recordEnd = false;
+    };
+    std::thread m_processingWorker;
+    std::mutex m_processingQueueMutex;
+    std::condition_variable m_processingQueueCv;
+    std::condition_variable m_processingQueueDrainedCv;
+    std::deque<AcquiredFrameJob> m_processingQueue;
+    bool m_processingWorkerStop = false;
+    bool m_processingWorkerBusy = false;
+    std::atomic<quint64> m_processingQueuePeak{0};
+    // 已计算但尚未在DataController所属Qt线程提交的厚度/历史结果数。
+    std::atomic<int> m_pendingResultCommits{0};
 
     void applySettings();
     void configureDevice();
@@ -258,6 +303,18 @@ private:
                            double tolerance, int structLen, int minWidth,
                            int delayCount, double &peakTime, double &peakVoltage);
     void updateDetectionRate();
+    void ensureSaveWorkerStarted();
+    void enqueueFrameSave(FrameSaveJob job);
+    void drainSaveQueue();
+    void stopSaveWorker();
+    void saveWorkerLoop();
+    void ensureProcessingWorkerStarted();
+    void enqueueAcquiredFrame(AcquiredFrameJob job);
+    void drainProcessingQueue();
+    void stopProcessingWorker();
+    void processingWorkerLoop();
+    void processAcquiredFrame(AcquiredFrameJob job);
+    void flushPendingResultCommits();
 };
 
 #endif // DATACONTROLLER_H
