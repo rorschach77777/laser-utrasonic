@@ -38,6 +38,8 @@ public:
                                       double sampleRateHz);
     Q_INVOKABLE void appendThickness(double thickness);
     Q_INVOKABLE void appendMeasurement(double thickness, double snrDb, bool valid);
+    // 核心重锁确认后修正此前的PENDING点；framesAgo=1表示当前待追加点之前的上一点。
+    void replaceRecentMeasurement(int framesAgo, double thickness, double snrDb, bool valid);
     Q_INVOKABLE void finishSession();
     bool isSessionActive() const { return m_sessionActive; }
     int sessionDataCount() const { return m_sessionData.size(); }

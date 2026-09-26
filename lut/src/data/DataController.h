@@ -14,6 +14,7 @@
 #include <vector>
 #include "bdaqctrl.h"
 #include "HistoryManager.h"
+#include "../algorithm/ThicknessProcessor.h"
 
 // 配置参数结构体
 struct ConfigureParameter
@@ -42,6 +43,13 @@ struct ConfigureParameter
     double thicknessTolerance;
     int structLen;
     int minWidth;
+
+    // 带通频率由数据页已有控件设置，核心测厚与显示滤波共用同一组值。
+    double filterLowFreqMHz;
+    double filterHighFreqMHz;
+
+    // 测试程序迁移来的高级核心参数；默认值在结构体中与测试程序保持一致。
+    ThicknessAlgorithmParameters thicknessAlgorithm;
 };
 
 class DataController : public QObject
@@ -152,6 +160,7 @@ public:
     Q_INVOKABLE void setThicknessTolerance(double val);
     Q_INVOKABLE void setStructLen(int val);
     Q_INVOKABLE void setMinWidth(int val);
+    Q_INVOKABLE void setThicknessAlgorithmParameter(const QString &name, double value);
 
     // Graph data access
     Q_INVOKABLE QVector<double> getThicknessHistory() const;
@@ -226,6 +235,8 @@ private:
     HistoryManager *m_historyManager;
 
     ConfigureParameter m_configure;
+    // UI参数写入与DAQ回调逐帧快照之间的互斥，避免实时采集期间读到半更新配置。
+    mutable std::mutex m_configMutex;
     void *m_waveformAiCtrl;  // Automation::BDaq::WaveformAiCtrl*
     double *m_scaledData;
     double m_xInc;
@@ -242,10 +253,10 @@ private:
 
     bool m_isTriggerSupported;
     int m_filterOrder;
-    std::vector<double> m_filterCoeffs;
-    QMutex m_filterMutex;
-    // FIR参数变化版本号：采集线程仅在版本变化时重新拷贝系数，避免100 Hz下每帧加锁+复制。
-    std::atomic<quint64> m_filterRevision{0};
+
+    // 工业实时测厚核心算法模块：测试程序算法迁移入口。
+    // 仅输出厚度和峰值marker，不输出诊断文本和拟合显示数据。
+    ThicknessProcessor m_thicknessProcessor;
 
     int m_saveFrameCounter;
     QString m_saveFolder;
@@ -266,8 +277,11 @@ private:
     bool m_saveWorkerStop = false;
     bool m_saveWorkerBusy = false;
     std::atomic<quint64> m_saveQueuePeak{0};
+    // 延迟一帧写盘，使重锁确认能按测试程序逻辑回填上一帧厚度。
+    bool m_hasPendingFrameSave = false;
+    FrameSaveJob m_pendingFrameSave;
 
-    // DAQ回调与现有数据处理链解耦：回调只复制采集帧，单独线程按FIFO执行滤波/旧寻峰/SNR。
+    // DAQ回调与处理链解耦：回调只复制采集帧并固化参数，FIFO线程调用同源核心测厚。
     struct AcquiredFrameJob {
         std::vector<double> original;
         ConfigureParameter configure;
@@ -293,19 +307,11 @@ private:
     void configureDevice();
     void configureGraph();
     void checkError(int errorCode);
-    void updateFilterCoefficients(double lowFreqHz, double highFreqHz);
-    void designBandpassFilter(double lowFreq, double highFreq, double sampleRate,
-                              int order, std::vector<double> &coeffs);
-    void applyBandpassFilter(const double *input, double *output, int length);
-    void detrendSignal(std::vector<double> &signal);
-    double detectFirstPeak(const std::vector<double> &signal, double clockRate,
-                           const QString &mode, double thicknessStd,
-                           double tolerance, int structLen, int minWidth,
-                           int delayCount, double &peakTime, double &peakVoltage);
     void updateDetectionRate();
     void ensureSaveWorkerStarted();
     void enqueueFrameSave(FrameSaveJob job);
     void drainSaveQueue();
+    void flushPendingFrameSave();
     void stopSaveWorker();
     void saveWorkerLoop();
     void ensureProcessingWorkerStarted();

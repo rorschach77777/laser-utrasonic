@@ -90,6 +90,7 @@ set(CONTROLLER_HEADERS
 # Data module sources
 set(DATA_SOURCES
     src/data/DataController.cpp
+    src/algorithm/ThicknessProcessor.cpp
     src/data/SimpleGraphItem.cpp
     src/data/ThicknessHistoryItem.cpp
     src/data/HistoryManager.cpp
@@ -99,6 +100,8 @@ set(DATA_SOURCES
 
 set(DATA_HEADERS
     src/data/DataController.h
+    src/algorithm/ThicknessProcessor.h
+    src/algorithm/PacketSpline.h
     src/data/SimpleGraphItem.h
     src/data/ThicknessHistoryItem.h
     src/data/HistoryRecord.h
@@ -143,6 +146,21 @@ set(PREBUILT_RUNTIME_LIBS
 
 set(PREBUILT_IMPORT_LIBS
     ${PREBUILT_LIB_DIR}/liblstcore.a
+)
+
+# 迁移一致性测试直接链接主程序实际使用的 ThicknessProcessor，
+# 避免另一套未接入实现造成“测试通过但主程序不同”的假阳性。
+qt_add_executable(IndustrialAlgorithmFileTest
+    tools/IndustrialAlgorithmFileTest.cpp
+)
+
+target_include_directories(IndustrialAlgorithmFileTest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(IndustrialAlgorithmFileTest
+    PRIVATE
+        lst_data
 )
 
 qt_add_executable(appLST

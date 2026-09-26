@@ -127,6 +127,21 @@ void HistoryManager::appendMeasurement(double thickness, double snrDb, bool vali
     }
 }
 
+void HistoryManager::replaceRecentMeasurement(int framesAgo,
+                                              double thickness,
+                                              double snrDb,
+                                              bool valid)
+{
+    if (!m_sessionActive || framesAgo <= 0 || framesAgo > m_sessionData.size())
+        return;
+
+    const int index = m_sessionData.size() - framesAgo;
+    m_sessionData[index] = thickness;
+    m_sessionSnrData[index] = snrDb;
+    m_sessionValidData[index] = valid ? 1 : 0;
+    emit sessionProgressChanged();
+}
+
 void HistoryManager::finishSession()
 {
     qDebug() << "[HistoryManager] finishSession() called, sessionActive:" << m_sessionActive

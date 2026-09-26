@@ -208,7 +208,7 @@ ScrollView {
                         label: "触发延迟"
                         editorWidth: 140
                         editorType: "spinbox"
-                        intValue: 160
+                        intValue: 240
                         intFrom: 0
                         intTo: 1000
                         enabled: dataController && dataController.triggerSupported
@@ -322,6 +322,19 @@ ScrollView {
                             if (dataController) dataController.setMinWidth(value)
                         }
                     }
+
+                    Button {
+                        Layout.fillWidth: true
+                        text: "核心测厚参数..."
+                        font.pixelSize: 12
+                        enabled: dataController != null && !dataController.running
+                        ToolTip.visible: hovered
+                        ToolTip.text: dataController && dataController.running
+                                      ? "请先停止采集，再修改跨帧跟踪与波包拟合参数"
+                                      : "打开迁移自LSTAlgorithmTest的高级测厚参数"
+                        onClicked: thicknessAlgorithmDialog.open()
+                    }
+
                     Rectangle {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 1
@@ -764,6 +777,198 @@ ScrollView {
                             enabled: dataController != null
                             onCheckedChanged: {
                                 if (dataController) dataController.setSavePerFrame(checked)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: thicknessAlgorithmDialog
+        title: "核心测厚参数"
+        modal: true
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(root.width - 40, 760)
+        height: Math.min(root.height - 40, 760)
+        standardButtons: Dialog.Close
+        closePolicy: Popup.CloseOnEscape
+
+        // 以下默认值逐项对齐 LSTAlgorithmTest/AlgorithmTestPage.qml。
+        property var protectionParameters: [
+            { key: "filterOrder", label: "FIR阶数", type: "int", defaultValue: 50, from: 1, to: 1000 },
+            { key: "impulseMadMultiplier", label: "Raw差分 / σ", type: "double", defaultValue: 20, from: 0.1, to: 1000, decimals: 1 },
+            { key: "impulseMinJumpV", label: "最小脉冲跳变", unit: "V", type: "double", defaultValue: 1, from: 0.000001, to: 100, decimals: 3 },
+            { key: "impulseIsolationRatio", label: "Raw局部孤立度倍数", type: "double", defaultValue: 20, from: 5, to: 100, decimals: 1 },
+            { key: "impulseGuardSamples", label: "脉冲额外保护点", type: "int", defaultValue: 8, from: 0, to: 1000 },
+            { key: "energyWindowSamples", label: "局部能量窗", unit: "点", type: "int", defaultValue: 7, from: 3, to: 255, step: 2 },
+            { key: "minLocalSnrDb", label: "最低局部SNR", unit: "dB", type: "double", defaultValue: 7, from: 0.1, to: 100, decimals: 1 },
+            { key: "lowSnrSoftMinDb", label: "LOCK低SNR软下限", unit: "dB", type: "double", defaultValue: 6, from: 0.1, to: 30, decimals: 1 },
+            { key: "lowSnrSoftMinTrackingCorrelation", label: "低SNR最低模板相关", type: "double", defaultValue: 0.90, from: 0.1, to: 1, decimals: 2 },
+            { key: "lowSnrSoftMaxResidualSamples", label: "低SNR最大预测残差", unit: "点", type: "double", defaultValue: 2, from: 0.1, to: 20, decimals: 1 },
+            { key: "lowSnrSoftMinFitR2", label: "低SNR最低拟合R²", type: "double", defaultValue: 0.95, from: 0.1, to: 0.9999, decimals: 2 },
+            { key: "noiseMadRejectMultiplier", label: "Noise dB-MAD剔除倍数", type: "double", defaultValue: 3, from: 1, to: 10, decimals: 2 },
+            { key: "noiseEwmaAlphaUp", label: "Noise EWMA快速上升α", type: "double", defaultValue: 0.30, from: 0.01, to: 1, decimals: 2 },
+            { key: "noiseEwmaAlphaDown", label: "Noise EWMA慢速下降α", type: "double", defaultValue: 0.15, from: 0.001, to: 1, decimals: 3 },
+            { key: "minCandidateRatio", label: "第一/第二显著性比", type: "double", defaultValue: 1.2, from: 1.01, to: 100, decimals: 2 },
+            { key: "candidateSeparationSamples", label: "独立波包间距", unit: "点", type: "int", defaultValue: 12, from: 1, to: 1000 },
+            { key: "predictionHistorySize", label: "有效峰历史长度", type: "int", defaultValue: 5, from: 1, to: 32 },
+            { key: "predictionMinValid", label: "建门所需有效峰", type: "int", defaultValue: 3, from: 1, to: 32 },
+            { key: "predictionHalfWidth", label: "预测半窗", unit: "点", type: "int", defaultValue: 16, from: 1, to: 1000 },
+            { key: "predictionMaxMisses", label: "连续失检进入LOST帧数", type: "int", defaultValue: 3, from: 1, to: 100 },
+            { key: "trackingResidualAcceptSamples", label: "LOCK正常残差", unit: "点", type: "double", defaultValue: 6, from: 0.5, to: 100, decimals: 1 },
+            { key: "trackingResidualRejectSamples", label: "严重跳变残差", unit: "点", type: "double", defaultValue: 9, from: 0.5, to: 200, decimals: 1 },
+            { key: "reacquireConfirmFrames", label: "重捕获连续确认帧", type: "int", defaultValue: 2, from: 2, to: 10 },
+            { key: "reacquireConsistencySamples", label: "重捕获位置一致", unit: "点", type: "double", defaultValue: 5, from: 0.5, to: 100, decimals: 1 }
+        ]
+
+        property var packetParameters: [
+            { key: "longitudinalVelocityMps", label: "纵波声速", unit: "m/s", type: "double", defaultValue: 6459.7, from: 1, to: 20000, decimals: 1 },
+            { key: "echoMinCorrelation", label: "辅助回波相关门限", type: "double", defaultValue: 0.70, from: 0.1, to: 1, decimals: 2 },
+            { key: "echoMinSnrDb", label: "辅助回波最低SNR", unit: "dB", type: "double", defaultValue: 3, from: 0.1, to: 30, decimals: 1 },
+            { key: "echoMinRelativeEnergy", label: "辅助回波最小相对能量", type: "double", defaultValue: 0.03, from: 0.001, to: 0.5, decimals: 3 },
+            { key: "echoPeriodTolerance", label: "回波间隔相对容差", type: "double", defaultValue: 0.20, from: 0.01, to: 0.4, decimals: 2 },
+            { key: "packetMinWidth", label: "最小波包宽", unit: "点", type: "int", defaultValue: 8, from: 5, to: 100 },
+            { key: "packetMaxWidth", label: "最大波包宽", unit: "点", type: "int", defaultValue: 50, from: 6, to: 250 },
+            { key: "packetMergeGap", label: "能量片段合并间隙", type: "int", defaultValue: 4, from: 0, to: 20 },
+            { key: "packetEnergyFraction", label: "波包相对能量边界", type: "double", defaultValue: 0.05, from: 0.001, to: 0.5, decimals: 3 },
+            { key: "lockedPacketMaxCoreWidth", label: "LOCK宽核心最大宽", unit: "点", type: "int", defaultValue: 60, from: 6, to: 250 },
+            { key: "lockedBroadMinTrackingCorrelation", label: "宽包恢复最低相关", type: "double", defaultValue: 0.80, from: 0.1, to: 1, decimals: 2 },
+            { key: "lockedBroadEnergyPeakToleranceSamples", label: "宽包能量峰/ToF容差", unit: "点", type: "double", defaultValue: 7, from: 0.5, to: 50, decimals: 1 },
+            { key: "fitFootFraction", label: "拟合脚底比例", type: "double", defaultValue: 0.10, from: 0.01, to: 0.8, decimals: 2 },
+            { key: "fitFootConfirmSamples", label: "脚底连续确认", unit: "点", type: "int", defaultValue: 3, from: 1, to: 20 },
+            { key: "fitFootSmoothRadius", label: "脚底平滑半径", unit: "点", type: "int", defaultValue: 1, from: 0, to: 8 },
+            { key: "fitCenterHalfRange", label: "拟合中心微调±", unit: "点", type: "double", defaultValue: 0.75, from: 0.01, to: 10, decimals: 2 },
+            { key: "fitAmplitudeMinRatio", label: "拟合幅值下限/峰值比", type: "double", defaultValue: 1.75, from: 0.05, to: 3, decimals: 2 },
+            { key: "fitAmplitudeMaxRatio", label: "拟合幅值上限/峰值比", type: "double", defaultValue: 3.50, from: 0.05, to: 5, decimals: 2 },
+            { key: "fitMinR2", label: "等效单脉冲最低质量", type: "double", defaultValue: 0.50, from: 0.1, to: 0.9999, decimals: 2 },
+            { key: "adaptiveWidthHistorySize", label: "自适应脉宽历史", unit: "帧", type: "int", defaultValue: 21, from: 5, to: 101 },
+            { key: "adaptiveWidthMinHistory", label: "脉宽模型最少历史", unit: "帧", type: "int", defaultValue: 7, from: 3, to: 101 },
+            { key: "adaptiveWidthMadMultiplier", label: "脉宽MAD倍数", type: "double", defaultValue: 4, from: 1, to: 12, decimals: 1 },
+            { key: "adaptiveWidthMinToleranceSamples", label: "脉宽最小动态容差", unit: "点", type: "double", defaultValue: 4.5, from: 0.5, to: 20, decimals: 1 },
+            { key: "adaptiveWidthOutlierMultiplier", label: "脉宽异常倍数", type: "double", defaultValue: 2.5, from: 1.1, to: 5, decimals: 1 }
+        ]
+
+        property var trackingParameters: [
+            { key: "trackingMinCorrelation", label: "连续帧最小相关", type: "double", defaultValue: 0.65, from: 0.1, to: 1, decimals: 2 },
+            { key: "trackingCorrelationMargin", label: "相关不唯一判定差", type: "double", defaultValue: 0.10, from: 0.001, to: 1, decimals: 3 },
+            { key: "trackingEmaTemplateAlpha", label: "EMA模板更新α", type: "double", defaultValue: 0.15, from: 0.01, to: 1, decimals: 2 },
+            { key: "trackingShapeTemplateAlpha", label: "形态模板更新α", type: "double", defaultValue: 0.30, from: 0.01, to: 1, decimals: 2 },
+            { key: "trackingMultiTemplateAgreementSamples", label: "多模板ToF一致诊断", unit: "点", type: "double", defaultValue: 2, from: 0.25, to: 10, decimals: 1 },
+            { key: "trackingBackupTemplateMaxResidualSamples", label: "后备模板最大预测残差", unit: "点", type: "double", defaultValue: 5, from: 0.25, to: 6, decimals: 1 },
+            { key: "trackingBackupRecentBlendAlpha", label: "CONFIRMED模板更新α", type: "double", defaultValue: 0.25, from: 0.01, to: 1, decimals: 2 },
+            { key: "trackingSoftCorrelation", label: "软恢复最低相关", type: "double", defaultValue: 0.53, from: 0.1, to: 1, decimals: 2 },
+            { key: "trackingSoftFitPredictionToleranceSamples", label: "软恢复拟合/预测容差", unit: "点", type: "double", defaultValue: 3, from: 0.1, to: 20, decimals: 1 },
+            { key: "trackingSoftMinFitR2", label: "软恢复最低拟合R²", type: "double", defaultValue: 0.80, from: 0.1, to: 0.9999, decimals: 2 },
+            { key: "trackingSoftMinMaxSnrDb", label: "软恢复最低MaxSNR", unit: "dB", type: "double", defaultValue: 15, from: 0.1, to: 60, decimals: 1 }
+        ]
+
+        contentItem: ScrollView {
+            clip: true
+            contentWidth: availableWidth
+
+            ColumnLayout {
+                width: Math.max(0, thicknessAlgorithmDialog.width - 48)
+                spacing: 10
+
+                Label {
+                    Layout.fillWidth: true
+                    text: "仅可在停止采集时修改；修改后下一批采集将清空旧参数建立的峰位、模板和噪声底。"
+                    wrapMode: Text.WordWrap
+                    color: "#F57C00"
+                    font.pixelSize: 12
+                }
+
+                GroupBox {
+                    title: "防误检、SNR与预测门控"
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                        anchors.fill: parent
+                        Repeater {
+                            model: thicknessAlgorithmDialog.protectionParameters
+                            delegate: Comp.InlineParamRow {
+                                Layout.fillWidth: true
+                                label: modelData.label
+                                unit: modelData.unit || ""
+                                editorType: modelData.type === "int" ? "spinbox" : "doublefield"
+                                editorWidth: 210
+                                intValue: modelData.defaultValue
+                                intFrom: modelData["from"]
+                                intTo: modelData["to"]
+                                intStep: modelData.step || 1
+                                doubleValue: modelData.defaultValue
+                                doubleFrom: modelData["from"]
+                                doubleTo: modelData["to"]
+                                decimals: modelData.decimals || 2
+                                enabled: dataController != null && !dataController.running
+                                onValueCommitted: function(value) {
+                                    if (dataController)
+                                        dataController.setThicknessAlgorithmParameter(modelData.key, value)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                GroupBox {
+                    title: "纵波判据、波包与拟合"
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                        anchors.fill: parent
+                        Repeater {
+                            model: thicknessAlgorithmDialog.packetParameters
+                            delegate: Comp.InlineParamRow {
+                                Layout.fillWidth: true
+                                label: modelData.label
+                                unit: modelData.unit || ""
+                                editorType: modelData.type === "int" ? "spinbox" : "doublefield"
+                                editorWidth: 210
+                                intValue: modelData.defaultValue
+                                intFrom: modelData["from"]
+                                intTo: modelData["to"]
+                                intStep: modelData.step || 1
+                                doubleValue: modelData.defaultValue
+                                doubleFrom: modelData["from"]
+                                doubleTo: modelData["to"]
+                                decimals: modelData.decimals || 2
+                                enabled: dataController != null && !dataController.running
+                                onValueCommitted: function(value) {
+                                    if (dataController)
+                                        dataController.setThicknessAlgorithmParameter(modelData.key, value)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                GroupBox {
+                    title: "多模板跟踪与软恢复"
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                        anchors.fill: parent
+                        Repeater {
+                            model: thicknessAlgorithmDialog.trackingParameters
+                            delegate: Comp.InlineParamRow {
+                                Layout.fillWidth: true
+                                label: modelData.label
+                                unit: modelData.unit || ""
+                                editorType: modelData.type === "int" ? "spinbox" : "doublefield"
+                                editorWidth: 210
+                                intValue: modelData.defaultValue
+                                intFrom: modelData["from"]
+                                intTo: modelData["to"]
+                                intStep: modelData.step || 1
+                                doubleValue: modelData.defaultValue
+                                doubleFrom: modelData["from"]
+                                doubleTo: modelData["to"]
+                                decimals: modelData.decimals || 2
+                                enabled: dataController != null && !dataController.running
+                                onValueCommitted: function(value) {
+                                    if (dataController)
+                                        dataController.setThicknessAlgorithmParameter(modelData.key, value)
+                                }
                             }
                         }
                     }

@@ -1,4 +1,5 @@
 #include "DataController.h"
+#include "../algorithm/ThicknessProcessor.h"
 #include "bdaqctrl.h"
 #include <QCoreApplication>
 #include <QDateTime>
@@ -14,96 +15,7 @@
 
 using namespace Automation::BDaq;
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 #define LOCAL_EDGE "Local"
-
-namespace {
-
-// 与 LSTAlgorithmTest 保持一致：用 7 点局部交流能量计算信号/噪声功率，
-// 并用搜索窗外多个背景窗口能量的中位数作为噪声基线。
-constexpr int SNR_ENERGY_WINDOW_SAMPLES = 7;
-
-double snrLocalEnergy(const std::vector<double> &signal, int center, int halfWidth)
-{
-    if (center - halfWidth < 0
-        || center + halfWidth >= static_cast<int>(signal.size()))
-        return std::numeric_limits<double>::quiet_NaN();
-
-    double mean = 0.0;
-    for (int i = center - halfWidth; i <= center + halfWidth; ++i)
-        mean += signal[i];
-    const int count = 2 * halfWidth + 1;
-    mean /= count;
-
-    double energy = 0.0;
-    for (int i = center - halfWidth; i <= center + halfWidth; ++i) {
-        const double value = signal[i] - mean;
-        energy += value * value;
-    }
-    return energy / count;
-}
-
-double snrMedian(std::vector<double> &values)
-{
-    if (values.empty())
-        return std::numeric_limits<double>::quiet_NaN();
-    const size_t middle = values.size() / 2;
-    std::nth_element(values.begin(), values.begin() + middle, values.end());
-    const double upper = values[middle];
-    if (values.size() % 2 != 0)
-        return upper;
-    const double lower = *std::max_element(values.begin(), values.begin() + middle);
-    return 0.5 * (lower + upper);
-}
-
-double calculateAlgorithmTestSnr(const std::vector<double> &signal,
-                                 int peakIndex,
-                                 int searchLeft,
-                                 int searchRight,
-                                 int filterOrder)
-{
-    const int half = SNR_ENERGY_WINDOW_SAMPLES / 2;
-    const int edge = filterOrder + half;
-    // 100 Hz实时路径复用背景能量缓冲区，避免每帧重新申请/释放堆内存。
-    // snrMedian() 会原地重排该临时数组，但不会改变输入波形或计算结果。
-    static thread_local std::vector<double> background;
-    background.clear();
-    const int estimatedWindows = (std::max)(1,
-        static_cast<int>(signal.size()) / SNR_ENERGY_WINDOW_SAMPLES);
-    if (static_cast<int>(background.capacity()) < estimatedWindows)
-        background.reserve(estimatedWindows);
-
-    // 与 LSTAlgorithmTest 的 estimateNoiseEnergy() 一致：
-    // 排除 FIR 边界和理论搜索窗，在剩余背景区按相同17点窗口取局部交流能量，
-    // 再以多个背景窗口能量的中位数作为 noiseEnergy。
-    for (int center = edge; center + edge < static_cast<int>(signal.size());
-         center += SNR_ENERGY_WINDOW_SAMPLES) {
-        if (center + half >= searchLeft - filterOrder
-            && center - half <= searchRight + filterOrder)
-            continue;
-
-        const double energy = snrLocalEnergy(signal, center, half);
-        if (std::isfinite(energy))
-            background.push_back(energy);
-    }
-
-    // LSTAlgorithmTest 在不足4个背景窗口时判 INSUFFICIENT_NOISE；
-    // 主 LST 此处只负责显示/记录 SNR，不改变原测厚判定，因此返回0 dB。
-    if (background.size() < 4)
-        return 0.0;
-
-    const double noiseEnergy = (std::max)(snrMedian(background), 1e-24);
-    const double signalEnergy = snrLocalEnergy(signal, peakIndex, half);
-    if (!std::isfinite(signalEnergy))
-        return 0.0;
-
-    return 10.0 * std::log10((std::max)(signalEnergy, 1e-24) / noiseEnergy);
-}
-
-} // namespace
 
 DataController::DataController(QObject *parent)
     : QObject(parent)
@@ -127,7 +39,7 @@ DataController::DataController(QObject *parent)
     , m_totalAttempts(0)
     , m_validDetections(0)
     , m_isTriggerSupported(false)
-    , m_filterOrder(30)
+    , m_filterOrder(50)
     , m_saveFrameCounter(0)
 {
     m_configure.hostName = LOCAL_EDGE;
@@ -144,16 +56,17 @@ DataController::DataController(QObject *parent)
     m_configure.thicknessTolerance = 0.8;
     m_configure.structLen = 9;
     m_configure.minWidth = 1;
+    m_configure.filterLowFreqMHz = 3.0;
+    m_configure.filterHighFreqMHz = 30.0;
     m_configure.triggerAction = DelayToStart;
-    m_configure.delayCount = 160;
+    // 与 LSTAlgorithmTest 的固定延时标定保持一致。
+    m_configure.delayCount = 240;
     m_configure.triggerLevel = 2.0;
     m_configure.triggerEdge = RisingEdge;
     m_configure.triggerSourceIndex = 0;
     m_configure.actualDelayCount = 0;
 
     //m_triggerEdgeList << "RisingEdge" << "FallingEdge";
-
-    updateFilterCoefficients(3e6, 30e6);
 }
 
 DataController::~DataController()
@@ -164,6 +77,7 @@ DataController::~DataController()
         ctrl->Stop();
     }
     stopProcessingWorker();
+    flushPendingFrameSave();
     flushPendingResultCommits();
     stopSaveWorker();
 
@@ -189,7 +103,6 @@ void DataController::initialize()
         ctrl->addDataReadyHandler(OnDataReadyEvent, this);
         //qDebug() << "[DataController] DataReady handler registered";
     }
-    updateFilterCoefficients(3e6, 30e6);
     refreshDeviceList();
 }
 
@@ -476,6 +389,16 @@ void DataController::drainSaveQueue()
     });
 }
 
+void DataController::flushPendingFrameSave()
+{
+    // 只在处理队列已排空或处理线程内部调用，避免与m_pendingFrameSave并发访问。
+    if (!m_hasPendingFrameSave)
+        return;
+    enqueueFrameSave(std::move(m_pendingFrameSave));
+    m_pendingFrameSave = FrameSaveJob{};
+    m_hasPendingFrameSave = false;
+}
+
 void DataController::stopSaveWorker()
 {
     if (!m_saveWorker.joinable())
@@ -574,15 +497,221 @@ void DataController::setHistoryManager(QObject *manager)
     qDebug() << "[DataController] setHistoryManager called, manager:" << (m_historyManager ? "valid" : "null");
 }
 
-void DataController::setTriggerSource(int index) { m_configure.triggerSourceIndex = index; }
-void DataController::setTriggerEdge(int index) { m_configure.triggerEdge = (index == 0) ? RisingEdge : FallingEdge; }
-void DataController::setDelayCount(int count) { m_configure.delayCount = count; }
-void DataController::setTriggerLevel(double level) { m_configure.triggerLevel = level; }
-void DataController::setDetectMode(const QString &mode) { m_configure.detectMode = mode; }
-void DataController::setThicknessStd(double val) { m_configure.thicknessStd = val; }
-void DataController::setThicknessTolerance(double val) { m_configure.thicknessTolerance = val; }
-void DataController::setStructLen(int val) { m_configure.structLen = val; }
-void DataController::setMinWidth(int val) { m_configure.minWidth = val; }
+void DataController::setTriggerSource(int index)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.triggerSourceIndex = index;
+}
+
+void DataController::setTriggerEdge(int index)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.triggerEdge = (index == 0) ? RisingEdge : FallingEdge;
+}
+
+void DataController::setDelayCount(int count)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.delayCount = count;
+}
+
+void DataController::setTriggerLevel(double level)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.triggerLevel = level;
+}
+
+void DataController::setDetectMode(const QString &mode)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.detectMode = mode;
+}
+
+void DataController::setThicknessStd(double val)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.thicknessStd = val;
+}
+
+void DataController::setThicknessTolerance(double val)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.thicknessTolerance = val;
+}
+
+void DataController::setStructLen(int val)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.structLen = val;
+}
+
+void DataController::setMinWidth(int val)
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    m_configure.minWidth = val;
+}
+
+void DataController::setThicknessAlgorithmParameter(const QString &name, double value)
+{
+    // 高级参数涉及跨帧历史、模板和噪声底，只允许停采时修改。
+    if (m_running) {
+        emit errorOccurred(tr("请先停止采集，再修改核心测厚参数。"));
+        return;
+    }
+    if (!std::isfinite(value))
+        return;
+
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    auto &p = m_configure.thicknessAlgorithm;
+    const auto asInt = [value](int minimum, int maximum) {
+        return std::clamp(static_cast<int>(std::lround(value)), minimum, maximum);
+    };
+    const auto bounded = [value](double minimum, double maximum) {
+        return std::clamp(value, minimum, maximum);
+    };
+
+    bool recognized = true;
+    if (name == QStringLiteral("filterOrder")) {
+        m_filterOrder = asInt(1, 1000);
+        return;
+    } else if (name == QStringLiteral("impulseMadMultiplier")) {
+        p.impulseMadMultiplier = bounded(0.1, 1000.0);
+    } else if (name == QStringLiteral("impulseMinJumpV")) {
+        p.impulseMinJumpV = bounded(0.000001, 100.0);
+    } else if (name == QStringLiteral("impulseIsolationRatio")) {
+        p.impulseIsolationRatio = bounded(5.0, 100.0);
+    } else if (name == QStringLiteral("impulseGuardSamples")) {
+        p.impulseGuardSamples = asInt(0, 1000);
+    } else if (name == QStringLiteral("energyWindowSamples")) {
+        int window = asInt(3, 255);
+        if ((window & 1) == 0)
+            window = window < 255 ? window + 1 : window - 1;
+        p.energyWindowSamples = window;
+    } else if (name == QStringLiteral("minLocalSnrDb")) {
+        p.minLocalSnrDb = bounded(0.1, 100.0);
+        p.lowSnrSoftMinDb = std::min(p.lowSnrSoftMinDb, p.minLocalSnrDb);
+    } else if (name == QStringLiteral("lowSnrSoftMinDb")) {
+        p.lowSnrSoftMinDb = std::min(bounded(0.1, 30.0), p.minLocalSnrDb);
+    } else if (name == QStringLiteral("lowSnrSoftMinTrackingCorrelation")) {
+        p.lowSnrSoftMinTrackingCorrelation = bounded(0.1, 1.0);
+    } else if (name == QStringLiteral("lowSnrSoftMaxResidualSamples")) {
+        p.lowSnrSoftMaxResidualSamples = bounded(0.1, 20.0);
+    } else if (name == QStringLiteral("lowSnrSoftMinFitR2")) {
+        p.lowSnrSoftMinFitR2 = bounded(0.1, 0.9999);
+    } else if (name == QStringLiteral("noiseMadRejectMultiplier")) {
+        p.noiseMadRejectMultiplier = bounded(1.0, 10.0);
+    } else if (name == QStringLiteral("noiseEwmaAlphaUp")) {
+        p.noiseEwmaAlphaUp = bounded(0.01, 1.0);
+    } else if (name == QStringLiteral("noiseEwmaAlphaDown")) {
+        p.noiseEwmaAlphaDown = bounded(0.001, 1.0);
+    } else if (name == QStringLiteral("minCandidateRatio")) {
+        p.minCandidateRatio = bounded(1.01, 100.0);
+    } else if (name == QStringLiteral("candidateSeparationSamples")) {
+        p.candidateSeparationSamples = asInt(1, 1000);
+    } else if (name == QStringLiteral("predictionHistorySize")) {
+        p.predictionHistorySize = asInt(1, 32);
+        p.predictionMinValid = std::min(p.predictionMinValid, p.predictionHistorySize);
+    } else if (name == QStringLiteral("predictionMinValid")) {
+        p.predictionMinValid = asInt(1, p.predictionHistorySize);
+    } else if (name == QStringLiteral("predictionHalfWidth")) {
+        p.predictionHalfWidth = asInt(1, 1000);
+    } else if (name == QStringLiteral("predictionMaxMisses")) {
+        p.predictionMaxMisses = asInt(1, 100);
+    } else if (name == QStringLiteral("trackingResidualAcceptSamples")) {
+        p.trackingResidualAcceptSamples = bounded(0.5, 100.0);
+        p.trackingResidualRejectSamples =
+            std::max(p.trackingResidualRejectSamples, p.trackingResidualAcceptSamples);
+    } else if (name == QStringLiteral("trackingResidualRejectSamples")) {
+        p.trackingResidualRejectSamples =
+            std::max(bounded(0.5, 200.0), p.trackingResidualAcceptSamples);
+    } else if (name == QStringLiteral("reacquireConfirmFrames")) {
+        p.reacquireConfirmFrames = asInt(2, 10);
+    } else if (name == QStringLiteral("reacquireConsistencySamples")) {
+        p.reacquireConsistencySamples = bounded(0.5, 100.0);
+    } else if (name == QStringLiteral("longitudinalVelocityMps")) {
+        p.longitudinalVelocityMps = bounded(1.0, 20000.0);
+    } else if (name == QStringLiteral("echoMinCorrelation")) {
+        p.echoMinCorrelation = bounded(0.1, 1.0);
+    } else if (name == QStringLiteral("echoMinSnrDb")) {
+        p.echoMinSnrDb = bounded(0.1, 30.0);
+    } else if (name == QStringLiteral("echoMinRelativeEnergy")) {
+        p.echoMinRelativeEnergy = bounded(0.001, 0.5);
+    } else if (name == QStringLiteral("echoPeriodTolerance")) {
+        p.echoPeriodTolerance = bounded(0.01, 0.4);
+    } else if (name == QStringLiteral("packetMinWidth")) {
+        p.packetMinWidth = asInt(5, std::max(5, p.packetMaxWidth - 1));
+    } else if (name == QStringLiteral("packetMaxWidth")) {
+        p.packetMaxWidth = asInt(p.packetMinWidth + 1, 250);
+        p.lockedPacketMaxCoreWidth =
+            std::max(p.lockedPacketMaxCoreWidth, p.packetMaxWidth);
+    } else if (name == QStringLiteral("packetMergeGap")) {
+        p.packetMergeGap = asInt(0, 20);
+    } else if (name == QStringLiteral("packetEnergyFraction")) {
+        p.packetEnergyFraction = bounded(0.001, 0.5);
+    } else if (name == QStringLiteral("lockedPacketMaxCoreWidth")) {
+        p.lockedPacketMaxCoreWidth = asInt(p.packetMaxWidth, 250);
+    } else if (name == QStringLiteral("lockedBroadMinTrackingCorrelation")) {
+        p.lockedBroadMinTrackingCorrelation = bounded(0.1, 1.0);
+    } else if (name == QStringLiteral("lockedBroadEnergyPeakToleranceSamples")) {
+        p.lockedBroadEnergyPeakToleranceSamples = bounded(0.5, 50.0);
+    } else if (name == QStringLiteral("fitFootFraction")) {
+        p.fitFootFraction = bounded(0.01, 0.80);
+    } else if (name == QStringLiteral("fitFootConfirmSamples")) {
+        p.fitFootConfirmSamples = asInt(1, 20);
+    } else if (name == QStringLiteral("fitFootSmoothRadius")) {
+        p.fitFootSmoothRadius = asInt(0, 8);
+    } else if (name == QStringLiteral("fitCenterHalfRange")) {
+        p.fitCenterHalfRange = bounded(0.01, 10.0);
+    } else if (name == QStringLiteral("fitAmplitudeMinRatio")) {
+        p.fitAmplitudeMinRatio = bounded(0.05, 3.0);
+        p.fitAmplitudeMaxRatio =
+            std::max(p.fitAmplitudeMaxRatio, p.fitAmplitudeMinRatio);
+    } else if (name == QStringLiteral("fitAmplitudeMaxRatio")) {
+        p.fitAmplitudeMaxRatio =
+            std::max(bounded(0.05, 5.0), p.fitAmplitudeMinRatio);
+    } else if (name == QStringLiteral("fitMinR2")) {
+        p.fitMinR2 = bounded(0.1, 0.9999);
+    } else if (name == QStringLiteral("adaptiveWidthHistorySize")) {
+        p.adaptiveWidthHistorySize = asInt(5, 101);
+        p.adaptiveWidthMinHistory =
+            std::min(p.adaptiveWidthMinHistory, p.adaptiveWidthHistorySize);
+    } else if (name == QStringLiteral("adaptiveWidthMinHistory")) {
+        p.adaptiveWidthMinHistory = asInt(3, p.adaptiveWidthHistorySize);
+    } else if (name == QStringLiteral("adaptiveWidthMadMultiplier")) {
+        p.adaptiveWidthMadMultiplier = bounded(1.0, 12.0);
+    } else if (name == QStringLiteral("adaptiveWidthMinToleranceSamples")) {
+        p.adaptiveWidthMinToleranceSamples = bounded(0.5, 20.0);
+    } else if (name == QStringLiteral("adaptiveWidthOutlierMultiplier")) {
+        p.adaptiveWidthOutlierMultiplier = bounded(1.1, 5.0);
+    } else if (name == QStringLiteral("trackingMinCorrelation")) {
+        p.trackingMinCorrelation = bounded(0.1, 1.0);
+    } else if (name == QStringLiteral("trackingCorrelationMargin")) {
+        p.trackingCorrelationMargin = bounded(0.001, 1.0);
+    } else if (name == QStringLiteral("trackingEmaTemplateAlpha")) {
+        p.trackingEmaTemplateAlpha = bounded(0.01, 1.0);
+    } else if (name == QStringLiteral("trackingShapeTemplateAlpha")) {
+        p.trackingShapeTemplateAlpha = bounded(0.01, 1.0);
+    } else if (name == QStringLiteral("trackingMultiTemplateAgreementSamples")) {
+        p.trackingMultiTemplateAgreementSamples = bounded(0.25, 10.0);
+    } else if (name == QStringLiteral("trackingBackupTemplateMaxResidualSamples")) {
+        p.trackingBackupTemplateMaxResidualSamples = bounded(0.25, 6.0);
+    } else if (name == QStringLiteral("trackingBackupRecentBlendAlpha")) {
+        p.trackingBackupRecentBlendAlpha = bounded(0.01, 1.0);
+    } else if (name == QStringLiteral("trackingSoftCorrelation")) {
+        p.trackingSoftCorrelation = bounded(0.1, 1.0);
+    } else if (name == QStringLiteral("trackingSoftFitPredictionToleranceSamples")) {
+        p.trackingSoftFitPredictionToleranceSamples = bounded(0.1, 20.0);
+    } else if (name == QStringLiteral("trackingSoftMinFitR2")) {
+        p.trackingSoftMinFitR2 = bounded(0.1, 0.9999);
+    } else if (name == QStringLiteral("trackingSoftMinMaxSnrDb")) {
+        p.trackingSoftMinMaxSnrDb = bounded(0.1, 60.0);
+    } else {
+        recognized = false;
+    }
+
+    if (recognized)
+        ++p.revision;
+}
 
 void DataController::applySettings()
 {
@@ -764,6 +893,8 @@ void DataController::startAcquisition()
     m_saveQueuePeak.store(0, std::memory_order_relaxed);
     m_processingQueuePeak.store(0, std::memory_order_relaxed);
     m_waveformFrameCounter.store(0, std::memory_order_relaxed);
+    // 新批次不能沿用上一批次的峰位、波包模板和噪声底。
+    m_thicknessProcessor.reset();
     ensureProcessingWorkerStarted();
 
     emit runningChanged();
@@ -830,6 +961,7 @@ void DataController::stopAcquisition()
 
     // DAQ已经停止后先排空处理队列；处理线程可能继续产生保存任务，因此随后再排空写盘队列。
     drainProcessingQueue();
+    flushPendingFrameSave();
     flushPendingResultCommits();
     drainSaveQueue();
     const quint64 processingQueuePeak = m_processingQueuePeak.load(std::memory_order_relaxed);
@@ -856,6 +988,7 @@ void DataController::stopAcquisition()
 
 void DataController::applyFilter(double lowFreqMHz, double highFreqMHz)
 {
+    std::lock_guard<std::mutex> configLocker(m_configMutex);
     double sampleRate = m_configure.clockRatePerChan;
     double nyquist = sampleRate / 2.0 / 1e6;
 
@@ -864,7 +997,8 @@ void DataController::applyFilter(double lowFreqMHz, double highFreqMHz)
         return;
     }
 
-    updateFilterCoefficients(lowFreqMHz * 1e6, highFreqMHz * 1e6);
+    m_configure.filterLowFreqMHz = lowFreqMHz;
+    m_configure.filterHighFreqMHz = highFreqMHz;
 }
 
 void DataController::applyYRange(double yMin, double yMax)
@@ -928,182 +1062,6 @@ QVector<double> DataController::getThicknessHistory() const
 
 void *DataController::waveformAiCtrl() const { return m_waveformAiCtrl; }
 
-void DataController::designBandpassFilter(double lowFreq, double highFreq,
-                                           double sampleRate, int order,
-                                           std::vector<double> &coeffs)
-{
-    int taps = order + 1;
-    double fc1 = lowFreq / sampleRate;
-    double fc2 = highFreq / sampleRate;
-    int M = order / 2;
-    coeffs.resize(taps);
-    for (int n = 0; n < taps; ++n) {
-        double window = 0.54 - 0.46 * cos(2 * M_PI * n / order);
-        int k = n - M;
-        if (k == 0) {
-            coeffs[n] = 2 * (fc2 - fc1) * window;
-        } else {
-            double sinc = (sin(2 * M_PI * fc2 * k) - sin(2 * M_PI * fc1 * k)) / (M_PI * k);
-            coeffs[n] = sinc * window;
-        }
-    }
-}
-
-void DataController::updateFilterCoefficients(double lowFreqHz, double highFreqHz)
-{
-    double sampleRate = m_configure.clockRatePerChan;
-    if (sampleRate <= 0) sampleRate = 80e6;
-
-    std::vector<double> newCoeffs;
-    if (m_filterOrder > 0) {
-        designBandpassFilter(lowFreqHz, highFreqHz, sampleRate, m_filterOrder, newCoeffs);
-    }
-
-    QMutexLocker locker(&m_filterMutex);
-    m_filterCoeffs.swap(newCoeffs);
-    m_filterRevision.fetch_add(1, std::memory_order_release);
-}
-
-void DataController::applyBandpassFilter(const double* input, double* output, int len)
-{
-    // FIR参数通常在采集开始前设置，100 Hz采集过程中不会逐帧变化。
-    // 用“对象+版本号”的线程局部快照避免每帧进入QMutex并复制系数；
-    // 用户修改滤波参数后版本号变化，下一帧自动刷新，数值系数保持完全一致。
-    static thread_local const DataController *cachedOwner = nullptr;
-    static thread_local quint64 cachedRevision = std::numeric_limits<quint64>::max();
-    static thread_local std::vector<double> coeffsCopy;
-
-    const quint64 revision = m_filterRevision.load(std::memory_order_acquire);
-    if (cachedOwner != this || cachedRevision != revision) {
-        QMutexLocker locker(&m_filterMutex);
-        coeffsCopy = m_filterCoeffs;
-        cachedOwner = this;
-        cachedRevision = m_filterRevision.load(std::memory_order_relaxed);
-    }
-    if (coeffsCopy.empty()) {
-        memcpy(output, input, len * sizeof(double));
-        return;
-    }
-    int order = (int)coeffsCopy.size() - 1;
-    if (order < 1) {
-        memcpy(output, input, len * sizeof(double));
-        return;
-    }
-    const double* coeffs = coeffsCopy.data();
-
-    // ---- 边界延拓：反射/镜像，使得边界连续 ----
-    // 修复(越界): padLen 上限为 len，避免 padLen > len 时 srcIdx 越界读取 input[]
-    int padLen = (std::min)(order * 2, len);    // 延拓长度，不超过信号长度
-    int nPadded = 2 * padLen + len;
-
-    // 优化(缓冲区复用): 使用 thread_local 复用 padded/forward/backward，
-    // 避免每帧调用都进行 3 次堆分配（原实现每次 new/delete 3 个 vector）
-    static thread_local std::vector<double> padded;
-    static thread_local std::vector<double> forward;
-    static thread_local std::vector<double> backward;
-    if ((int)padded.size() < nPadded) {
-        padded.resize(nPadded);
-        forward.resize(nPadded);
-        backward.resize(nPadded);
-    }
-
-    // 左侧反射延拓: 镜像围绕 input[0]，即 padded[padLen-1-i] = input[i]
-    for (int i = 0; i < padLen; ++i) {
-        int srcIdx = i;
-        if (srcIdx >= len) srcIdx = len - 1;    // 钳位防止越界
-        padded[padLen - 1 - i] = input[srcIdx];
-    }
-    // 原始数据
-    for (int i = 0; i < len; ++i) {
-        padded[padLen + i] = input[i];
-    }
-    // 右侧反射延拓: 镜像围绕 input[len-1]，即 padded[padLen+len+i] = input[len-1-i]
-    for (int i = 0; i < padLen; ++i) {
-        int srcIdx = len - 1 - i;
-        if (srcIdx < 0) srcIdx = 0;             // 钳位防止越界
-        padded[padLen + len + i] = input[srcIdx];
-    }
-
-    // 优化(消除分支): 将内层循环拆分为热身/主体两段，
-    // 主体段无 if(i-j>=0) / if(i+j<nPadded) 分支判断，减少分支预测失败
-    // ---- 正向滤波（零相位第一步） ----
-    // 热身段: i < order，j 上界为 i（仅 order 个元素）
-    int warmupEnd = (std::min)(order, nPadded);
-    for (int i = 0; i < warmupEnd; ++i) {
-        double sum = 0.0;
-        for (int j = 0; j <= i; ++j) {
-            sum += coeffs[j] * padded[i - j];
-        }
-        forward[i] = sum;
-    }
-    // 主体段: order <= i < nPadded，j 全程 [0,order] 有效，无分支
-    for (int i = warmupEnd; i < nPadded; ++i) {
-        double sum = 0.0;
-        const double* p = padded.data() + i;
-        for (int j = 0; j <= order; ++j) {
-            sum += coeffs[j] * p[-j];
-        }
-        forward[i] = sum;
-    }
-
-    // ---- 反向滤波（零相位第二步） ----
-    // 主体段: i < nPadded - order，j 全程 [0,order] 有效，无分支
-    int mainEnd = nPadded - order - 1;
-    for (int i = mainEnd; i >= 0; --i) {
-        double sum = 0.0;
-        const double* p = forward.data() + i;
-        for (int j = 0; j <= order; ++j) {
-            sum += coeffs[j] * p[j];
-        }
-        backward[i] = sum;
-    }
-    // 收尾段(高索引): i >= nPadded - order，j 上界为 nPadded-1-i
-    int tailEnd = (std::max)(0, nPadded - order);
-    for (int i = nPadded - 1; i >= tailEnd; --i) {
-        double sum = 0.0;
-        int jMax = nPadded - 1 - i;
-        if (jMax > order) jMax = order;
-        const double* p = forward.data() + i;
-        for (int j = 0; j <= jMax; ++j) {
-            sum += coeffs[j] * p[j];
-        }
-        backward[i] = sum;
-    }
-
-    // ---- 裁剪掉延拓部分，得到输出 ----
-    for (int i = 0; i < len; ++i) {
-        output[i] = backward[padLen + i];
-    }
-}
-
-void DataController::detrendSignal(std::vector<double>& signal)
-{
-    int n = (int)signal.size();
-    if (n < 2) return;
-
-    // 计算均值（索引均值固定）
-    double mean_x = (n - 1) / 2.0;
-    double mean_y = 0.0;
-    for (double v : signal) mean_y += v;
-    mean_y /= n;
-
-    // 计算斜率
-    double numerator = 0.0, denominator = 0.0;
-    for (int i = 0; i < n; ++i) {
-        double dx = i - mean_x;
-        double dy = signal[i] - mean_y;
-        numerator += dx * dy;
-        denominator += dx * dx;
-    }
-    double slope = (denominator != 0.0) ? numerator / denominator : 0.0;
-    double intercept = mean_y - slope * mean_x;
-
-    // 去除线性趋势
-    for (int i = 0; i < n; ++i) {
-        signal[i] -= (slope * i + intercept);
-    }
-}
-
 void DataController::updateDetectionRate()
 {
     double rate = 0.0;
@@ -1112,195 +1070,6 @@ void DataController::updateDetectionRate()
     }
     m_detectionRate = rate;
     emit detectionRateChanged();
-}
-
-double DataController::detectFirstPeak(const std::vector<double>& signal,
-                                       double clockRate,
-                                       const QString& mode,
-                                       double thicknessStd,
-                                       double tolerance,
-                                       int structLen,
-                                       int minWidth,
-                                       int delayCount,
-                                       double& peakTime,
-                                       double& peakVoltage)
-{
-    int N = signal.size();
-    if (N == 0) return NAN;
-
-    // 1. 理论位置计算
-    double bias = 1.1;
-    thicknessStd += bias;
-    double thickness_m = thicknessStd * 1e-3;
-    double velocity = 6459.7;
-    double t_ref = 2.0 * thickness_m / velocity;
-    int interval_theory = (int)round(t_ref * clockRate);
-    int first_center = (std::max)(1, interval_theory - delayCount);
-    int search_half = (int)(clockRate / 80000000 * 27);   // 转换为整数
-
-    int left_win = (std::max)(0, first_center - search_half);
-    int right_win = (std::min)(N-1, first_center + search_half);
-    if (left_win >= right_win) return NAN;
-
-    // 2. 极性判断
-    bool usePeakMode = true;
-    if (mode == "auto") {
-        double maxVal = signal[left_win], minVal = signal[left_win];
-        for (int i = left_win + 1; i <= right_win; ++i) {
-            if (signal[i] > maxVal) maxVal = signal[i];
-            if (signal[i] < minVal) minVal = signal[i];
-        }
-        usePeakMode = (maxVal > -minVal);
-    } else if (mode == "peak") {
-        usePeakMode = true;
-    } else if (mode == "valley") {
-        usePeakMode = false;
-    } else {
-        return NAN;
-    }
-
-    // 3. 形态学变换
-    int half_struct = structLen / 2;
-    int margin = (std::max)(structLen * 2, minWidth * 4);  // 半高宽游走边距
-    int morph_left = (std::max)(0, left_win - margin);
-    int morph_right = (std::min)(N - 1, right_win + margin);
-    int morph_len = morph_right - morph_left + 1;
-    // 腐蚀/膨胀需额外 structLen/2 边距以保证开/闭运算边界正确
-    int erode_left = (std::max)(0, morph_left - half_struct);
-    int erode_right = (std::min)(N - 1, morph_right + half_struct);
-    int erode_len = erode_right - erode_left + 1;
-
-    // 100 Hz路径复用形态学/统计工作区；所有元素仍按原顺序逐一覆盖，计算结果不变。
-    static thread_local std::vector<double> feature;
-    static thread_local std::vector<double> morphologyA;
-    static thread_local std::vector<double> morphologyB;
-    static thread_local std::vector<double> sorted;
-    static thread_local std::vector<double> absDev;
-    static thread_local std::vector<int> candidates;
-    static thread_local std::vector<int> validCandidates;
-    feature.resize(morph_len);
-
-    if (usePeakMode) {
-        // 腐蚀: eroded[k] = min(signal[erode_left+k-half_struct .. +half_struct])
-        morphologyA.resize(erode_len);
-        std::vector<double> &eroded = morphologyA;
-        for (int k = 0; k < erode_len; ++k) {
-            int gi = erode_left + k;  // 全局索引
-            int left = (std::max)(0, gi - half_struct);
-            int right = (std::min)(N - 1, gi + half_struct);
-            double minVal = signal[left];
-            for (int j = left + 1; j <= right; ++j)
-                if (signal[j] < minVal) minVal = signal[j];
-            eroded[k] = minVal;
-        }
-        // 开运算: opened[k] = max(eroded[对应窗口])
-        morphologyB.resize(morph_len);
-        std::vector<double> &opened = morphologyB;
-        for (int k = 0; k < morph_len; ++k) {
-            int gi = morph_left + k;
-            int left = (std::max)(erode_left, gi - half_struct) - erode_left;
-            int right = (std::min)(erode_right, gi + half_struct) - erode_left;
-            double maxVal = eroded[left];
-            for (int j = left + 1; j <= right; ++j)
-                if (eroded[j] > maxVal) maxVal = eroded[j];
-            opened[k] = maxVal;
-        }
-        for (int k = 0; k < morph_len; ++k)
-            feature[k] = signal[morph_left + k] - opened[k];
-    } else {
-        // 膨胀: dilated[k] = max(signal[窗口])
-        morphologyA.resize(erode_len);
-        std::vector<double> &dilated = morphologyA;
-        for (int k = 0; k < erode_len; ++k) {
-            int gi = erode_left + k;
-            int left = (std::max)(0, gi - half_struct);
-            int right = (std::min)(N - 1, gi + half_struct);
-            double maxVal = signal[left];
-            for (int j = left + 1; j <= right; ++j)
-                if (signal[j] > maxVal) maxVal = signal[j];
-            dilated[k] = maxVal;
-        }
-        // 闭运算: closed[k] = min(dilated[对应窗口])
-        morphologyB.resize(morph_len);
-        std::vector<double> &closed = morphologyB;
-        for (int k = 0; k < morph_len; ++k) {
-            int gi = morph_left + k;
-            int left = (std::max)(erode_left, gi - half_struct) - erode_left;
-            int right = (std::min)(erode_right, gi + half_struct) - erode_left;
-            double minVal = dilated[left];
-            for (int j = left + 1; j <= right; ++j)
-                if (dilated[j] < minVal) minVal = dilated[j];
-            closed[k] = minVal;
-        }
-        for (int k = 0; k < morph_len; ++k)
-            feature[k] = closed[k] - signal[morph_left + k];
-    }
-
-    // 4. 窗口内峰检测 (优化: 使用局部索引直接访问 feature，避免 feat_win 子向量拷贝)
-    int win_left_local = left_win - morph_left;
-    int win_right_local = right_win - morph_left;
-    int win_len = win_right_local - win_left_local + 1;
-
-    candidates.clear();
-    for (int i = win_left_local + 1; i < win_right_local; ++i) {
-        if (feature[i] > feature[i-1] && feature[i] > feature[i+1])
-            candidates.push_back(i);
-    }
-    if (candidates.empty()) return NAN;
-
-    sorted.assign(feature.begin() + win_left_local, feature.begin() + win_right_local + 1);
-    std::sort(sorted.begin(), sorted.end());
-    double median = sorted[win_len/2];
-    absDev.resize(win_len);
-    for (int i = 0; i < win_len; ++i)
-        absDev[static_cast<size_t>(i)] = std::fabs(feature[win_left_local + i] - median);
-    std::sort(absDev.begin(), absDev.end());
-    double mad = absDev[win_len/2];
-    double dynamic_thresh = median + 2.0 * mad;
-    double feat_max = 0.0;
-    for (int i = win_left_local; i <= win_right_local; ++i)
-        if (feature[i] > feat_max) feat_max = feature[i];
-    dynamic_thresh = (std::max)(dynamic_thresh, 0.01 * feat_max);
-
-    validCandidates.clear();
-    for (int idx : candidates) {
-        if (feature[idx] >= dynamic_thresh)
-            validCandidates.push_back(idx);
-    }
-    if (validCandidates.empty()) return NAN;
-
-    int best_local = validCandidates[0];
-    double best_val = feature[best_local];
-    for (int idx : validCandidates) {
-        if (feature[idx] > best_val) {
-            best_val = feature[idx];
-            best_local = idx;
-        }
-    }
-    int first_peak = morph_left + best_local;  // 转换为全局索引
-
-    // 5. 半高宽计算（不插值，仅用整数索引）
-    double half = feature[best_local] / 2.0;
-
-    int left_idx = best_local;
-    while (left_idx > 0 && feature[left_idx] > half) --left_idx;
-
-    int right_idx = best_local;
-    while (right_idx < morph_len - 1 && feature[right_idx] > half) ++right_idx;
-
-    int width = right_idx - left_idx;   // 整数宽度（不插值）
-    if (width < minWidth) return NAN;
-
-    // 6. 获取峰值幅值
-    peakVoltage = signal[first_peak];
-
-    // 7. 计算厚度
-    peakTime = first_peak / clockRate;
-    double thickness = velocity * ((delayCount / clockRate) + peakTime) / 2.0 * 1000.0;
-    if (std::abs(thickness - thicknessStd) > tolerance)
-        thickness = NAN;
-    thickness -= bias;
-    return thickness;
 }
 
 void DataController::ensureProcessingWorkerStarted()
@@ -1411,12 +1180,38 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
     if (filtered.capacity() < static_cast<size_t>(cfg.sectionLength))
         filtered.reserve(cfg.sectionLength);
 
-    filtered.resize(pointsPerChan);
-    applyBandpassFilter(job.original.data(), filtered.data(), pointsPerChan);
-    detrendSignal(filtered);
-
-    // UI只抽帧显示；每个完整采集帧仍然逐帧执行滤波、寻峰、SNR和历史记录。
+    // 只有完整采集帧进入测厚；滤波结果由测试程序同源核心一次性生成，
+    // 后续界面显示和逐帧保存直接复用，避免实时链存在第二套预处理实现。
     const bool completeWaveform = (pointsPerChan == cfg.sectionLength);
+    ThicknessResult thicknessResult;
+    if (completeWaveform) {
+        ThicknessDetectionMode detectionMode = ThicknessDetectionMode::Auto;
+        if (cfg.detectMode == QStringLiteral("peak"))
+            detectionMode = ThicknessDetectionMode::Peak;
+        else if (cfg.detectMode == QStringLiteral("valley"))
+            detectionMode = ThicknessDetectionMode::Valley;
+
+        thicknessResult = m_thicknessProcessor.process(
+            job.original,
+            &filtered,
+            cfg.clockRatePerChan,
+            cfg.filterLowFreqMHz,
+            cfg.filterHighFreqMHz,
+            cfg.delayCount,
+            cfg.thicknessStd,
+            cfg.thicknessTolerance,
+            cfg.structLen,
+            cfg.minWidth,
+            detectionMode,
+            job.filterOrder,
+            cfg.thicknessAlgorithm);
+
+        // Raw脉冲门控可能在滤波前直接结束；此时仍用Raw维持显示/保存列长度一致。
+        if (filtered.size() != job.original.size())
+            filtered = job.original;
+    }
+
+    // UI只抽帧显示；每个完整采集帧仍逐帧执行同源核心、SNR和历史记录。
     bool refreshWaveform = false;
     if (completeWaveform) {
         const quint64 waveformFrame =
@@ -1451,40 +1246,55 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
     }
 
     if (completeWaveform) {
-        double peakTimeSec = 0.0, peakVoltage = 0.0;
-        const double thickness = detectFirstPeak(filtered,
-                                                 cfg.clockRatePerChan,
-                                                 cfg.detectMode,
-                                                 cfg.thicknessStd,
-                                                 cfg.thicknessTolerance,
-                                                 cfg.structLen,
-                                                 cfg.minWidth,
-                                                 cfg.delayCount,
-                                                 peakTimeSec,
-                                                 peakVoltage);
-
-        const double biasForSnr = 1.1;
-        const double thicknessForSnr = cfg.thicknessStd + biasForSnr;
-        const double thicknessMeterForSnr = thicknessForSnr * 1e-3;
-        const double velocityForSnr = 6459.7;
-        const double referenceTimeForSnr = 2.0 * thicknessMeterForSnr / velocityForSnr;
-        const int theoreticalIntervalForSnr = static_cast<int>(
-            std::round(referenceTimeForSnr * cfg.clockRatePerChan));
-        const int firstCenterForSnr = (std::max)(
-            1, theoreticalIntervalForSnr - cfg.delayCount);
-        const int searchHalfForSnr = static_cast<int>(
-            cfg.clockRatePerChan / 80000000.0 * 27.0);
-        const int searchLeftForSnr = (std::max)(0, firstCenterForSnr - searchHalfForSnr);
-        const int searchRightForSnr = (std::min)(
-            pointsPerChan - 1, firstCenterForSnr + searchHalfForSnr);
-        const int peakIndexForSnr = static_cast<int>(
-            std::round(peakTimeSec * cfg.clockRatePerChan));
-        const double snr = calculateAlgorithmTestSnr(
-            filtered, peakIndexForSnr, searchLeftForSnr, searchRightForSnr, job.filterOrder);
+        // 主程序只消费同源核心的厚度、峰值位置和SNR，不引入第二套寻峰或判定分支。
+        const double thickness = thicknessResult.valid
+            ? thicknessResult.thicknessMm
+            : std::numeric_limits<double>::quiet_NaN();
+        const double peakTimeSec = thicknessResult.peakTimeSec;
+        const double peakVoltage = thicknessResult.peakVoltage;
+        const double snr = thicknessResult.snrDb;
+        const bool hasBackfill = thicknessResult.hasBackfill;
+        const int backfillFramesAgo = thicknessResult.backfillFramesAgo;
+        const double backfillThickness = thicknessResult.backfillThicknessMm;
+        const double backfillSnr = thicknessResult.backfillSnrDb;
 
         m_pendingResultCommits.fetch_add(1, std::memory_order_release);
         const bool commitQueued = QMetaObject::invokeMethod(this,
-            [this, thickness, peakTimeSec, peakVoltage, snr, refreshWaveform]() {
+            [this, thickness, peakTimeSec, peakVoltage, snr, refreshWaveform,
+             hasBackfill, backfillFramesAgo, backfillThickness, backfillSnr]() {
+                // 测试程序在下一帧确认重锁后，会把此前PENDING帧恢复为当时真实测量值。
+                // Qt对同一对象的排队调用保持顺序，因此此处目标帧已经写入历史、当前帧尚未追加。
+                bool backfillApplied = false;
+                double replacedThickness = std::numeric_limits<double>::quiet_NaN();
+                if (hasBackfill && backfillFramesAgo > 0
+                    && std::isfinite(backfillThickness)) {
+                    QMutexLocker locker(&m_thicknessMutex);
+                    const int targetIndex = m_thicknessHistory.size() - backfillFramesAgo;
+                    if (targetIndex >= 0 && targetIndex < m_thicknessHistory.size()) {
+                        replacedThickness = m_thicknessHistory[targetIndex];
+                        m_thicknessHistory[targetIndex] = backfillThickness;
+                        backfillApplied = true;
+                    }
+                }
+
+                if (backfillApplied) {
+                    // PENDING帧原本必为无效值；回填只补齐一次有效统计，不改变尝试总数。
+                    if (!std::isfinite(replacedThickness)) {
+                        ++m_validDetections;
+                        m_thicknessSum += backfillThickness;
+                        ++m_thicknessCount;
+                    } else {
+                        // 防御性处理：当前状态机不会进入此分支，但替换有效值时仍保持均值正确。
+                        m_thicknessSum += backfillThickness - replacedThickness;
+                    }
+                    m_thicknessMax = (std::max)(m_thicknessMax, backfillThickness);
+                    m_thicknessMin = (std::min)(m_thicknessMin, backfillThickness);
+                    if (m_historyManager && m_historyManager->isSessionActive()) {
+                        m_historyManager->replaceRecentMeasurement(
+                            backfillFramesAgo, backfillThickness, backfillSnr, true);
+                    }
+                }
+
                 m_thickness = thickness;
                 m_snr = snr;
                 ++m_totalAttempts;
@@ -1520,13 +1330,19 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
         if (!commitQueued)
             m_pendingResultCommits.fetch_sub(1, std::memory_order_release);
 
+        // 写盘延迟一个完整帧：若当前帧确认重锁，可先把上一帧PENDING厚度回填后再入队。
+        if (m_hasPendingFrameSave) {
+            if (hasBackfill && backfillFramesAgo == 1 && std::isfinite(backfillThickness))
+                m_pendingFrameSave.thickness = backfillThickness;
+            flushPendingFrameSave();
+        }
+
         if (!job.saveFileName.isEmpty()) {
-            FrameSaveJob saveJob;
-            saveJob.fileName = job.saveFileName;
-            saveJob.original = std::move(job.original);
-            saveJob.filtered.assign(filtered.begin(), filtered.end());
-            saveJob.thickness = thickness;
-            enqueueFrameSave(std::move(saveJob));
+            m_pendingFrameSave.fileName = job.saveFileName;
+            m_pendingFrameSave.original = std::move(job.original);
+            m_pendingFrameSave.filtered.assign(filtered.begin(), filtered.end());
+            m_pendingFrameSave.thickness = thickness;
+            m_hasPendingFrameSave = true;
         }
     }
 
@@ -1557,9 +1373,19 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
     double timeStamp = 0;
     DataController *p = (DataController *)userParam;
     bool flagForRecordEnd = false;
-    int32 bufSize = (p->m_configure.sectionLength * p->m_configure.channelCount);
 
-    // DAQ回调只负责取数并复制到处理FIFO。滤波、旧寻峰、SNR、UI和保存均在后续线程执行。
+    // 回调入口一次性固化完整配置；本次硬件取数、帧拆分和核心调用使用同一份参数，
+    // 避免实时调参时sectionLength/channelCount与随帧参数来自不同版本。
+    ConfigureParameter frameConfigure;
+    int frameFilterOrder = 0;
+    {
+        std::lock_guard<std::mutex> configLocker(p->m_configMutex);
+        frameConfigure = p->m_configure;
+        frameFilterOrder = p->m_filterOrder;
+    }
+    const int32 bufSize = frameConfigure.sectionLength * frameConfigure.channelCount;
+
+    // DAQ回调只负责取数和固化参数快照；同源核心测厚、UI提交与保存均在FIFO处理线程执行。
     do
     {
         getDataCount = qMin(bufSize, remainingCount);
@@ -1577,14 +1403,14 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
         }
 
         flagForRecordEnd = (errorCode == WarningRecordEnd);
-        const int pointsPerChan = returnedCount / p->m_configure.channelCount;
+        const int pointsPerChan = returnedCount / frameConfigure.channelCount;
         if (pointsPerChan > 0) {
             AcquiredFrameJob job;
             job.original.assign(p->m_scaledData, p->m_scaledData + pointsPerChan);
-            // 将采集时刻的处理配置随帧固化，避免FIFO存在短暂积压时被后续UI设置“穿越”影响旧帧。
-            job.configure = p->m_configure;
+            // 同一DAQ回调内的所有帧共用入口快照，保证硬件帧长与算法参数严格对应。
+            job.configure = frameConfigure;
+            job.filterOrder = frameFilterOrder;
             job.xInc = p->m_xInc;
-            job.filterOrder = p->m_filterOrder;
             job.waveformRefreshInterval =
                 p->m_waveformRefreshInterval.load(std::memory_order_relaxed);
             job.showOriginal = p->m_showOriginal.load(std::memory_order_relaxed);
