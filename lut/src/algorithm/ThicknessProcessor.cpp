@@ -1090,6 +1090,7 @@ struct WaveformResult
     int predictionHistoryCount = 0;
     int predictionLeftIndex = -1;
     int predictionRightIndex = -1;
+    QString searchWindowStage = QStringLiteral("GLOBAL_SEARCH");
     QString longitudinalStatus = QStringLiteral("NOT_EVALUATED");
     bool longitudinalCandidate = false;
     QString longitudinalEvidence;
@@ -1217,6 +1218,14 @@ double medianValue(std::vector<double> values)
     return medianValueInPlace(values);
 }
 
+enum class SearchWindowStage
+{
+    GlobalSearch,
+    Warmup,
+    Prediction,
+    GlobalReacquire
+};
+
 struct PredictionGate
 {
     double center = NaN;
@@ -1233,6 +1242,11 @@ struct PredictionGate
     bool lockActive = false;
     bool reacquireRequired = false;
     bool startupConfirmationEnabled = false;
+    bool warmupActive = false;
+    int warmupFrames = 0;
+    int missCount = 0;
+    double searchWindowAnchor = NaN;
+    SearchWindowStage windowStage = SearchWindowStage::GlobalSearch;
     // LOST后保留的冻结长期身份。它只用于重捕获认证，不直接作为厚度输出。
     bool longTermIdentityAvailable = false;
     double longTermIdentityCenter = NaN;
@@ -1288,7 +1302,12 @@ struct PeakHistory
     // 保留若干帧用于模板、脉宽和噪声模型收敛，避免冷启动阶段过早使用严格LOCK约束。
     bool warmupLearningActive = false;
     int warmupLearningFrames = 0;
-    static constexpr int WarmupLearningTargetFrames = 30;
+    // Session Search Window锚点：由实际首波身份学习得到，不再由reference thickness换算。
+    // LOST时保留；只有新目录/新采集会话resetAll()才清空。
+    double searchWindowAnchor = NaN;
+    // 启动/重锁后的前若干有效帧不使用窄位置门，只在全局首波物理ROI内学习身份和速度。
+    // 连续8个有效帧后才进入PREDICTION，避免刚锁定就因位置跳动重新失锁。
+    static constexpr int WarmupLearningTargetFrames = 8;
     double pendingPeak = NaN;
     int pendingTime = 0;
     int pendingCount = 0;
@@ -1401,6 +1420,7 @@ struct PeakHistory
         reacquireRequired = false;
         warmupLearningActive = false;
         warmupLearningFrames = 0;
+        searchWindowAnchor = NaN;
         backfillReady = false;
         backfillTargetClock = 0;
         backfillWaveform = WaveformResult{};
@@ -1426,6 +1446,15 @@ struct PeakHistory
         gate.lockActive = lockActive;
         gate.reacquireRequired = reacquireRequired;
         gate.startupConfirmationEnabled = startupConfirmationEnabled;
+        gate.warmupActive = warmupLearningActive;
+        gate.warmupFrames = warmupLearningFrames;
+        gate.missCount = misses;
+        gate.searchWindowAnchor = searchWindowAnchor;
+        gate.windowStage = reacquireRequired
+            ? SearchWindowStage::GlobalReacquire
+            : (!lockActive ? SearchWindowStage::GlobalSearch
+                           : (warmupLearningActive ? SearchWindowStage::Warmup
+                                                   : SearchWindowStage::Prediction));
         if (lockActive) {
             gate.templateValues = lastTemplate;
             gate.anchorFraction = lastFraction;
@@ -1435,29 +1464,37 @@ struct PeakHistory
             gate.emaAnchorFraction = emaFraction;
             gate.shapeTemplateValues = shapeTemplate;
             gate.shapeAnchorFraction = shapeFraction;
-        } else if (reacquireRequired && !frozenIdentityTemplate.empty()
-                   && std::isfinite(frozenIdentityCenter)
-                   && misses >= p.predictionMaxMisses
-                                + PredictionRecoveryGraceFrames
-                                + FrozenIdentitySearchDelayFrames) {
-            // 刚进入LOST时仍优先走原有的普通候选+连续两帧重捕获链；
-            // 只有该链继续失败后才暴露冻结身份，避免身份搜索过早覆盖真实候选。
-            // 使用独立字段传递，避免把冻结模板误当作正常LOCK下的CONFIRMED模板重复匹配。
-            gate.frozenIdentityTemplate = frozenIdentityTemplate;
-            gate.frozenIdentityFraction = frozenIdentityFraction;
-            gate.longTermIdentityAvailable = true;
+        } else if (reacquireRequired && std::isfinite(frozenIdentityCenter)) {
+            // LOST后立即保留最后可靠位置，用于渐进扩窗；冻结模板仍按原延时策略
+            // 在普通两帧重捕获继续失败后才参与身份认证。
             gate.longTermIdentityCenter = frozenIdentityCenter;
+            if (!frozenIdentityTemplate.empty()
+                && misses >= p.predictionMaxMisses
+                             + PredictionRecoveryGraceFrames
+                             + FrozenIdentitySearchDelayFrames) {
+                gate.frozenIdentityTemplate = frozenIdentityTemplate;
+                gate.frozenIdentityFraction = frozenIdentityFraction;
+                gate.longTermIdentityAvailable = true;
+            }
         }
         if (lockActive && !validPeaks.empty()) {
-            // LOCK时以有效帧之间的稳健速度预测加热漂移。重捕获确认后即使只有
-            // 两个内部确认点，也立即恢复趋势门，不再重新放开整个理论窗。
-            std::vector<double> speeds;
-            for (int i = 1; i < gate.historyCount; ++i)
-                speeds.push_back((validPeaks[i] - validPeaks[i - 1])
-                                / std::max(1, validTimes[i] - validTimes[i - 1]));
-            const double velocity = speeds.empty() ? 0.0
-                : std::clamp(medianValue(speeds), -double(p.predictionHalfWidth),
-                                                 double(p.predictionHalfWidth));
+            // 位置身份确认不等于速度已经稳定。冷启动/重锁后只有2~3个位置点时，
+            // 两点速度极易被多瓣内部切换放大，导致预测窗自己跑离真实packet。
+            // 至少4个有效位置点（3个速度样本）后才启用median velocity；此前只用
+            // 最后可靠位置作为中心，由GLOBAL/WARMUP或正常±16门继续收集稳定历史。
+            constexpr int minimumVelocityHistoryCount = 4;
+            double velocity = 0.0;
+            if (gate.historyCount >= minimumVelocityHistoryCount) {
+                std::vector<double> speeds;
+                speeds.reserve(static_cast<size_t>(gate.historyCount - 1));
+                for (int i = 1; i < gate.historyCount; ++i)
+                    speeds.push_back((validPeaks[i] - validPeaks[i - 1])
+                                    / std::max(1, validTimes[i] - validTimes[i - 1]));
+                if (!speeds.empty())
+                    velocity = std::clamp(medianValue(speeds),
+                                          -double(p.predictionHalfWidth),
+                                           double(p.predictionHalfWidth));
+            }
             gate.center = validPeaks.back() + velocity * (clock - validTimes.back());
         }
 
@@ -1648,9 +1685,31 @@ struct PeakHistory
             validPeaks.pop_front();
             validTimes.pop_front();
         }
+
+        // Session Search Window只从已经被核心链接受的真实TOF学习。首次至少3个点后
+        // 用中位数建立锚点；以后只有最近3个有效点整体偏离锚点超过24点时才重心迁移，
+        // 避免单帧跳变让noise floor / packet分割窗口跟着抖动。
+        if (!std::isfinite(searchWindowAnchor) && validPeaks.size() >= 3) {
+            std::vector<double> recent{validPeaks[validPeaks.size() - 3],
+                                       validPeaks[validPeaks.size() - 2],
+                                       validPeaks.back()};
+            searchWindowAnchor = medianValue(recent);
+        } else if (std::isfinite(searchWindowAnchor) && validPeaks.size() >= 3) {
+            std::vector<double> recent{validPeaks[validPeaks.size() - 3],
+                                       validPeaks[validPeaks.size() - 2],
+                                       validPeaks.back()};
+            const double recentCenter = medianValue(recent);
+            const double recenterThreshold = std::max(24.0, 1.5 * p.predictionHalfWidth);
+            if (std::abs(recentCenter - searchWindowAnchor) > recenterThreshold)
+                searchWindowAnchor = recentCenter;
+        }
+
         if (!lockActive && static_cast<int>(validPeaks.size()) >= p.predictionMinValid) {
             lockActive = true;
             everLocked = true;
+            warmupLearningActive = true;
+            warmupLearningFrames = 1;
+            r.trackingState = QStringLiteral("WARMUP_LEARNING");
         }
     }
 
@@ -1868,6 +1927,10 @@ struct PeakHistory
         everLocked = true;
         reacquireRequired = false;
         misses = 0;
+        // LOST后的重锁已经有冻结身份/历史模板，不重新进入冷启动WARMUP。
+        // 直接恢复PREDICTION，避免成熟运行阶段反复“重新学习”而降低检出率。
+        warmupLearningActive = false;
+        warmupLearningFrames = 0;
         clearPending();
         r.trackingState = QStringLiteral("RELOCKED");
         return true;
@@ -1892,6 +1955,7 @@ struct PeakHistory
                 ? r.fitPeakIndex
                 : (r.firstCandidateIndex >= 0 ? double(r.firstCandidateIndex) : NaN);
             const bool strongAlternative = lockActive
+                && !warmupLearningActive
                 && misses + 1 >= p.predictionMaxMisses
                 && (r.rejectionReason == QStringLiteral("PREDICTION_GATE")
                     || r.rejectionReason == QStringLiteral("TRACKING_MISMATCH"))
@@ -1920,8 +1984,11 @@ struct PeakHistory
                 strongAlternativePeak = NaN;
             }
             r.trackingState = reacquireRequired ? QStringLiteral("LOST")
-                                                : (lockActive ? QStringLiteral("LOCK")
-                                                              : QStringLiteral("SEARCH"));
+                                                : (lockActive
+                                                    ? (warmupLearningActive
+                                                        ? QStringLiteral("WARMUP")
+                                                        : QStringLiteral("LOCK"))
+                                                    : QStringLiteral("SEARCH"));
             return;
         }
 
@@ -2001,6 +2068,9 @@ struct PeakHistory
         if (lockActive && std::isfinite(gate.center)) {
             r.trackingResidualSamples = candidatePeak - gate.center;
             const double residual = std::abs(r.trackingResidualSamples);
+            // WARMUP扩大“发现范围”，但不取消位置身份确认。超过正常残差的候选仍走
+            // 原两帧pending确认：连续真实位移可在下一帧确认并回填，单帧大跳变不能
+            // 因为处于启动学习阶段就直接污染位置/速度历史。
             if (residual > p.trackingResidualAcceptSamples) {
                 if (confirmPending(r, p, candidatePeak))
                     return;
@@ -2057,7 +2127,9 @@ struct PeakHistory
         else if (r.trackingSoftRecovered)
             r.trackingState = QStringLiteral("SOFT_TRACK_RECOVERED");
         else
-            r.trackingState = lockActive ? QStringLiteral("LOCK") : QStringLiteral("SEARCH");
+            r.trackingState = lockActive
+                ? (warmupLearningActive ? QStringLiteral("WARMUP") : QStringLiteral("LOCK"))
+                : QStringLiteral("SEARCH");
     }
 };
 
@@ -2453,6 +2525,10 @@ void evaluateWaveformQuality(WaveformResult &r, const TestParameters &p)
             r.qualityLevel = QStringLiteral("VALID_FALLBACK");
             r.qualityLabel = QStringLiteral("单峰回退");
             confidenceCap = 80.0;
+        } else if (r.searchWindowStage == QStringLiteral("WARMUP")) {
+            r.qualityLevel = QStringLiteral("VALID_WARMUP");
+            r.qualityLabel = QStringLiteral("启动宽窗学习");
+            confidenceCap = 90.0;
         } else if (r.trackingState == QStringLiteral("LOCK")) {
             r.qualityLevel = QStringLiteral("VALID_LOCKED");
             r.qualityLabel = QStringLiteral("直接锁定");
@@ -2650,6 +2726,7 @@ QVariantMap waveformDiagnostics(const WaveformResult &r)
         {"predictedPeakIndex", finiteVariant(r.predictedPeakIndex)},
         {"predictionHistoryCount", r.predictionHistoryCount},
         {"predictionLeftIndex", r.predictionLeftIndex}, {"predictionRightIndex", r.predictionRightIndex},
+        {"searchWindowStage", r.searchWindowStage},
         {"longitudinalStatus", r.longitudinalStatus}, {"longitudinalCandidate", r.longitudinalCandidate},
         {"longitudinalEvidence", r.longitudinalEvidence}, {"echoConfirmed", r.echoConfirmed},
         {"echoCorrelation", finiteVariant(r.echoCorrelation)}, {"echoSnrDb", finiteVariant(r.echoSnrDb)},
@@ -2892,9 +2969,9 @@ WaveformResult detectLongitudinalPacket(
     // 其它位置的强旁瓣/其它回波抬高阈值，把沿历史轨迹的真实弱首波包压掉。
     double referencePeakEnergy = -1.0;
     int referencePeakIndex = -1;
-    const int referenceLeft = history.lockActive
+    const int referenceLeft = result.predictionApplied
         ? std::max(left, result.predictionLeftIndex) : left;
-    const int referenceRight = history.lockActive
+    const int referenceRight = result.predictionApplied
         ? std::min(right, result.predictionRightIndex) : right;
     for (int i = referenceLeft; i <= referenceRight; ++i) {
         if (energies[i] > referencePeakEnergy) {
@@ -4160,7 +4237,25 @@ WaveformResult detectLongitudinalPacket(
         // 保留原始snrDb用于统计，不修改SNR阈值。
     }
 
-    if (!std::isfinite(result.snrDb) || result.snrDb < p.minLocalSnrDb) {
+    const bool coldGlobalSearch = history.windowStage == SearchWindowStage::GlobalSearch
+        && !history.lockActive && !history.reacquireRequired && history.historyCount == 0;
+    // GLOBAL_SEARCH不再抬高最终SNR硬门。7~9.5 dB的弱全局候选仍可通过，
+    // 但必须同时具备单候选、高R²和后续Echo高相关三种独立证据；这样抑制
+    // “全局ROI里总能挑到一个噪声局部最大值”，同时保留真实弱启动波包。
+    const bool coldGlobalWeakBand = coldGlobalSearch
+        && std::isfinite(result.snrDb)
+        && result.snrDb >= p.minLocalSnrDb
+        && result.snrDb < p.minLocalSnrDb + 2.5;
+    const bool coldGlobalWeakEvidence = coldGlobalWeakBand
+        && result.candidateCount == 1
+        && result.fitSucceeded && !result.fallbackPeakUsed
+        && std::isfinite(result.fitR2) && result.fitR2 >= 0.95
+        && result.echoConfirmed
+        && std::isfinite(result.echoCorrelation)
+        && result.echoCorrelation >= std::max(p.echoMinCorrelation, 0.85);
+    const bool coldGlobalWeakRejected = coldGlobalWeakBand && !coldGlobalWeakEvidence;
+    if (!std::isfinite(result.snrDb) || result.snrDb < p.minLocalSnrDb
+        || coldGlobalWeakRejected) {
         const bool inLowSnrBand = std::isfinite(result.snrDb)
             && result.snrDb >= p.lowSnrSoftMinDb
             && result.snrDb < p.minLocalSnrDb;
@@ -4214,14 +4309,17 @@ WaveformResult detectLongitudinalPacket(
                 : QStringLiteral("LOW_SNR_RECOVERED");
         } else {
             rejectWaveform(result, QStringLiteral("NO_SIGNAL"),
-                inLowSnrBand
-                    ? QStringLiteral("SNR %1 dB处于%2~%3 dB软恢复区，但LOCK相关/R²/位置一致性条件未同时满足")
+                coldGlobalWeakRejected
+                    ? QStringLiteral("GLOBAL_SEARCH弱候选SNR %1 dB虽过基础门，但缺少单候选/高R²/Echo高相关联合证据")
                         .arg(result.snrDb, 0, 'f', 2)
-                        .arg(p.lowSnrSoftMinDb, 0, 'f', 2)
-                        .arg(p.minLocalSnrDb, 0, 'f', 2)
-                    : QStringLiteral("选中峰局部SNR %1 dB，低于稳定LOCK软恢复下限 %2 dB")
-                        .arg(result.snrDb, 0, 'f', 2)
-                        .arg(p.lowSnrSoftMinDb, 0, 'f', 2), true);
+                    : (inLowSnrBand
+                        ? QStringLiteral("SNR %1 dB处于%2~%3 dB软恢复区，但LOCK相关/R²/位置一致性条件未同时满足")
+                            .arg(result.snrDb, 0, 'f', 2)
+                            .arg(p.lowSnrSoftMinDb, 0, 'f', 2)
+                            .arg(p.minLocalSnrDb, 0, 'f', 2)
+                        : QStringLiteral("选中峰局部SNR %1 dB，低于稳定LOCK软恢复下限 %2 dB")
+                            .arg(result.snrDb, 0, 'f', 2)
+                            .arg(p.lowSnrSoftMinDb, 0, 'f', 2)), true);
             return result;
         }
     }
@@ -4308,40 +4406,105 @@ WaveformResult runCurrentWaveformAlgorithm(
     }
 
     const int n = static_cast<int>(raw.size());
-    const double center = std::max(1.0,
-        std::round(2.0 * (p.thicknessStdMm + CURRENT_FIXED_BIAS_MM) * 1e-3
-                   / p.longitudinalVelocityMps * p.sampleRateHz) - p.delayCount);
-    const double half = std::max(1.0, std::floor(p.sampleRateHz / 80000000.0 * 27.0));
-    if (!std::isfinite(center) || !std::isfinite(half)
-        || center - half >= n - 1 || half > std::numeric_limits<int>::max()) {
+    const int energyHalf = p.energyWindowSamples / 2;
+
+    // 三阶段窗口：搜索位置不再由参考厚度thicknessStdMm决定。
+    // GLOBAL_SEARCH使用首波物理ROI；WARMUP围绕已确认身份使用较宽局部门；
+    // 稳定后PREDICTION才收窄到历史中心±predictionHalfWidth。LOST则从冻结身份中心
+    // 渐进扩窗，失败越久窗口越宽，避免一失锁就重新在全局ROI竞争错误波包。
+    // 当前物理ROI左端避开FIR边缘，右端利用采集时序delayCount留在首波区，避免把
+    // Echo2/Echo3直接纳入启动候选竞争。后续可将该物理ROI暴露为现场参数。
+    const int globalLeft = std::clamp(
+        std::max(energyHalf, std::max(1, p.filterOrder / 2)),
+        energyHalf, n - 1 - energyHalf);
+    const int delayDerivedRight = p.delayCount > 0
+        ? p.delayCount + 8 * p.predictionHalfWidth
+        : n / 4;
+    const int minimumGlobalSpan = std::max(160, 10 * p.predictionHalfWidth);
+    const int globalRight = std::clamp(
+        std::max(globalLeft + minimumGlobalSpan, delayDerivedRight),
+        globalLeft + 2, n - 1 - energyHalf);
+    if (globalLeft + 2 > globalRight) {
         rejectWaveform(result, QStringLiteral("INVALID_WINDOW"),
-            QStringLiteral("理论搜索窗超出波形范围"));
+            QStringLiteral("首波物理全局搜索ROI无有效范围"));
         return result;
     }
-    result.searchLeftIndex = static_cast<int>(std::max(0.0, center - half));
-    result.searchRightIndex = static_cast<int>(std::min(double(n - 1), center + half));
+
+    const int localSearchHalf = std::max(
+        1, static_cast<int>(std::floor(p.sampleRateHz / 80000000.0 * 27.0)));
+    // 旧160 MHz稳定数据中最终TOF约78~82点，而固定搜索窗为38:146，
+    // 因此相对真实TOF的等效几何约为前42/后66点。用0.75*predictionHalfWidth
+    // 表达该12点偏移；Session Window建立后固定，不随逐帧prediction抖动。
+    const int packetGeometryOffset = std::clamp(
+        static_cast<int>(std::llround(0.75 * p.predictionHalfWidth)),
+        0, localSearchHalf - energyHalf);
+    const int localLeftMargin = std::max(energyHalf,
+                                         localSearchHalf - packetGeometryOffset);
+    const int localRightMargin = localSearchHalf + packetGeometryOffset;
     result.predictionHistoryCount = prediction.historyCount;
     result.predictedPeakIndex = prediction.center;
-    result.predictionApplied = std::isfinite(prediction.center);
-    result.trackingState = prediction.reacquireRequired ? QStringLiteral("LOST")
-        : (prediction.lockActive ? QStringLiteral("LOCK") : QStringLiteral("SEARCH"));
-    result.predictionLeftIndex = result.searchLeftIndex;
-    result.predictionRightIndex = result.searchRightIndex;
-    if (result.predictionApplied) {
-        result.predictionLeftIndex = std::max(result.searchLeftIndex,
-            static_cast<int>(std::ceil(prediction.center - p.predictionHalfWidth)));
-        result.predictionRightIndex = std::min(result.searchRightIndex,
-            static_cast<int>(std::floor(prediction.center + p.predictionHalfWidth)));
-    }
-    const int energyHalf = p.energyWindowSamples / 2;
-    result.predictionLeftIndex = std::max(result.predictionLeftIndex, energyHalf);
-    result.predictionRightIndex = std::min(result.predictionRightIndex, n - 1 - energyHalf);
+    const bool hasPredictionCenter = std::isfinite(prediction.center);
 
-    // 对完整理论搜索窗做污染判定，不允许通过缩小预测门绕开污染检查。
-    // detectRawImpulses返回当前处理线程的复用污染掩码；只读引用可避免每帧再复制1600位标记。
-    const std::vector<bool> &contaminated = detectRawImpulses(raw, p, result, ws);
-    if (result.firstContaminatedIndex >= 0 && !filteredOut)
-        return result;
+    // Discovery ROI只用于粗定位；真正的searchLeft/searchRight会在滤波后根据粗位置
+    // 重新收回到约±54点的Local Search Window，保证noise floor和packet分割不被全局窗污染。
+    int discoveryLeft = globalLeft;
+    int discoveryRight = globalRight;
+    switch (prediction.windowStage) {
+    case SearchWindowStage::Prediction:
+        result.searchWindowStage = QStringLiteral("PREDICTION");
+        result.trackingState = QStringLiteral("LOCK");
+        if (std::isfinite(prediction.searchWindowAnchor)) {
+            discoveryLeft = std::max(globalLeft,
+                static_cast<int>(std::floor(prediction.searchWindowAnchor - localLeftMargin)));
+            discoveryRight = std::min(globalRight,
+                static_cast<int>(std::ceil(prediction.searchWindowAnchor + localRightMargin)));
+        }
+        break;
+    case SearchWindowStage::Warmup:
+        result.searchWindowStage = QStringLiteral("WARMUP");
+        result.trackingState = QStringLiteral("WARMUP");
+        if (std::isfinite(prediction.searchWindowAnchor)) {
+            discoveryLeft = std::max(globalLeft,
+                static_cast<int>(std::floor(prediction.searchWindowAnchor - localLeftMargin)));
+            discoveryRight = std::min(globalRight,
+                static_cast<int>(std::ceil(prediction.searchWindowAnchor + localRightMargin)));
+        }
+        break;
+    case SearchWindowStage::GlobalReacquire:
+        result.searchWindowStage = prediction.longTermIdentityAvailable
+            ? QStringLiteral("GLOBAL_REACQUIRE")
+            : QStringLiteral("REACQUIRE_EXPANDED");
+        result.trackingState = QStringLiteral("LOST");
+        if (!prediction.longTermIdentityAvailable
+            && std::isfinite(prediction.longTermIdentityCenter)) {
+            // LOST前期仍围绕冻结位置渐进扩窗，不允许全局最强峰立即接管身份。
+            const int baseReacquireHalfWidth = std::max(40, 2 * p.predictionHalfWidth);
+            const int expandedHalfWidth = std::min(
+                globalRight - globalLeft,
+                baseReacquireHalfWidth + 3 * std::max(0, prediction.missCount));
+            discoveryLeft = std::max(globalLeft,
+                static_cast<int>(std::floor(
+                    prediction.longTermIdentityCenter - expandedHalfWidth)));
+            discoveryRight = std::min(globalRight,
+                static_cast<int>(std::ceil(
+                    prediction.longTermIdentityCenter + expandedHalfWidth)));
+        }
+        // 只有冻结身份模板已正式开放时，才把Discovery放回整个物理ROI；
+        // 后续候选仍必须通过LOST_CONFIRMED/EMA模板身份认证。
+        break;
+    case SearchWindowStage::GlobalSearch:
+    default:
+        result.searchWindowStage = QStringLiteral("GLOBAL_SEARCH");
+        result.trackingState = QStringLiteral("SEARCH");
+        break;
+    }
+    discoveryLeft = std::max(discoveryLeft, energyHalf);
+    discoveryRight = std::min(discoveryRight, n - 1 - energyHalf);
+    result.searchLeftIndex = discoveryLeft;
+    result.searchRightIndex = discoveryRight;
+    result.predictionLeftIndex = discoveryLeft;
+    result.predictionRightIndex = discoveryRight;
+    result.predictionApplied = false;
 
     // 100 Hz实时路径：滤波参数不变时复用FIR系数和滤波输出缓冲。
     // 缓存属于显式AlgorithmWorkspace，任务结束前正常析构，不依赖TLS生命周期。
@@ -4361,8 +4524,6 @@ WaveformResult runCurrentWaveformAlgorithm(
     detrendSignal(filtered);
     if (filteredOut)
         *filteredOut = filtered;
-    if (result.firstContaminatedIndex >= 0)
-        return result;
 
     if (!std::all_of(filtered.begin(), filtered.end(),
             [](double value) { return std::isfinite(value); })) {
@@ -4370,6 +4531,165 @@ WaveformResult runCurrentWaveformAlgorithm(
             QStringLiteral("滤波后出现非有限数据"));
         return result;
     }
+
+    // 第一层：Discovery只用滤波后局部能量粗定位，不依赖参考厚度，也不参与最终SNR判据。
+    double discoveryMaximumEnergy = 0.0;
+    int discoveryMaxIndex = -1;
+    for (int i = discoveryLeft; i <= discoveryRight; ++i) {
+        const double energy = localEnergy(filtered, i, energyHalf);
+        if (energy > discoveryMaximumEnergy) {
+            discoveryMaximumEnergy = energy;
+            discoveryMaxIndex = i;
+        }
+    }
+
+    // GLOBAL_SEARCH左边界附近容易包含采集起始基线跃迁/滤波过渡。若全局最强点
+    // 落在“无法向左容纳一个完整Local Search Window”的边缘区，不直接把它当首波。
+    // 仅当更深处存在能量至少达到边缘峰20%的候选时才切换到内部候选；因此不使用
+    // reference thickness，也不会因为普通弱噪声就覆盖真正靠左的物理首波。
+    bool globalEdgeTransientSuppressed = false;
+    int globalDiscoveryCompetitionLeft = discoveryLeft;
+    if (prediction.windowStage == SearchWindowStage::GlobalSearch
+        && discoveryMaxIndex >= 0) {
+        const int interiorLeft = std::min(discoveryRight,
+            globalLeft + std::max(localLeftMargin, p.filterOrder / 2));
+        if (discoveryMaxIndex < interiorLeft && interiorLeft < discoveryRight) {
+            double interiorMaximumEnergy = 0.0;
+            int interiorMaxIndex = -1;
+            for (int i = interiorLeft; i <= discoveryRight; ++i) {
+                const double energy = localEnergy(filtered, i, energyHalf);
+                if (energy > interiorMaximumEnergy) {
+                    interiorMaximumEnergy = energy;
+                    interiorMaxIndex = i;
+                }
+            }
+            constexpr double minimumInteriorEnergyFraction = 0.20;
+            if (interiorMaxIndex >= 0
+                && interiorMaximumEnergy >= minimumInteriorEnergyFraction * discoveryMaximumEnergy) {
+                discoveryMaximumEnergy = interiorMaximumEnergy;
+                discoveryMaxIndex = interiorMaxIndex;
+                globalEdgeTransientSuppressed = true;
+                globalDiscoveryCompetitionLeft = interiorLeft;
+            }
+        }
+    }
+
+    // 冷启动全局搜索不能只围绕“最强点”立即裁窗，否则两个相距较远、能量接近的
+    // 首波候选会被先验裁掉一个，绕过后续AMBIGUOUS_PACKETS安全门。额外寻找一个
+    // 与最强点相隔至少2*candidateSeparation的竞争峰；只有能量比已达到原独立候选
+    // 歧义标准时，才把Local Search Window中心放到两者中点，让正常packet链同时评估。
+    int discoverySecondIndex = -1;
+    double discoverySecondEnergy = 0.0;
+    bool globalDiscoveryAmbiguous = false;
+    if (prediction.windowStage == SearchWindowStage::GlobalSearch && discoveryMaxIndex >= 0) {
+        const int exclusion = std::max(2 * p.candidateSeparationSamples,
+                                       p.packetMaxWidth / 2);
+        for (int i = globalDiscoveryCompetitionLeft; i <= discoveryRight; ++i) {
+            // 已被识别为启动边缘瞬态的区域不能再次以“第二候选”身份回流，
+            // 否则主候选与瞬态取中点仍会把真正首波裁在Local Window边缘。
+            if (globalEdgeTransientSuppressed && i < globalDiscoveryCompetitionLeft)
+                continue;
+            if (std::abs(i - discoveryMaxIndex) < exclusion)
+                continue;
+            const double energy = localEnergy(filtered, i, energyHalf);
+            if (energy > discoverySecondEnergy) {
+                discoverySecondEnergy = energy;
+                discoverySecondIndex = i;
+            }
+        }
+        globalDiscoveryAmbiguous = discoverySecondIndex >= 0
+            && discoverySecondEnergy > 1e-24
+            && discoveryMaximumEnergy / discoverySecondEnergy < p.minCandidateRatio;
+    }
+
+    double localCenter = NaN;
+    switch (prediction.windowStage) {
+    case SearchWindowStage::Prediction:
+        localCenter = std::isfinite(prediction.searchWindowAnchor)
+            ? prediction.searchWindowAnchor
+            : (hasPredictionCenter ? prediction.center : double(discoveryMaxIndex));
+        break;
+    case SearchWindowStage::Warmup:
+        localCenter = std::isfinite(prediction.searchWindowAnchor)
+            ? prediction.searchWindowAnchor
+            : (hasPredictionCenter ? prediction.center : double(discoveryMaxIndex));
+        break;
+    case SearchWindowStage::GlobalReacquire:
+        if (prediction.longTermIdentityAvailable && discoveryMaxIndex >= 0)
+            localCenter = discoveryMaxIndex;
+        else if (std::isfinite(prediction.longTermIdentityCenter))
+            localCenter = prediction.longTermIdentityCenter;
+        else if (std::isfinite(prediction.searchWindowAnchor))
+            localCenter = prediction.searchWindowAnchor;
+        else
+            localCenter = discoveryMaxIndex;
+        break;
+    case SearchWindowStage::GlobalSearch:
+    default:
+        localCenter = globalDiscoveryAmbiguous
+            ? 0.5 * (discoveryMaxIndex + discoverySecondIndex)
+            : double(discoveryMaxIndex);
+        break;
+    }
+
+    // 第二层：Local Search Window保持与旧理论窗近似相同的±54点宽度，但中心来自
+    // Discovery/历史身份，而不是reference thickness。Raw污染、noise floor和packet分割
+    // 全部只在这个局部窗内运行，避免全局ROI改变成熟算法的统计基线。
+    if (std::isfinite(localCenter)) {
+        // 首波局部窗采用与旧稳定算法等效的非对称几何，但不再依赖参考厚度中心。
+        // 默认160 MHz / predictionHalfWidth=16时得到前42/后66点，总宽度与旧±54窗一致。
+        result.searchLeftIndex = std::max(globalLeft,
+            static_cast<int>(std::floor(localCenter - localLeftMargin)));
+        result.searchRightIndex = std::min(globalRight,
+            static_cast<int>(std::ceil(localCenter + localRightMargin)));
+    } else {
+        result.searchLeftIndex = discoveryLeft;
+        result.searchRightIndex = discoveryRight;
+    }
+
+    result.predictionLeftIndex = result.searchLeftIndex;
+    result.predictionRightIndex = result.searchRightIndex;
+    result.predictionApplied = false;
+    if (prediction.windowStage == SearchWindowStage::Prediction && hasPredictionCenter) {
+        // 正常LOCK用±predictionHalfWidth；出现连续miss后每帧扩大8点，优先在保持
+        // RECENT身份的前提下追上真实位移，而不是直接清空历史进入LOST重学。
+        const int expandedPredictionHalfWidth = std::min(
+            localSearchHalf,
+            p.predictionHalfWidth + 8 * std::max(0, prediction.missCount));
+        result.predictionLeftIndex = std::max(result.searchLeftIndex,
+            static_cast<int>(std::ceil(prediction.center - expandedPredictionHalfWidth)));
+        result.predictionRightIndex = std::min(result.searchRightIndex,
+            static_cast<int>(std::floor(prediction.center + expandedPredictionHalfWidth)));
+        result.predictionApplied = true;
+    } else if (prediction.windowStage == SearchWindowStage::Warmup
+               && std::isfinite(localCenter)) {
+        constexpr int warmupCandidateHalfWidth = 32;
+        const double warmupGateCenter = hasPredictionCenter
+            ? prediction.center : (discoveryMaxIndex >= 0 ? double(discoveryMaxIndex) : localCenter);
+        result.predictionLeftIndex = std::max(result.searchLeftIndex,
+            static_cast<int>(std::floor(warmupGateCenter - warmupCandidateHalfWidth)));
+        result.predictionRightIndex = std::min(result.searchRightIndex,
+            static_cast<int>(std::ceil(warmupGateCenter + warmupCandidateHalfWidth)));
+        result.predictionApplied = true;
+    } else if (prediction.windowStage == SearchWindowStage::GlobalReacquire
+               && std::isfinite(localCenter)) {
+        const int reacquireCandidateHalfWidth = prediction.longTermIdentityAvailable
+            ? 40
+            : std::min(localSearchHalf,
+                       p.predictionHalfWidth + 4 * std::max(1, prediction.missCount));
+        result.predictionLeftIndex = std::max(result.searchLeftIndex,
+            static_cast<int>(std::floor(localCenter - reacquireCandidateHalfWidth)));
+        result.predictionRightIndex = std::min(result.searchRightIndex,
+            static_cast<int>(std::ceil(localCenter + reacquireCandidateHalfWidth)));
+        result.predictionApplied = true;
+    }
+    result.predictionLeftIndex = std::max(result.predictionLeftIndex, energyHalf);
+    result.predictionRightIndex = std::min(result.predictionRightIndex, n - 1 - energyHalf);
+
+    // Raw污染与噪声估计现在都基于Local Search Window，而不是全局Discovery ROI。
+    const std::vector<bool> &contaminated = detectRawImpulses(raw, p, result, ws);
+    if (result.firstContaminatedIndex >= 0)
+        return result;
     if (!estimateNoiseEnergy(filtered, contaminated, p, result, prediction, ws))
         return result;
 
@@ -4399,22 +4719,30 @@ WaveformResult runCurrentWaveformAlgorithm(
         && !prediction.reacquireRequired
         && !prediction.templateValues.empty();
     const double searchSnrFloor = stableLockForLowSnr
-        ? p.lowSnrSoftMinDb : p.minLocalSnrDb;
+        ? p.lowSnrSoftMinDb
+        : (prediction.windowStage == SearchWindowStage::GlobalSearch
+            ? p.minLocalSnrDb - 0.25 : p.minLocalSnrDb);
+    // 一旦Discovery已经生成局部Candidate Gate，信号存在性也以该局部门为准；
+    // 不能让远处强能量团把全局maxLocalSNR抬高后误导当前身份分支。
+    const double signalPresenceSnrDb = result.predictionApplied
+        ? result.predictionGateMaxLocalSnrDb : result.maxLocalSnrDb;
+    const double signalPresenceEnergy = result.predictionApplied
+        ? predictionGateMaximumEnergy : maximumEnergy;
     if (stableLockForLowSnr
-        && std::isfinite(result.maxLocalSnrDb)
-        && result.maxLocalSnrDb >= p.lowSnrSoftMinDb
-        && result.maxLocalSnrDb < p.minLocalSnrDb)
+        && std::isfinite(signalPresenceSnrDb)
+        && signalPresenceSnrDb >= p.lowSnrSoftMinDb
+        && signalPresenceSnrDb < p.minLocalSnrDb)
         result.lowSnrSoftCandidate = true;
-    if (maximumEnergy <= 1e-24 || result.maxLocalSnrDb < searchSnrFloor) {
-        result.snrDb = result.maxLocalSnrDb;
+    if (signalPresenceEnergy <= 1e-24 || signalPresenceSnrDb < searchSnrFloor) {
+        result.snrDb = signalPresenceSnrDb;
         rejectWaveform(result, QStringLiteral("NO_SIGNAL"),
             stableLockForLowSnr
-                ? QStringLiteral("稳定LOCK搜索窗最大局部SNR %1 dB，低于软恢复下限 %2 dB（普通硬门%3 dB）")
-                    .arg(result.maxLocalSnrDb, 0, 'f', 2)
+                ? QStringLiteral("当前候选门最大局部SNR %1 dB，低于软恢复下限 %2 dB（普通硬门%3 dB）")
+                    .arg(signalPresenceSnrDb, 0, 'f', 2)
                     .arg(p.lowSnrSoftMinDb, 0, 'f', 2)
                     .arg(p.minLocalSnrDb, 0, 'f', 2)
-                : QStringLiteral("搜索窗最大局部能量SNR %1 dB，低于门限 %2 dB")
-                    .arg(result.maxLocalSnrDb, 0, 'f', 2).arg(p.minLocalSnrDb, 0, 'f', 2), true);
+                : QStringLiteral("当前候选门最大局部能量SNR %1 dB，低于门限 %2 dB")
+                    .arg(signalPresenceSnrDb, 0, 'f', 2).arg(p.minLocalSnrDb, 0, 'f', 2), true);
         return result;
     }
     if (result.predictionLeftIndex + 2 > result.predictionRightIndex) {
@@ -5665,9 +5993,25 @@ HighPrecisionDecision computeHighPrecisionDecision(
                    && std::isfinite(r.snrDb) && r.snrDb >= p.minLocalSnrDb
                    && r.candidateCount >= 1 && r.candidateCount <= 2
                    && !r.fallbackPeakUsed
-                   && ((r.fitSucceeded && std::isfinite(r.fitR2) && r.fitR2 >= 0.93)
+                   && ((r.fitSucceeded && std::isfinite(r.fitR2)
+                        && ((r.candidateCount == 1 && r.fitR2 >= 0.80)
+                            || (r.candidateCount == 2 && r.fitR2 >= 0.93)))
                        || (r.echoConfirmed && std::isfinite(r.echoCorrelation)
-                           && r.echoCorrelation >= std::max(p.echoMinCorrelation, 0.85)))) {
+                           && r.echoCorrelation >= std::max(p.echoMinCorrelation, 0.80)))) {
+            mainFallback = true;
+        } else if ((r.searchWindowStage == QStringLiteral("WARMUP")
+                    || r.trackingState == QStringLiteral("WARMUP"))
+                   && leadingReliable && hasNcc && !templateReliable && hasT50
+                   && std::isfinite(deltaNccT50) && deltaNccT50 <= 2.0
+                   && r.candidateCount == 1
+                   && std::isfinite(r.snrDb) && r.snrDb >= p.minLocalSnrDb + 5.0
+                   && r.fitSucceeded && std::isfinite(r.fitR2) && r.fitR2 >= 0.95
+                   && !r.fallbackPeakUsed
+                   && r.echoConfirmed && std::isfinite(r.echoCorrelation)
+                   && r.echoCorrelation >= std::max(p.echoMinCorrelation, 0.75)) {
+            // WARMUP阶段Envelope模板仍在收敛；若仅因模板相关偏弱而被高精度层拒绝，
+            // 但核心链已有唯一候选、极高R²、强SNR、Echo佐证且NCC/t50位置一致，
+            // 允许暂用核心整包拟合TOF，避免模板学习期清空可靠厚度。
             mainFallback = true;
         } else if (r.trackingState == QStringLiteral("SEARCH")
                    && r.predictionHistoryCount <= 2 && r.candidateCount == 1
@@ -7027,9 +7371,11 @@ ThicknessResult ThicknessProcessor::process(
                 && backfillWaveform.candidateCount >= 1 && backfillWaveform.candidateCount <= 2
                 && !backfillWaveform.fallbackPeakUsed
                 && ((backfillWaveform.fitSucceeded && std::isfinite(backfillWaveform.fitR2)
-                     && backfillWaveform.fitR2 >= 0.93)
+                     && ((backfillWaveform.candidateCount == 1 && backfillWaveform.fitR2 >= 0.80)
+                         || (backfillWaveform.candidateCount == 2
+                             && backfillWaveform.fitR2 >= 0.93)))
                     || (backfillWaveform.echoConfirmed && std::isfinite(backfillWaveform.echoCorrelation)
-                        && backfillWaveform.echoCorrelation >= std::max(p.echoMinCorrelation, 0.85)));
+                        && backfillWaveform.echoCorrelation >= std::max(p.echoMinCorrelation, 0.80)));
             const bool residualSafe = std::isfinite(backfillWaveform.trackingResidualSamples)
                 && std::abs(backfillWaveform.trackingResidualSamples) <= 2.0;
             if (clippedSafe || startupSafe || residualSafe) {
