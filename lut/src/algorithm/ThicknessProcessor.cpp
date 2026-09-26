@@ -1,5 +1,6 @@
 #include "ThicknessProcessor.h"
 #include "PacketSpline.h"
+#include "CandidateTofOutputChain.h"
 
 #include <QString>
 #include <QStringList>
@@ -554,6 +555,10 @@ struct AlgorithmWorkspace
 
     // 等效单脉冲拟合工作区
     PacketPeakFit::FitWorkspace fit;
+    // Candidate TOF身份链的固定正/负极性旁路拟合使用独立工作区，
+    // 不污染主fit，也避免100 Hz路径每帧重复分配临时向量。
+    PacketPeakFit::FitWorkspace positiveFitDiagnostic;
+    PacketPeakFit::FitWorkspace negativeFitDiagnostic;
 };
 
 // -----------------------------------------------------------------------------
@@ -1107,6 +1112,18 @@ struct WaveformResult
     double fitResidualRms = NaN;
     double fitSinglePeakIndex = NaN;
     double packetCenterIndex = NaN;
+    // Candidate TOF身份链只读观测量：固定正/负极性PacketPeakFit、
+    // 同极性DirectPeak以及当前packet原始三点抛物线峰。
+    // 这些字段不参与现有检测/SNR/LOCK/LOST/VALID质量判据。
+    double directParabolicPeakIndex = NaN;
+    bool positiveFitSolved = false;
+    double positiveFitR2 = NaN;
+    double positiveFitCenterIndex = NaN;
+    double positivePolarityDirectPeakIndex = NaN;
+    bool negativeFitSolved = false;
+    double negativeFitR2 = NaN;
+    double negativeFitCenterIndex = NaN;
+    double negativePolarityDirectPeakIndex = NaN;
     double fitPeakWidthSamples = NaN;
     // 自适应拟合脉宽模型诊断。WIDTH_NORMAL / WIDTH_TRANSITION / WIDTH_OUTLIER
     // 只影响quality/confidence，不直接判废当前厚度。
@@ -2358,6 +2375,61 @@ OriginalPeakResult findOriginalSinglePeak(const std::vector<double> &signal,
     return result;
 }
 
+struct FitPolarityDirectPeakResult
+{
+    bool found = false;
+    double position = NaN;
+};
+
+// Candidate TOF身份链观测：复用PacketPeakFit已经得到的局部线性基线和固定极性，
+// 在原packet全窗内寻找该极性的最强局部极值，并做三点抛物线亚采样。
+// 只提供身份定位证据，不改变主fit和质量链。
+FitPolarityDirectPeakResult findFitPolarityDirectPeak(
+    const std::vector<double> &signal, int left, int right,
+    const PacketPeakFit::Fit &fit)
+{
+    FitPolarityDirectPeakResult result;
+    left = std::max(0, left);
+    right = std::min(right, static_cast<int>(signal.size()) - 1);
+    if (left > right || !std::isfinite(fit.polarity)
+        || !std::isfinite(fit.baselineIntercept)
+        || !std::isfinite(fit.baselineSlope)
+        || !std::isfinite(fit.baselineOrigin))
+        return result;
+
+    auto normalized = [&](int index) {
+        const double baseline = fit.baselineIntercept
+            + fit.baselineSlope * (index - fit.baselineOrigin);
+        return fit.polarity * (signal[static_cast<size_t>(index)] - baseline);
+    };
+
+    int best = left;
+    double bestValue = normalized(left);
+    for (int i = left + 1; i <= right; ++i) {
+        const double value = normalized(i);
+        if (value > bestValue) {
+            bestValue = value;
+            best = i;
+        }
+    }
+    if (!std::isfinite(bestValue))
+        return result;
+
+    double delta = 0.0;
+    if (best > left && best < right) {
+        const double yl = normalized(best - 1);
+        const double yc = normalized(best);
+        const double yr = normalized(best + 1);
+        const double curvature = yl - 2.0 * yc + yr;
+        if (std::isfinite(curvature) && curvature < -1e-15)
+            delta = std::clamp(0.5 * (yl - yr) / curvature, -0.5, 0.5);
+    }
+
+    result.found = true;
+    result.position = best + delta;
+    return result;
+}
+
 bool estimateNoiseEnergy(const std::vector<double> &signal,
                          const std::vector<bool> &contaminated,
                          const TestParameters &p, WaveformResult &r,
@@ -2738,6 +2810,15 @@ QVariantMap waveformDiagnostics(const WaveformResult &r)
         {"fitResidualRms", finiteVariant(r.fitResidualRms)},
         {"fitSinglePeakIndex", finiteVariant(r.fitSinglePeakIndex)},
         {"packetCenterIndex", finiteVariant(r.packetCenterIndex)},
+        {"directParabolicPeakIndex", finiteVariant(r.directParabolicPeakIndex)},
+        {"positiveFitSolved", r.positiveFitSolved},
+        {"positiveFitR2", finiteVariant(r.positiveFitR2)},
+        {"positiveFitCenterIndex", finiteVariant(r.positiveFitCenterIndex)},
+        {"positivePolarityDirectPeakIndex", finiteVariant(r.positivePolarityDirectPeakIndex)},
+        {"negativeFitSolved", r.negativeFitSolved},
+        {"negativeFitR2", finiteVariant(r.negativeFitR2)},
+        {"negativeFitCenterIndex", finiteVariant(r.negativeFitCenterIndex)},
+        {"negativePolarityDirectPeakIndex", finiteVariant(r.negativePolarityDirectPeakIndex)},
         {"fitPeakWidthSamples", finiteVariant(r.fitPeakWidthSamples)},
         {"adaptiveWidthState", r.adaptiveWidthState},
         {"adaptiveWidthHistoryCount", r.adaptiveWidthHistoryCount},
@@ -3475,6 +3556,37 @@ WaveformResult detectLongitudinalPacket(
         result.fitR2 = fit.rSquared;
         result.fitResidualRms = fit.residualRms;
         result.fitSucceeded = fit.solved && fit.rSquared >= p.fitMinR2;
+
+        // Candidate TOF身份链观测：同一packet固定正/负极性各拟合一次。
+        // 主算法仍只使用上面的auto fit；这些结果不会改变selected、tracking或VALID。
+        const PacketPeakFit::Fit positiveFit = PacketPeakFit::fit(
+            signal, packet.left, packet.right, "peak", fitOptions,
+            &workspace.positiveFitDiagnostic);
+        const PacketPeakFit::Fit negativeFit = PacketPeakFit::fit(
+            signal, packet.left, packet.right, "valley", fitOptions,
+            &workspace.negativeFitDiagnostic);
+        result.positiveFitSolved = positiveFit.solved;
+        result.positiveFitR2 = positiveFit.rSquared;
+        result.positiveFitCenterIndex = positiveFit.center;
+        result.negativeFitSolved = negativeFit.solved;
+        result.negativeFitR2 = negativeFit.rSquared;
+        result.negativeFitCenterIndex = negativeFit.center;
+
+        const FitPolarityDirectPeakResult positiveDirect = findFitPolarityDirectPeak(
+            signal, packet.left, packet.right, positiveFit);
+        if (positiveDirect.found)
+            result.positivePolarityDirectPeakIndex = positiveDirect.position;
+        const FitPolarityDirectPeakResult negativeDirect = findFitPolarityDirectPeak(
+            signal, packet.left, packet.right, negativeFit);
+        if (negativeDirect.found)
+            result.negativePolarityDirectPeakIndex = negativeDirect.position;
+
+        // 与测试程序E2E Candidate相同：RAW Direct为当前packet内原检测极性的三点抛物线峰。
+        const OriginalPeakResult rawDirect = findOriginalSinglePeak(
+            signal, packet.left, packet.right, p.detectMode);
+        if (rawDirect.found)
+            result.directParabolicPeakIndex = rawDirect.position;
+
         if (fit.solved) {
             const int fittedPointCount = std::max(
                 0, static_cast<int>(std::floor((fit.right - fit.left) / 0.25)) + 1);
@@ -6952,10 +7064,25 @@ QString csvEscape(QString text)
 
 struct ThicknessProcessor::Impl
 {
+    struct CandidateOutputSnapshot {
+        int clock = 0;
+        bool valid = false;
+        double peakVoltage = NaN;
+        double snrDb = NaN;
+    };
+    struct CandidateReplayFrame {
+        int clock = 0;
+        QVariantMap input;
+        CandidateTof::CandidateTofOutputChain stateBefore;
+    };
+
     PeakHistory history;
     AlgorithmWorkspace workspace;
     HighPrecisionHistory highPrecisionHistory;
     StartupProvisionalState startupProvisional;
+    CandidateTof::CandidateTofOutputChain candidateTof;
+    std::deque<CandidateOutputSnapshot> candidateOutputHistory;
+    std::deque<CandidateReplayFrame> candidateReplayHistory;
     // 保存最近帧“当时”的高精度决策。PENDING帧下一帧确认时必须回填这一时刻的
     // NCC/三证据结果，不能再用旧核心厚度覆盖高精度序列。
     std::deque<std::pair<int, HighPrecisionDecision>> highPrecisionDecisionHistory;
@@ -7121,6 +7248,9 @@ ThicknessResult ThicknessProcessor::process(
         m_impl->highPrecisionHistory = HighPrecisionHistory{};
         m_impl->startupProvisional.reset();
         m_impl->highPrecisionDecisionHistory.clear();
+        m_impl->candidateTof = CandidateTof::CandidateTofOutputChain{};
+        m_impl->candidateOutputHistory.clear();
+        m_impl->candidateReplayHistory.clear();
         m_impl->lastSampleRate = sampleRate;
         m_impl->lastLowFreqMHz = lowFreqMHz;
         m_impl->lastHighFreqMHz = highFreqMHz;
@@ -7330,26 +7460,85 @@ ThicknessResult ThicknessProcessor::process(
     while (m_impl->highPrecisionDecisionHistory.size() > 32)
         m_impl->highPrecisionDecisionHistory.pop_front();
 
+    // Candidate优先TOF层只读取既有诊断，不反向写入核心检测/跟踪状态。
+    // Candidate真正处理当前帧前，先拿到本帧触发的核心回填；若旧PENDING帧刚被恢复为
+    // BACKFILLED_RELOCKED，则回滚Candidate状态到该帧之前，用“最终诊断”重放，复现测试程序
+    // “整批核心backfill完成后再顺序跑Candidate”的时序，同时不延迟普通实时输出。
+    QVariantMap candidateInput = waveformDiagnostics(waveform);
+    candidateInput[QStringLiteral("fileName")] = QString::number(m_impl->history.clock);
+
     WaveformResult backfillWaveform;
     int backfillTargetClock = 0;
     const bool hasBackfill =
         m_impl->history.takeBackfill(backfillWaveform, backfillTargetClock);
 
+    CandidateTof::OutputDecision replayedBackfillCandidate;
+    int replayedBackfillClock = 0;
+    auto replayCandidateFromBackfill = [&](int targetClock, const WaveformResult &finalizedWaveform) {
+        if (targetClock <= 0)
+            return;
+        auto targetIt = std::find_if(
+            m_impl->candidateReplayHistory.begin(),
+            m_impl->candidateReplayHistory.end(),
+            [&](const Impl::CandidateReplayFrame &frame) { return frame.clock == targetClock; });
+        if (targetIt == m_impl->candidateReplayHistory.end())
+            return;
+
+        m_impl->candidateTof = targetIt->stateBefore;
+        bool first = true;
+        for (auto it = targetIt; it != m_impl->candidateReplayHistory.end(); ++it) {
+            if (first) {
+                it->input = waveformDiagnostics(finalizedWaveform);
+                it->input[QStringLiteral("fileName")] = QString::number(targetClock);
+            }
+            it->stateBefore = m_impl->candidateTof;
+            const CandidateTof::OutputDecision replayed =
+                m_impl->candidateTof.process(it->input);
+            if (first) {
+                replayedBackfillCandidate = replayed;
+                replayedBackfillClock = targetClock;
+                first = false;
+            }
+        }
+    };
+
+    if (hasBackfill)
+        replayCandidateFromBackfill(backfillTargetClock, backfillWaveform);
+    else if (startupEnvelopeConfirmed)
+        replayCandidateFromBackfill(startupBackfillClock, startupBackfillWaveform);
+
+    const CandidateTof::CandidateTofOutputChain candidateStateBefore = m_impl->candidateTof;
+    const CandidateTof::OutputDecision candidateDecision =
+        m_impl->candidateTof.process(candidateInput);
+    m_impl->candidateReplayHistory.push_back({
+        m_impl->history.clock, candidateInput, candidateStateBefore});
+    while (m_impl->candidateReplayHistory.size() > 32)
+        m_impl->candidateReplayHistory.pop_front();
+
     ThicknessResult result;
     const bool legacyCoreValid = waveform.measurementStatus == QStringLiteral("VALID")
         && std::isfinite(waveform.thicknessMm)
         && std::isfinite(waveform.interpolatedPeakIndex);
-    // 高精度TOF只能替换“已由核心身份链确认有效”的当前帧厚度；
-    // TRACKING_JUMP / REACQUIRE_PENDING / NO_SIGNAL 等核心拒绝帧不能仅凭NCC重新变成VALID。
+    // 现有核心身份链 + 高精度Final仍唯一决定VALID；Candidate绝不把INVALID/NO_SIGNAL升级。
     result.valid = legacyCoreValid
         && highPrecision.allowed && std::isfinite(highPrecision.thicknessMm)
         && std::isfinite(highPrecision.tofIndex);
-    result.thicknessMm = result.valid ? highPrecision.thicknessMm : NaN;
-    result.peakTimeSec = result.valid ? highPrecision.tofIndex / p.sampleRateHz : NaN;
+
+    double finalTof = result.valid ? highPrecision.tofIndex : NaN;
+    double finalThickness = result.valid ? highPrecision.thicknessMm : NaN;
+    if (result.valid && std::isfinite(candidateDecision.center)) {
+        finalTof = candidateDecision.center;
+        finalThickness = p.longitudinalVelocityMps
+            * (finalTof + p.delayCount) / p.sampleRateHz / 2.0 * 1000.0
+            - CURRENT_FIXED_BIAS_MM;
+    }
+
+    result.thicknessMm = result.valid ? finalThickness : NaN;
+    result.peakTimeSec = result.valid ? finalTof / p.sampleRateHz : NaN;
     result.peakVoltage = result.valid ? waveform.peakVoltage : NaN;
     result.snrDb = result.valid ? waveform.snrDb : NaN;
     result.peakIndex = result.valid
-        ? static_cast<int>(std::llround(highPrecision.tofIndex)) : -1;
+        ? static_cast<int>(std::llround(finalTof)) : -1;
 
     if (hasBackfill && std::isfinite(backfillWaveform.thicknessMm)) {
         const auto decisionIt = std::find_if(
@@ -7417,6 +7606,88 @@ ThicknessResult ThicknessProcessor::process(
         result.backfillSnrDb = startupBackfillWaveform.snrDb;
         result.backfillPeakIndex = static_cast<int>(std::llround(startupBackfillTof));
     }
+
+    // Candidate只修正TOF身份，不负责把无效帧升级为VALID。
+    // 对已经由核心/启动链确认有效的backfill，先应用“重放后的该帧Candidate中心”；
+    // 随后若当前帧的PENDING/CONFIRMED又明确要求回填同一目标，则以当前确认中心覆盖，
+    // 顺序与测试程序整批回填后再跑Candidate完全一致。
+    if (result.hasBackfill && result.backfillFramesAgo > 0) {
+        const int activeTargetClock = m_impl->history.clock - result.backfillFramesAgo;
+        double candidateBackfillTof = NaN;
+        if (replayedBackfillClock == activeTargetClock
+            && std::isfinite(replayedBackfillCandidate.center)) {
+            candidateBackfillTof = replayedBackfillCandidate.center;
+        }
+
+        if (candidateDecision.backfillPrevious
+            && std::isfinite(candidateDecision.backfillCenter)) {
+            bool clockOk = false;
+            const int decisionTargetClock = candidateDecision.backfillFile.toInt(&clockOk);
+            if (clockOk && decisionTargetClock == activeTargetClock)
+                candidateBackfillTof = candidateDecision.backfillCenter;
+        }
+
+        if (std::isfinite(candidateBackfillTof)) {
+            const double candidateBackfillThickness = p.longitudinalVelocityMps
+                * (candidateBackfillTof + p.delayCount) / p.sampleRateHz / 2.0 * 1000.0
+                - CURRENT_FIXED_BIAS_MM;
+            if (std::isfinite(candidateBackfillThickness)) {
+                result.backfillThicknessMm = candidateBackfillThickness;
+                result.backfillPeakTimeSec = candidateBackfillTof / p.sampleRateHz;
+                result.backfillPeakIndex = static_cast<int>(std::llround(candidateBackfillTof));
+            }
+        }
+
+        // 该旧帧现在已经被核心链正式恢复为VALID；同步Candidate回填快照，供后续周期确认使用。
+        auto snapshotIt = std::find_if(
+            m_impl->candidateOutputHistory.begin(),
+            m_impl->candidateOutputHistory.end(),
+            [&](const Impl::CandidateOutputSnapshot &snapshot) {
+                return snapshot.clock == activeTargetClock;
+            });
+        if (snapshotIt != m_impl->candidateOutputHistory.end()) {
+            snapshotIt->valid = true;
+            snapshotIt->peakVoltage = result.backfillPeakVoltage;
+            snapshotIt->snrDb = result.backfillSnrDb;
+        }
+    }
+
+    // 没有核心backfill占用输出通道时，Candidate确认仍可修正一个“原本已经VALID”的旧帧。
+    if (!result.hasBackfill && candidateDecision.backfillPrevious
+        && std::isfinite(candidateDecision.backfillCenter)) {
+        bool clockOk = false;
+        const int targetClock = candidateDecision.backfillFile.toInt(&clockOk);
+        if (clockOk && targetClock > 0) {
+            const auto snapshotIt = std::find_if(
+                m_impl->candidateOutputHistory.begin(),
+                m_impl->candidateOutputHistory.end(),
+                [&](const Impl::CandidateOutputSnapshot &snapshot) {
+                    return snapshot.clock == targetClock;
+                });
+            if (snapshotIt != m_impl->candidateOutputHistory.end() && snapshotIt->valid) {
+                const double backfillTof = candidateDecision.backfillCenter;
+                const double backfillThickness = p.longitudinalVelocityMps
+                    * (backfillTof + p.delayCount) / p.sampleRateHz / 2.0 * 1000.0
+                    - CURRENT_FIXED_BIAS_MM;
+                if (std::isfinite(backfillThickness)) {
+                    result.hasBackfill = true;
+                    result.backfillFramesAgo =
+                        (std::max)(1, m_impl->history.clock - targetClock);
+                    result.backfillThicknessMm = backfillThickness;
+                    result.backfillPeakTimeSec = backfillTof / p.sampleRateHz;
+                    result.backfillPeakVoltage = snapshotIt->peakVoltage;
+                    result.backfillSnrDb = snapshotIt->snrDb;
+                    result.backfillPeakIndex = static_cast<int>(std::llround(backfillTof));
+                }
+            }
+        }
+    }
+
+    m_impl->candidateOutputHistory.push_back({
+        m_impl->history.clock, result.valid, waveform.peakVoltage, waveform.snrDb});
+    while (m_impl->candidateOutputHistory.size() > 32)
+        m_impl->candidateOutputHistory.pop_front();
+
     return result;
 }
 
