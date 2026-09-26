@@ -4615,10 +4615,19 @@ WaveformResult runCurrentWaveformAlgorithm(
             : (hasPredictionCenter ? prediction.center : double(discoveryMaxIndex));
         break;
     case SearchWindowStage::GlobalReacquire:
-        if (prediction.longTermIdentityAvailable && discoveryMaxIndex >= 0)
-            localCenter = discoveryMaxIndex;
-        else if (std::isfinite(prediction.longTermIdentityCenter))
-            localCenter = prediction.longTermIdentityCenter;
+        // 冻结身份模板开放后，只允许“仍在冻结身份邻域内”的全局最强点接管Local Window。
+        // 若最强点已经远离最后可靠身份，则继续以冻结中心为锚，避免远处强回波/噪声先把
+        // 真实首波裁出窗口；同时保留小范围真实漂移时对能量峰的跟随能力。
+        if (std::isfinite(prediction.longTermIdentityCenter)) {
+            const double discoveryFollowLimit = std::max(
+                24.0, 1.5 * p.predictionHalfWidth);
+            if (prediction.longTermIdentityAvailable && discoveryMaxIndex >= 0
+                && std::abs(discoveryMaxIndex - prediction.longTermIdentityCenter)
+                    <= discoveryFollowLimit)
+                localCenter = discoveryMaxIndex;
+            else
+                localCenter = prediction.longTermIdentityCenter;
+        }
         else if (std::isfinite(prediction.searchWindowAnchor))
             localCenter = prediction.searchWindowAnchor;
         else
