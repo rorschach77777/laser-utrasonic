@@ -6,6 +6,7 @@
 #include <QFileInfo>
 #include <QTextStream>
 #include <QElapsedTimer>
+#include <QHash>
 
 #include <algorithm>
 #include <cmath>
@@ -27,8 +28,78 @@ struct OutputRow
     ThicknessResult result;
     double referenceThickness = std::numeric_limits<double>::quiet_NaN();
     bool replacedByBackfill = false;
+    bool shadowReplacedByBackfill = false;
     double processingMs = std::numeric_limits<double>::quiet_NaN();
 };
+
+struct ExpectedShadowRow
+{
+    double tof = std::numeric_limits<double>::quiet_NaN();
+    double thicknessMm = std::numeric_limits<double>::quiet_NaN();
+    QString confidenceClass;
+    QString reason;
+};
+
+static QStringList splitCsvQuoted(const QString &line)
+{
+    QStringList fields;
+    QString current;
+    bool quoted = false;
+    for (int i = 0; i < line.size(); ++i) {
+        const QChar ch = line[i];
+        if (ch == '"') {
+            if (quoted && i + 1 < line.size() && line[i + 1] == '"') {
+                current += '"';
+                ++i;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (ch == ',' && !quoted) {
+            fields.push_back(current);
+            current.clear();
+        } else {
+            current += ch;
+        }
+    }
+    fields.push_back(current);
+    return fields;
+}
+
+static QHash<QString, ExpectedShadowRow> readExpectedShadow(const QString &path)
+{
+    QHash<QString, ExpectedShadowRow> rows;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return rows;
+    QTextStream in(&file);
+    if (in.atEnd())
+        return rows;
+    const QStringList header = splitCsvQuoted(in.readLine());
+    const int fileCol = header.indexOf(QStringLiteral("File"));
+    const int tofCol = header.indexOf(QStringLiteral("OutputTOF"));
+    const int thicknessCol = header.indexOf(QStringLiteral("OutputThicknessMm"));
+    const int confidenceCol = header.indexOf(QStringLiteral("ConfidenceClass"));
+    const int reasonCol = header.indexOf(QStringLiteral("Reason"));
+    if (fileCol < 0 || tofCol < 0 || thicknessCol < 0 || confidenceCol < 0 || reasonCol < 0)
+        return rows;
+    while (!in.atEnd()) {
+        const QStringList fields = splitCsvQuoted(in.readLine());
+        const int required = std::max({fileCol, tofCol, thicknessCol, confidenceCol, reasonCol});
+        if (fields.size() <= required)
+            continue;
+        bool tofOk = false;
+        bool thicknessOk = false;
+        ExpectedShadowRow row;
+        row.tof = fields[tofCol].toDouble(&tofOk);
+        row.thicknessMm = fields[thicknessCol].toDouble(&thicknessOk);
+        if (!tofOk || !thicknessOk)
+            continue;
+        row.confidenceClass = fields[confidenceCol];
+        row.reason = fields[reasonCol];
+        rows.insert(fields[fileCol], row);
+    }
+    return rows;
+}
 
 static CsvData readCsv(const QString& filePath)
 {
@@ -73,7 +144,7 @@ int main(int argc, char* argv[])
     const QStringList arguments = app.arguments();
     if (arguments.size() < 2)
     {
-        std::cout << "Usage: IndustrialAlgorithmFileTest <csv-or-folder> [file-count]\n";
+        std::cout << "Usage: IndustrialAlgorithmFileTest <csv-or-folder> [file-count] [expected-confidence-csv]\n";
         return 2;
     }
 
@@ -81,6 +152,8 @@ int main(int argc, char* argv[])
     const int requestedCount = arguments.size() >= 3
         ? std::max(1, arguments[2].toInt())
         : 10;
+    const QString expectedConfidencePath = arguments.size() >= 4
+        ? arguments[3] : QString();
 
     QStringList files;
     if (input.isFile())
@@ -117,9 +190,11 @@ int main(int argc, char* argv[])
     constexpr int filterOrder = 50;
 
     std::cout << std::setprecision(17);
-    std::cout << "File,Valid,Thickness(mm),PeakIndex,PeakTime(us),PeakVoltage,SNR(dB),ReferenceThickness(mm),Backfilled,Processing(ms)\n";
+    std::cout << "File,Valid,Thickness(mm),PeakIndex,PeakTime(us),PeakVoltage,SNR(dB),ReferenceThickness(mm),Backfilled,"
+                 "ShadowValid,ShadowTOF,ShadowThickness(mm),ShadowConfidence,ShadowReason,ShadowBackfilled,Processing(ms)\n";
 
     int failures = 0;
+    int shadowComparisonFailures = 0;
     std::vector<double> processingTimesMs;
     processingTimesMs.reserve(static_cast<size_t>(files.size()));
     std::vector<OutputRow> outputRows;
@@ -171,8 +246,21 @@ int main(int argc, char* argv[])
             previous.snrDb = result.backfillSnrDb;
             outputRows[outputRows.size() - result.backfillFramesAgo].replacedByBackfill = true;
         }
+        if (result.hasFinalPrimaryShadowBackfill
+            && result.finalPrimaryShadowBackfillFramesAgo > 0
+            && result.finalPrimaryShadowBackfillFramesAgo <= static_cast<int>(outputRows.size())) {
+            ThicknessResult &previous = outputRows[
+                outputRows.size() - result.finalPrimaryShadowBackfillFramesAgo].result;
+            previous.finalPrimaryShadowValid = true;
+            previous.finalPrimaryShadowTofIndex = result.finalPrimaryShadowBackfillTofIndex;
+            previous.finalPrimaryShadowThicknessMm = result.finalPrimaryShadowBackfillThicknessMm;
+            previous.finalPrimaryShadowConfidenceClass = result.finalPrimaryShadowBackfillConfidenceClass;
+            previous.finalPrimaryShadowReason = result.finalPrimaryShadowBackfillReason;
+            outputRows[outputRows.size() - result.finalPrimaryShadowBackfillFramesAgo]
+                .shadowReplacedByBackfill = true;
+        }
 
-        outputRows.push_back({fileInfo.fileName(), result, csv.referenceThickness, false, processingMs});
+        outputRows.push_back({fileInfo.fileName(), result, csv.referenceThickness, false, false, processingMs});
     }
 
     for (const OutputRow &row : outputRows) {
@@ -186,7 +274,156 @@ int main(int argc, char* argv[])
                   << result.snrDb << ','
                   << row.referenceThickness << ','
                   << (row.replacedByBackfill ? "true" : "false") << ','
+                  << (result.finalPrimaryShadowValid ? "true" : "false") << ','
+                  << result.finalPrimaryShadowTofIndex << ','
+                  << result.finalPrimaryShadowThicknessMm << ','
+                  << result.finalPrimaryShadowConfidenceClass.toStdString() << ','
+                  << result.finalPrimaryShadowReason.toStdString() << ','
+                  << (row.shadowReplacedByBackfill ? "true" : "false") << ','
                   << row.processingMs << '\n';
+    }
+
+    if (!expectedConfidencePath.isEmpty()) {
+        const QHash<QString, ExpectedShadowRow> expected =
+            readExpectedShadow(expectedConfidencePath);
+        int expectedMatched = 0;
+        int validMismatch = 0;
+        int tofMismatch = 0;
+        int thicknessMismatch = 0;
+        int officialValidMismatch = 0;
+        int officialTofMismatch = 0;
+        int officialThicknessMismatch = 0;
+        int confidenceMismatch = 0;
+        int reasonMismatch = 0;
+        int missingFile = 0;
+        double maxTofDiff = 0.0;
+        double maxThicknessDiff = 0.0;
+        double maxOfficialTofDiff = 0.0;
+        double maxOfficialThicknessDiff = 0.0;
+        QStringList firstMismatches;
+        QHash<QString, bool> seen;
+
+        for (const OutputRow &row : outputRows) {
+            const auto expectedIt = expected.constFind(row.fileName);
+            const bool shouldBeValid = expectedIt != expected.constEnd();
+            const bool shadowValid = row.result.finalPrimaryShadowValid;
+            seen.insert(row.fileName, true);
+            if (shadowValid != shouldBeValid) {
+                ++validMismatch;
+                if (firstMismatches.size() < 20) {
+                    firstMismatches << QStringLiteral("%1 SHADOW_VALID main=%2 expected=%3")
+                        .arg(row.fileName)
+                        .arg(shadowValid ? 1 : 0)
+                        .arg(shouldBeValid ? 1 : 0);
+                }
+            }
+            if (row.result.valid != shouldBeValid) {
+                ++officialValidMismatch;
+                if (firstMismatches.size() < 20) {
+                    firstMismatches << QStringLiteral("%1 OFFICIAL_VALID main=%2 expected=%3")
+                        .arg(row.fileName)
+                        .arg(row.result.valid ? 1 : 0)
+                        .arg(shouldBeValid ? 1 : 0);
+                }
+            }
+            if (!shouldBeValid || !shadowValid || !row.result.valid)
+                continue;
+            ++expectedMatched;
+            const ExpectedShadowRow &exp = expectedIt.value();
+            const double tofDiff = std::abs(row.result.finalPrimaryShadowTofIndex - exp.tof);
+            const double thicknessDiff = std::abs(
+                row.result.finalPrimaryShadowThicknessMm - exp.thicknessMm);
+            maxTofDiff = std::max(maxTofDiff, tofDiff);
+            maxThicknessDiff = std::max(maxThicknessDiff, thicknessDiff);
+            if (!std::isfinite(tofDiff) || tofDiff > 1e-12) {
+                ++tofMismatch;
+                if (firstMismatches.size() < 20) {
+                    firstMismatches << QStringLiteral("%1 TOF main=%2 expected=%3 diff=%4")
+                        .arg(row.fileName)
+                        .arg(row.result.finalPrimaryShadowTofIndex, 0, 'f', 9)
+                        .arg(exp.tof, 0, 'f', 9)
+                        .arg(tofDiff, 0, 'g', 12);
+                }
+            }
+            if (!std::isfinite(thicknessDiff) || thicknessDiff > 1e-12) {
+                ++thicknessMismatch;
+                if (firstMismatches.size() < 20) {
+                    firstMismatches << QStringLiteral("%1 THICK main=%2 expected=%3 diff=%4")
+                        .arg(row.fileName)
+                        .arg(row.result.finalPrimaryShadowThicknessMm, 0, 'f', 9)
+                        .arg(exp.thicknessMm, 0, 'f', 9)
+                        .arg(thicknessDiff, 0, 'g', 12);
+                }
+            }
+            const double officialTof = row.result.peakTimeSec * sampleRateHz;
+            const double officialTofDiff = std::abs(officialTof - exp.tof);
+            const double officialThicknessDiff = std::abs(row.result.thicknessMm - exp.thicknessMm);
+            maxOfficialTofDiff = std::max(maxOfficialTofDiff, officialTofDiff);
+            maxOfficialThicknessDiff = std::max(maxOfficialThicknessDiff, officialThicknessDiff);
+            if (!std::isfinite(officialTofDiff) || officialTofDiff > 1e-12) {
+                ++officialTofMismatch;
+                if (firstMismatches.size() < 20) {
+                    firstMismatches << QStringLiteral("%1 OFFICIAL_TOF main=%2 expected=%3 diff=%4")
+                        .arg(row.fileName)
+                        .arg(officialTof, 0, 'f', 9)
+                        .arg(exp.tof, 0, 'f', 9)
+                        .arg(officialTofDiff, 0, 'g', 12);
+                }
+            }
+            if (!std::isfinite(officialThicknessDiff) || officialThicknessDiff > 1e-12) {
+                ++officialThicknessMismatch;
+                if (firstMismatches.size() < 20) {
+                    firstMismatches << QStringLiteral("%1 OFFICIAL_THICK main=%2 expected=%3 diff=%4")
+                        .arg(row.fileName)
+                        .arg(row.result.thicknessMm, 0, 'f', 9)
+                        .arg(exp.thicknessMm, 0, 'f', 9)
+                        .arg(officialThicknessDiff, 0, 'g', 12);
+                }
+            }
+            if (row.result.finalPrimaryShadowConfidenceClass != exp.confidenceClass) {
+                ++confidenceMismatch;
+                if (firstMismatches.size() < 20) {
+                    firstMismatches << QStringLiteral("%1 CONF main=%2 expected=%3")
+                        .arg(row.fileName, row.result.finalPrimaryShadowConfidenceClass,
+                             exp.confidenceClass);
+                }
+            }
+            if (row.result.finalPrimaryShadowReason != exp.reason) {
+                ++reasonMismatch;
+                if (firstMismatches.size() < 20) {
+                    firstMismatches << QStringLiteral("%1 REASON main=%2 expected=%3")
+                        .arg(row.fileName, row.result.finalPrimaryShadowReason, exp.reason);
+                }
+            }
+        }
+        for (auto it = expected.constBegin(); it != expected.constEnd(); ++it) {
+            if (!seen.contains(it.key())) {
+                ++missingFile;
+                if (firstMismatches.size() < 20)
+                    firstMismatches << QStringLiteral("%1 MISSING_MAIN_FRAME").arg(it.key());
+            }
+        }
+
+        shadowComparisonFailures = validMismatch + tofMismatch + thicknessMismatch
+            + officialValidMismatch + officialTofMismatch + officialThicknessMismatch
+            + confidenceMismatch + reasonMismatch + missingFile;
+        std::cout << "#SHADOW_COMPARE,expected_rows=" << expected.size()
+                  << ",matched_valid=" << expectedMatched
+                  << ",valid_mismatch=" << validMismatch
+                  << ",tof_mismatch=" << tofMismatch
+                  << ",thickness_mismatch=" << thicknessMismatch
+                  << ",official_valid_mismatch=" << officialValidMismatch
+                  << ",official_tof_mismatch=" << officialTofMismatch
+                  << ",official_thickness_mismatch=" << officialThicknessMismatch
+                  << ",confidence_mismatch=" << confidenceMismatch
+                  << ",reason_mismatch=" << reasonMismatch
+                  << ",missing_file=" << missingFile
+                  << ",max_tof_diff=" << maxTofDiff
+                  << ",max_thickness_diff=" << maxThicknessDiff
+                  << ",max_official_tof_diff=" << maxOfficialTofDiff
+                  << ",max_official_thickness_diff=" << maxOfficialThicknessDiff << '\n';
+        for (const QString &message : firstMismatches)
+            std::cout << "#SHADOW_MISMATCH," << message.toStdString() << '\n';
     }
 
     if (!processingTimesMs.empty()) {
@@ -223,5 +460,5 @@ int main(int argc, char* argv[])
                   << ",gt10ms=" << gt10 << '\n';
     }
 
-    return failures == 0 ? 0 : 1;
+    return (failures == 0 && shadowComparisonFailures == 0) ? 0 : 1;
 }

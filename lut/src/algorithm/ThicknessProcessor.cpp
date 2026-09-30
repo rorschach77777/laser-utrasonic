@@ -1,6 +1,9 @@
 #include "ThicknessProcessor.h"
 #include "PacketSpline.h"
 #include "CandidateTofOutputChain.h"
+#include "IdentityHypothesisChain.h"
+#include "FinalPrimaryIdentityDecisionEngine.h"
+#include "FirstEchoStartupTracker.h"
 
 #include <QString>
 #include <QStringList>
@@ -1203,6 +1206,20 @@ struct WaveformResult
     // 单候选+高质量拟合的同一波包内、拟合中心附近小支持区重新评价信号存在性；
     // 此路径必须再经相邻两帧ToF一致性确认后才真正输出并建立初始LOCK。
     bool startupSupportRecovered = false;
+    // FirstEcho冷启动多候选身份：GLOBAL_SEARCH每帧保留Top-3物理packet，
+    // FirstEchoStartupTracker在3个物理帧内做2票确认；确认后仅当前帧WARMUP重检/只读输出。
+    std::vector<double> startupHypothesisTofSamples;
+    std::vector<double> startupHypothesisScores;
+    std::vector<double> startupHypothesisSupportSnrDb;
+    QString startupHypothesisState = QStringLiteral("IDLE");
+    int startupHypothesisFramesObserved = 0;
+    int startupHypothesisVotes = 0;
+    int startupHypothesisClusterCount = 0;
+    int startupHypothesisSelectedRank = 0;
+    double startupHypothesisConsensusTof = NaN;
+    double startupHypothesisMeanSupportSnrDb = NaN;
+    bool startupHypothesisConfirmed = false;
+    bool startupHypothesisRerunAccepted = false;
     // 预锁定阶段的低SNR强主候选可输出，但必须只读，不能提前改写模板/位置历史。
     bool prelockReadOnlyRecovered = false;
     double startupSupportSnrDb = NaN;
@@ -1259,6 +1276,8 @@ struct PredictionGate
     bool lockActive = false;
     bool reacquireRequired = false;
     bool startupConfirmationEnabled = false;
+    // 仅用于3物理帧/2票冷启动共识后的当前帧WARMUP重检，不写入正式历史。
+    bool startupHypothesisConfirmed = false;
     bool warmupActive = false;
     int warmupFrames = 0;
     int missCount = 0;
@@ -1315,6 +1334,7 @@ struct PeakHistory
     bool reacquireRequired = false;
     // 文件夹/连续帧回放启用两帧启动确认；单文件离线分析没有下一帧，直接保留候选结果。
     bool startupConfirmationEnabled = true;
+    FirstEchoStartupTracker firstEchoStartupTracker;
     // 启动学习阶段：初始LOCK建立后，不立即进入完全稳定跟踪；
     // 保留若干帧用于模板、脉宽和噪声模型收敛，避免冷启动阶段过早使用严格LOCK约束。
     bool warmupLearningActive = false;
@@ -1437,6 +1457,7 @@ struct PeakHistory
         reacquireRequired = false;
         warmupLearningActive = false;
         warmupLearningFrames = 0;
+        firstEchoStartupTracker.reset();
         searchWindowAnchor = NaN;
         backfillReady = false;
         backfillTargetClock = 0;
@@ -1463,6 +1484,7 @@ struct PeakHistory
         gate.lockActive = lockActive;
         gate.reacquireRequired = reacquireRequired;
         gate.startupConfirmationEnabled = startupConfirmationEnabled;
+        gate.startupHypothesisConfirmed = false;
         gate.warmupActive = warmupLearningActive;
         gate.warmupFrames = warmupLearningFrames;
         gate.missCount = misses;
@@ -3409,6 +3431,90 @@ WaveformResult detectLongitudinalPacket(
     result.firstSignificance = eligible.front().score;
     result.firstCandidateIndex = eligible.front().strongest;
     result.secondSignificance = 0.0;
+
+    // FirstEcho冷启动候选池：最多保留Top-3物理packet，并用packet内超噪声能量T50
+    // 作为跨帧身份坐标。该坐标只用于2-of-3身份确认，不直接作为最终厚度TOF。
+    if (!history.lockActive && !history.reacquireRequired) {
+        const size_t startupKeep = std::min<size_t>(3, eligible.size());
+        result.startupHypothesisTofSamples.reserve(startupKeep);
+        result.startupHypothesisScores.reserve(startupKeep);
+        result.startupHypothesisSupportSnrDb.reserve(startupKeep);
+        for (size_t k = 0; k < startupKeep; ++k) {
+            const Packet &candidate = eligible[k];
+            double total = 0.0;
+            for (int i = candidate.left; i <= candidate.right; ++i)
+                total += std::max(0.0, energies[i] - result.noiseEnergy);
+            double t50 = double(candidate.strongest);
+            if (total > 1e-24) {
+                const double target = 0.5 * total;
+                double accumulated = 0.0;
+                for (int i = candidate.left; i <= candidate.right; ++i) {
+                    accumulated += std::max(0.0, energies[i] - result.noiseEnergy);
+                    if (accumulated >= target) {
+                        t50 = double(i);
+                        break;
+                    }
+                }
+            }
+            result.startupHypothesisTofSamples.push_back(t50);
+            result.startupHypothesisScores.push_back(
+                candidate.score / std::max(result.noiseEnergy, 1e-24));
+            result.startupHypothesisSupportSnrDb.push_back(
+                energySnrDb(candidate.primaryEnergy, result.noiseEnergy));
+        }
+    }
+
+    // 2-of-3 WARMUP重检时，跨帧身份共识优先于当前帧单帧能量排序。
+    // 只在重检旁路启用，不影响正常GLOBAL_SEARCH和成熟LOCK。
+    if (history.startupHypothesisConfirmed && std::isfinite(history.center)
+        && eligible.size() > 1) {
+        size_t nearestIndex = 0;
+        double nearestDistance = std::numeric_limits<double>::infinity();
+        double secondDistance = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < eligible.size(); ++i) {
+            const double distance = std::abs(
+                result.startupHypothesisTofSamples.size() > i
+                    ? result.startupHypothesisTofSamples[i] - history.center
+                    : double(eligible[i].strongest) - history.center);
+            if (distance < nearestDistance) {
+                secondDistance = nearestDistance;
+                nearestDistance = distance;
+                nearestIndex = i;
+            } else if (distance < secondDistance) {
+                secondDistance = distance;
+            }
+        }
+        if (nearestDistance <= 4.0
+            && (!std::isfinite(secondDistance) || secondDistance >= nearestDistance + 2.0)) {
+            Packet selectedStartupPacket = eligible[nearestIndex];
+            constexpr int startupConsensusFitHalfWidth = 16;
+            const int startupFitLeft = static_cast<int>(std::floor(
+                history.center - startupConsensusFitHalfWidth));
+            const int startupFitRight = static_cast<int>(std::ceil(
+                history.center + startupConsensusFitHalfWidth));
+            selectedStartupPacket.left = std::max(selectedStartupPacket.left, startupFitLeft);
+            selectedStartupPacket.right = std::min(selectedStartupPacket.right, startupFitRight);
+            if (selectedStartupPacket.strongest < selectedStartupPacket.left
+                || selectedStartupPacket.strongest > selectedStartupPacket.right) {
+                double localMaximum = -1.0;
+                int localStrongest = selectedStartupPacket.left;
+                for (int i = selectedStartupPacket.left;
+                     i <= selectedStartupPacket.right; ++i) {
+                    if (energies[i] > localMaximum) {
+                        localMaximum = energies[i];
+                        localStrongest = i;
+                    }
+                }
+                selectedStartupPacket.strongest = localStrongest;
+                selectedStartupPacket.primaryEnergy = localMaximum;
+            }
+            eligible.clear();
+            eligible.push_back(selectedStartupPacket);
+            result.recoveryEvidence = QStringLiteral(
+                "FirstEcho启动2-of-3跨帧身份优先选择共识packet，并限制WARMUP拟合支持区");
+        }
+    }
+
     if (eligible.size() > 1) {
         result.secondSignificance = eligible[1].score;
         result.secondCandidateIndex = eligible[1].strongest;
@@ -3595,27 +3701,43 @@ WaveformResult detectLongitudinalPacket(
                 result.fittedPoints.append(QVariantMap{{"x", x}, {"y", fit.value(x)}});
         }
         if (!result.fitSucceeded && !result.lockedFragmentedPacketCandidate) {
-            // 稳定LOCK下，拟合失败只说明当前形态不适合等效高斯，不等价于纵波身份消失。
-            // 只有当前帧能量足够、RECENT模板存在且历史中心有限时，才允许继续进入
-            // “模板直接定位”严格复核；最终仍必须通过高相关/小残差门，否则保持FIT_FAILED。
+            const bool startupSinglePeakEligible = history.startupHypothesisConfirmed
+                && std::isfinite(history.center)
+                && std::isfinite(result.maxLocalSnrDb)
+                && result.maxLocalSnrDb >= p.minLocalSnrDb + 3.0
+                && std::abs(double(packet.strongest) - history.center) <= 4.0;
+            bool startupSinglePeakRecovered = false;
+            if (startupSinglePeakEligible
+                && useOriginalPeak(QStringLiteral("STARTUP_HYPOTHESIS_PACKET_FIT_FAILED"))
+                && std::isfinite(selected)
+                && std::abs(selected - history.center) <= 6.0) {
+                startupSinglePeakRecovered = true;
+                result.startupSupportRecovered = true;
+                result.startupRecovered = true;
+                result.recoveryEvidence = QStringLiteral(
+                    "FirstEcho启动2-of-3已确认packet身份；Gaussian拟合失败，使用共识packet内原始单峰三点抛物线只读定位");
+            }
+
             const bool templateOnlyEligible = history.lockActive
                 && std::isfinite(history.center)
                 && !history.templateValues.empty()
                 && std::isfinite(result.maxLocalSnrDb)
                 && result.maxLocalSnrDb >= p.lockTemplateOnlyMinMaxSnrDb;
-            if (templateOnlyEligible) {
+            if (!startupSinglePeakRecovered && templateOnlyEligible) {
                 result.lockedTemplateOnlyCandidate = true;
-            } else {
+            } else if (!startupSinglePeakRecovered) {
                 rejectWaveform(result, QStringLiteral("PACKET_FIT_FAILED"),
-                    QStringLiteral("底部窗口固定脉宽高斯拟合不可信：R²=%1，要求≥%2；且未满足LOCK模板直接恢复前提")
+                    QStringLiteral("底部窗口固定脉宽高斯拟合不可信：R²=%1，要求≥%2；且未满足启动单峰/LOCK模板恢复前提")
                         .arg(result.fitR2, 0, 'f', 4).arg(p.fitMinR2, 0, 'f', 4));
                 return result;
             }
         }
         // 碎片/模板直接恢复允许高斯拟合失败，但只把历史预测中心作为临时占位；
-        // 后续必须由RECENT模板在严格预测残差门内重新定位，绝不会用该占位值直接计算厚度。
-        selected = result.fitSucceeded ? fit.center : history.center;
-        result.fitSinglePeakIndex = result.fitSucceeded ? fit.center : NaN;
+        // 启动单峰回退保留useOriginalPeak()得到的真实亚采样位置。
+        if (!result.fallbackPeakUsed)
+            selected = result.fitSucceeded ? fit.center : history.center;
+        result.fitSinglePeakIndex = result.fallbackPeakUsed
+            ? selected : (result.fitSucceeded ? fit.center : NaN);
         result.packetCenterIndex = selected;
         // 对外显示“脉宽”时使用10%底部宽度，而不是高斯sigma，便于直接和波形脚点对应。
         result.fitPeakWidthSamples = result.fitSucceeded ? fit.pulseWidthSamples : NaN;
@@ -4287,13 +4409,28 @@ WaveformResult detectLongitudinalPacket(
         && std::isfinite(history.lastAcceptedPeak)
         && std::isfinite(selected)
         && std::abs(selected - history.lastAcceptedPeak) <= 1.5;
+    const bool startupHypothesisStrongPacket = history.startupHypothesisConfirmed
+        && std::isfinite(result.maxLocalSnrDb)
+        && result.maxLocalSnrDb >= p.minLocalSnrDb + 3.0
+        && (!std::isfinite(centerSnrDb) || centerSnrDb < p.minLocalSnrDb);
+    const bool startupHypothesisSinglePeakFitFallback = history.startupHypothesisConfirmed
+        && result.fallbackPeakUsed
+        && result.fallbackReason == QStringLiteral("STARTUP_HYPOTHESIS_PACKET_FIT_FAILED")
+        && std::isfinite(history.center)
+        && std::isfinite(selected)
+        && std::abs(selected - history.center) <= 6.0;
+    const bool startupFitEvidence =
+        (result.fitSucceeded && !result.fallbackPeakUsed
+         && std::isfinite(result.fitR2) && result.fitR2 >= std::max(0.95, p.fitMinR2))
+        || startupHypothesisSinglePeakFitFallback;
     if (history.startupConfirmationEnabled
         && !history.lockActive && !history.reacquireRequired
-        && std::isfinite(centerSnrDb)
-        && centerSnrDb >= p.lowSnrSoftMinDb && centerSnrDb < p.minLocalSnrDb
-        && (result.candidateCount == 1 || dominantStartupMultiCandidate)
-        && result.fitSucceeded && !result.fallbackPeakUsed
-        && std::isfinite(result.fitR2) && result.fitR2 >= std::max(0.95, p.fitMinR2)
+        && ((std::isfinite(centerSnrDb)
+             && centerSnrDb >= p.lowSnrSoftMinDb && centerSnrDb < p.minLocalSnrDb)
+            || startupHypothesisStrongPacket)
+        && (result.candidateCount == 1 || dominantStartupMultiCandidate
+            || history.startupHypothesisConfirmed)
+        && startupFitEvidence
         && result.packetLeftIndex >= 0 && result.packetRightIndex >= result.packetLeftIndex) {
         const int supportHalf = std::max(half, p.packetMergeGap + 2);
         const int supportLeft = std::max({result.packetLeftIndex, result.predictionLeftIndex,
@@ -5108,6 +5245,12 @@ struct HighPrecisionDecision
     bool positiveCommonTimeShiftCorrected = false;
     double tofIndex = NaN;
     double thicknessMm = NaN;
+    // FinalPrimaryIdentityDecisionEngine所需的同帧独立TOF证据。
+    double hilbertEnvelopePeakTofIndex = NaN;
+    double cfd30TofIndex = NaN;
+    double leadingEdgeFitTofIndex = NaN;
+    double energyMedianT50Index = NaN;
+    double envelopeNccTofIndex = NaN;
     double envelopeNccCorrelation = NaN;
     double nccT50DeltaSamples = NaN;
     double echoChainPeriodDifferenceSamples = NaN;
@@ -5765,6 +5908,31 @@ HighPrecisionDecision computeHighPrecisionDecision(
     }
     const std::vector<double> &componentEnvelope = componentMasked ? componentBuffer : corrected;
 
+    // FinalPrimary旁路证据：Hilbert包络峰与30% CFD。计算定义与LSTAlgorithmTest一致，
+    // 只读取当前帧，不进入原HighPrecision允许/拒绝判据。
+    double peakDelta = 0.0;
+    if (peak > componentLeft && peak < componentRight) {
+        const double ym = componentEnvelope[static_cast<size_t>(peak - 1)];
+        const double y0 = componentEnvelope[static_cast<size_t>(peak)];
+        const double yp = componentEnvelope[static_cast<size_t>(peak + 1)];
+        const double curvature = ym - 2.0 * y0 + yp;
+        if (std::isfinite(curvature) && curvature < -1e-18)
+            peakDelta = std::clamp(0.5 * (ym - yp) / curvature, -0.5, 0.5);
+    }
+    decision.hilbertEnvelopePeakTofIndex = peak + peakDelta;
+
+    const double cfdLevel = 0.30 * peakValue;
+    const int cfdSearchLeft = componentMasked ? std::max(0, left - 12) : componentLeft;
+    for (int i = peak - 1; i >= cfdSearchLeft; --i) {
+        if (componentEnvelope[static_cast<size_t>(i)] <= cfdLevel
+            && componentEnvelope[static_cast<size_t>(i + 1)] > cfdLevel) {
+            decision.cfd30TofIndex = highPrecisionInterpolateCrossing(
+                i, componentEnvelope[static_cast<size_t>(i)],
+                i + 1, componentEnvelope[static_cast<size_t>(i + 1)], cfdLevel);
+            break;
+        }
+    }
+
     // t50：当前物理分量10%支撑区内的累计包络能量中位时刻。
     double t50 = NaN;
     const double supportLevel = 0.10 * peakValue;
@@ -5880,6 +6048,8 @@ HighPrecisionDecision computeHighPrecisionDecision(
             }
         }
     }
+    decision.energyMedianT50Index = t50;
+    decision.leadingEdgeFitTofIndex = leadingTof;
 
     // Envelope NCC：整个当前packet内自由搜索，三点抛物线亚采样，不使用历史绝对位置门。
     double nccTof = NaN;
@@ -6089,6 +6259,7 @@ HighPrecisionDecision computeHighPrecisionDecision(
     const bool hasT50 = std::isfinite(t50);
     decision.nccAvailable = hasNcc;
     decision.t50Available = hasT50;
+    decision.envelopeNccTofIndex = nccTof;
     const bool templateReliable = std::isfinite(nccCorrelation) && nccCorrelation >= 0.82;
     const double deltaNccT50 = hasNcc && hasT50 ? std::abs(nccTof - t50) : NaN;
     decision.envelopeNccCorrelation = nccCorrelation;
@@ -7056,6 +7227,71 @@ QString csvEscape(QString text)
     return text;
 }
 
+double finiteMapNumber(const QVariantMap &map, const QString &key)
+{
+    bool ok = false;
+    const double value = map.value(key).toDouble(&ok);
+    return ok && std::isfinite(value) ? value : NaN;
+}
+
+IdentityObservation makeFinalPrimaryIdentityObservation(
+    const QVariantMap &diagnostics,
+    const IdentityHypothesis::Decision &hypothesis)
+{
+    IdentityObservation out;
+    out.selectedIdentity = IdentityHypothesis::toEvidenceIdentity(hypothesis.identity);
+    out.identityEstablished = hypothesis.identityEstablished;
+    out.stage = hypothesis.stage;
+    out.rawDirectCenter = finiteMapNumber(diagnostics, QStringLiteral("directParabolicPeakIndex"));
+
+    auto fill = [&](IdentityBranchObservation &branch,
+                    DualPolarityIdentity polarity,
+                    const QString &prefix) {
+        branch.polarity = polarity;
+        branch.fitSolved = diagnostics.value(prefix + QStringLiteral("FitSolved")).toBool();
+        branch.fitR2 = finiteMapNumber(diagnostics, prefix + QStringLiteral("FitR2"));
+        branch.fitCenter = finiteMapNumber(diagnostics, prefix + QStringLiteral("FitCenterIndex"));
+        branch.directCenter = finiteMapNumber(
+            diagnostics, prefix + QStringLiteral("PolarityDirectPeakIndex"));
+    };
+    fill(out.positive, DualPolarityIdentity::Positive, QStringLiteral("positive"));
+    fill(out.negative, DualPolarityIdentity::Negative, QStringLiteral("negative"));
+    return out;
+}
+
+TofEvidenceFrame makeFinalPrimaryEvidenceFrame(
+    const QVariantMap &diagnostics,
+    const HighPrecisionDecision &highPrecision,
+    bool finalValid,
+    double finalTof,
+    double finalThicknessMm,
+    const IdentityHypothesis::Decision &hypothesis)
+{
+    TofEvidenceFrame out;
+    out.file = diagnostics.value(QStringLiteral("fileName")).toString();
+    out.trackingState = diagnostics.value(QStringLiteral("trackingState")).toString();
+    out.measurementStatus = diagnostics.value(QStringLiteral("measurementStatus")).toString();
+    out.finalMeasurementStatus = finalValid ? QStringLiteral("VALID") : out.measurementStatus;
+    out.predictionApplied = diagnostics.value(QStringLiteral("predictionApplied")).toBool();
+    out.finalTof = finalValid ? finalTof : NaN;
+    out.finalThicknessMm = finalValid ? finalThicknessMm : NaN;
+    out.currentOutputTof = out.finalTof;
+    out.currentOutputThicknessMm = out.finalThicknessMm;
+
+    out.envelopeNccTof = highPrecision.envelopeNccTofIndex;
+    out.envelopeNccCorrelation = highPrecision.envelopeNccCorrelation;
+    out.hilbertEnvelopePeakTof = highPrecision.hilbertEnvelopePeakTofIndex;
+    out.energyMedianT50Tof = highPrecision.energyMedianT50Index;
+    out.rawDirectTof = finiteMapNumber(diagnostics, QStringLiteral("directParabolicPeakIndex"));
+    out.cfd30Tof = highPrecision.cfd30TofIndex;
+    out.leadingEdgeFitTof = highPrecision.leadingEdgeFitTofIndex;
+    out.snrDb = finiteMapNumber(diagnostics, QStringLiteral("snrDb"));
+    out.maxLocalSnrDb = finiteMapNumber(diagnostics, QStringLiteral("maxLocalSnrDb"));
+    out.trackingCorrelation = finiteMapNumber(diagnostics, QStringLiteral("trackingCorrelation"));
+    out.identity = makeFinalPrimaryIdentityObservation(diagnostics, hypothesis);
+    return out;
+}
+
 } // namespace
 
 // -----------------------------------------------------------------------------
@@ -7073,14 +7309,22 @@ struct ThicknessProcessor::Impl
     struct CandidateReplayFrame {
         int clock = 0;
         QVariantMap input;
-        CandidateTof::CandidateTofOutputChain stateBefore;
+        IdentityHypothesis::Chain identityStateBefore;
+        FinalPrimary::DecisionEngine finalPrimaryStateBefore;
+        HighPrecisionDecision highPrecision;
+        bool finalBaselineValid = false;
+        double finalBaselineTof = NaN;
+        double finalBaselineThicknessMm = NaN;
+        IdentityHypothesis::Decision hypothesisDecision;
+        FinalPrimary::Decision finalPrimaryDecision;
     };
 
     PeakHistory history;
     AlgorithmWorkspace workspace;
     HighPrecisionHistory highPrecisionHistory;
     StartupProvisionalState startupProvisional;
-    CandidateTof::CandidateTofOutputChain candidateTof;
+    IdentityHypothesis::Chain identityHypothesis;
+    FinalPrimary::DecisionEngine finalPrimary;
     std::deque<CandidateOutputSnapshot> candidateOutputHistory;
     std::deque<CandidateReplayFrame> candidateReplayHistory;
     // 保存最近帧“当时”的高精度决策。PENDING帧下一帧确认时必须回填这一时刻的
@@ -7248,7 +7492,8 @@ ThicknessResult ThicknessProcessor::process(
         m_impl->highPrecisionHistory = HighPrecisionHistory{};
         m_impl->startupProvisional.reset();
         m_impl->highPrecisionDecisionHistory.clear();
-        m_impl->candidateTof = CandidateTof::CandidateTofOutputChain{};
+        m_impl->identityHypothesis = IdentityHypothesis::Chain{};
+        m_impl->finalPrimary.reset();
         m_impl->candidateOutputHistory.clear();
         m_impl->candidateReplayHistory.clear();
         m_impl->lastSampleRate = sampleRate;
@@ -7275,6 +7520,93 @@ ThicknessResult ThicknessProcessor::process(
     // 测厚、界面显示和逐帧保存共用同源核心生成的唯一滤波结果。
     WaveformResult waveform = runCurrentWaveformAlgorithm(
         raw, p, filteredOut, prediction, &m_impl->workspace);
+
+    // FirstEcho冷启动多候选：只生成当前帧output-only候选，不提前改写PeakHistory。
+    // 旧provisional/PeakHistory会在下面完整按原逻辑推进；只有旧结果仍无效时，
+    // 才允许2-of-3共识后的WARMUP重检结果覆盖当前对外输出。
+    bool startupHypothesisReadOnlyReady = false;
+    bool startupHypothesisOutputApplied = false;
+    WaveformResult startupHypothesisReadOnlyOutput;
+    if (m_impl->history.startupConfirmationEnabled
+        && !prediction.lockActive && !prediction.reacquireRequired
+        && !m_impl->history.everLocked) {
+        std::vector<FirstEchoStartupTracker::Candidate> startupCandidates;
+        const size_t startupCandidateCount = std::min({
+            waveform.startupHypothesisTofSamples.size(),
+            waveform.startupHypothesisScores.size(),
+            waveform.startupHypothesisSupportSnrDb.size()});
+        startupCandidates.reserve(startupCandidateCount);
+        for (size_t i = 0; i < startupCandidateCount; ++i) {
+            FirstEchoStartupTracker::Candidate candidate;
+            candidate.tofSamples = waveform.startupHypothesisTofSamples[i];
+            candidate.score = waveform.startupHypothesisScores[i];
+            candidate.supportSnrDb = waveform.startupHypothesisSupportSnrDb[i];
+            candidate.rank = static_cast<int>(i) + 1;
+            startupCandidates.push_back(candidate);
+        }
+
+        const auto startupResult = m_impl->history.firstEchoStartupTracker.observe(
+            m_impl->history.clock, startupCandidates);
+        waveform.startupHypothesisFramesObserved = startupResult.framesObserved;
+        waveform.startupHypothesisVotes = startupResult.votes;
+        waveform.startupHypothesisClusterCount = startupResult.clusterCount;
+        waveform.startupHypothesisSelectedRank = startupResult.selectedRank;
+        waveform.startupHypothesisConsensusTof = startupResult.consensusTofSamples;
+        waveform.startupHypothesisMeanSupportSnrDb = startupResult.meanSupportSnrDb;
+        waveform.startupHypothesisConfirmed = startupResult.confirmed;
+        waveform.startupHypothesisState = startupResult.confirmed
+            ? QStringLiteral("CONFIRMED_2_OF_3")
+            : (startupResult.pending ? QStringLiteral("PENDING_2_OF_3")
+                                     : QStringLiteral("NO_CANDIDATE"));
+
+        const bool startupNeedsHypothesisRerun =
+            waveform.measurementStatus != QStringLiteral("VALID");
+        if (startupResult.confirmed && startupNeedsHypothesisRerun
+            && std::isfinite(startupResult.consensusTofSamples)
+            && std::isfinite(startupResult.previousTofSamples)
+            && startupResult.previousClock > 0) {
+            PredictionGate startupGate = prediction;
+            startupGate.windowStage = SearchWindowStage::Warmup;
+            startupGate.lockActive = false;
+            startupGate.reacquireRequired = false;
+            startupGate.startupConfirmationEnabled = true;
+            startupGate.startupHypothesisConfirmed = true;
+            startupGate.warmupActive = true;
+            startupGate.warmupFrames = 0;
+            startupGate.historyCount = startupResult.votes;
+            startupGate.lastAcceptedPeak = startupResult.previousTofSamples;
+            startupGate.center = startupResult.consensusTofSamples;
+            startupGate.searchWindowAnchor = startupResult.consensusTofSamples;
+
+            WaveformResult refined = runCurrentWaveformAlgorithm(
+                raw, p, nullptr, startupGate, &m_impl->workspace);
+            refined.startupHypothesisFramesObserved = startupResult.framesObserved;
+            refined.startupHypothesisVotes = startupResult.votes;
+            refined.startupHypothesisClusterCount = startupResult.clusterCount;
+            refined.startupHypothesisSelectedRank = startupResult.selectedRank;
+            refined.startupHypothesisConsensusTof = startupResult.consensusTofSamples;
+            refined.startupHypothesisMeanSupportSnrDb = startupResult.meanSupportSnrDb;
+            refined.startupHypothesisConfirmed = true;
+            refined.startupHypothesisState = QStringLiteral("CONFIRMED_2_OF_3_RERUN");
+
+            const bool refinedIdentityConsistent =
+                refined.measurementStatus == QStringLiteral("VALID")
+                && std::isfinite(refined.interpolatedPeakIndex)
+                && std::abs(refined.interpolatedPeakIndex
+                            - startupResult.consensusTofSamples) <= 8.0;
+            if (refinedIdentityConsistent) {
+                refined.startupHypothesisRerunAccepted = true;
+                refined.prelockReadOnlyRecovered = true;
+                refined.startupRecovered = true;
+                refined.recoveryEvidence = QStringLiteral(
+                    "FirstEcho启动2-of-3共识确认同一packet；WARMUP重检仅作为当前帧只读输出，正式PeakHistory完全沿用原算法结果");
+                startupHypothesisReadOnlyOutput = std::move(refined);
+                startupHypothesisReadOnlyReady = true;
+            } else {
+                waveform.startupHypothesisState = QStringLiteral("CONFIRMED_RERUN_REJECTED");
+            }
+        }
+    }
 
     // ---------------------------------------------------------------------
     // STARTUP_PROVISIONAL：只处理“SEARCH冷启动 + 单个强packet + 拟合中心落在多瓣谷底”
@@ -7442,11 +7774,36 @@ ThicknessResult ThicknessProcessor::process(
         m_impl->history.observe(waveform, p);
     }
 
+    // 新的2-of-3启动链严格output-only：旧provisional和PeakHistory已经完整执行。
+    // 只有旧结果本帧仍无效时才覆盖当前输出，因此不会改变旧有效帧、LOCK时刻、
+    // RECENT模板或后续Prediction轨迹。
+    if (startupHypothesisReadOnlyReady
+        && waveform.measurementStatus != QStringLiteral("VALID")) {
+        const int savedFramesObserved = waveform.startupHypothesisFramesObserved;
+        const int savedVotes = waveform.startupHypothesisVotes;
+        const int savedClusterCount = waveform.startupHypothesisClusterCount;
+        const int savedSelectedRank = waveform.startupHypothesisSelectedRank;
+        const double savedConsensusTof = waveform.startupHypothesisConsensusTof;
+        const double savedMeanSupportSnr = waveform.startupHypothesisMeanSupportSnrDb;
+        waveform = std::move(startupHypothesisReadOnlyOutput);
+        waveform.startupHypothesisFramesObserved = savedFramesObserved;
+        waveform.startupHypothesisVotes = savedVotes;
+        waveform.startupHypothesisClusterCount = savedClusterCount;
+        waveform.startupHypothesisSelectedRank = savedSelectedRank;
+        waveform.startupHypothesisConsensusTof = savedConsensusTof;
+        waveform.startupHypothesisMeanSupportSnrDb = savedMeanSupportSnr;
+        waveform.startupHypothesisConfirmed = true;
+        waveform.startupHypothesisState = QStringLiteral("CONFIRMED_2_OF_3_OUTPUT_ONLY");
+        waveform.trackingState = QStringLiteral("STARTUP_2_OF_3_OUTPUT_ONLY");
+        startupHypothesisOutputApplied = true;
+    }
+
     // 旧核心继续负责纵波身份、候选、LOCK/LOST与预测；最终显示厚度改由高精度TOF层接管。
     // STARTUP_PROVISIONAL确认帧已经由临时Envelope-NCC给出最终ToF，必须保持只读：
     // 不调用正式高精度模板学习，避免冷启动临时形态污染后续成熟Envelope模板。
     HighPrecisionDecision highPrecision;
-    if (startupEnvelopeConfirmed && std::isfinite(waveform.interpolatedPeakIndex)
+    if ((startupEnvelopeConfirmed || startupHypothesisOutputApplied)
+        && std::isfinite(waveform.interpolatedPeakIndex)
         && std::isfinite(waveform.thicknessMm)) {
         highPrecision.allowed = true;
         highPrecision.usedMainFallback = false;
@@ -7460,21 +7817,121 @@ ThicknessResult ThicknessProcessor::process(
     while (m_impl->highPrecisionDecisionHistory.size() > 32)
         m_impl->highPrecisionDecisionHistory.pop_front();
 
-    // Candidate优先TOF层只读取既有诊断，不反向写入核心检测/跟踪状态。
-    // Candidate真正处理当前帧前，先拿到本帧触发的核心回填；若旧PENDING帧刚被恢复为
-    // BACKFILLED_RELOCKED，则回滚Candidate状态到该帧之前，用“最终诊断”重放，复现测试程序
-    // “整批核心backfill完成后再顺序跑Candidate”的时序，同时不延迟普通实时输出。
+    // IdentityHypothesis + FinalPrimary正式输出层只读取既有诊断，不反向写核心检测/跟踪。
+    // replay历史同时保存两级状态和每帧HighPrecision Final基线；核心backfill发生时从目标帧前
+    // 恢复并顺序重放，保证100 Hz实时链与“整批先完成backfill、再跑身份/FinalPrimary”一致。
     QVariantMap candidateInput = waveformDiagnostics(waveform);
     candidateInput[QStringLiteral("fileName")] = QString::number(m_impl->history.clock);
+
+    const bool legacyCoreValid = waveform.measurementStatus == QStringLiteral("VALID")
+        && std::isfinite(waveform.thicknessMm)
+        && std::isfinite(waveform.interpolatedPeakIndex);
+    const bool currentFinalBaselineValid = legacyCoreValid
+        && highPrecision.allowed && std::isfinite(highPrecision.thicknessMm)
+        && std::isfinite(highPrecision.tofIndex);
+    const double currentFinalBaselineTof = currentFinalBaselineValid ? highPrecision.tofIndex : NaN;
+    const double currentFinalBaselineThickness = currentFinalBaselineValid ? highPrecision.thicknessMm : NaN;
 
     WaveformResult backfillWaveform;
     int backfillTargetClock = 0;
     const bool hasBackfill =
         m_impl->history.takeBackfill(backfillWaveform, backfillTargetClock);
 
-    CandidateTof::OutputDecision replayedBackfillCandidate;
+    // 先按现有正式backfill策略求出目标帧应具有的HighPrecision Final基线；
+    // 这里先求目标帧Final基线，仅供replay恢复FinalPrimary状态使用。
+    bool replayBackfillFinalValid = false;
+    double replayBackfillFinalTof = NaN;
+    double replayBackfillFinalThickness = NaN;
+    HighPrecisionDecision replayBackfillHighPrecision;
+    auto resolveBackfillBaseline = [&](int targetClock,
+                                       const WaveformResult &finalizedWaveform,
+                                       bool startupBackfill,
+                                       double startupTof) {
+        replayBackfillFinalValid = false;
+        replayBackfillFinalTof = NaN;
+        replayBackfillFinalThickness = NaN;
+        replayBackfillHighPrecision = HighPrecisionDecision{};
+        if (targetClock <= 0)
+            return;
+
+        const auto decisionIt = std::find_if(
+            m_impl->highPrecisionDecisionHistory.begin(),
+            m_impl->highPrecisionDecisionHistory.end(),
+            [&](const auto &entry) { return entry.first == targetClock; });
+        if (decisionIt != m_impl->highPrecisionDecisionHistory.end())
+            replayBackfillHighPrecision = decisionIt->second;
+
+        if (startupBackfill && std::isfinite(startupTof)
+            && std::isfinite(finalizedWaveform.thicknessMm)) {
+            replayBackfillFinalValid = true;
+            replayBackfillFinalTof = startupTof;
+            replayBackfillFinalThickness = finalizedWaveform.thicknessMm;
+            replayBackfillHighPrecision.allowed = true;
+            replayBackfillHighPrecision.tofIndex = startupTof;
+            replayBackfillHighPrecision.thicknessMm = finalizedWaveform.thicknessMm;
+            return;
+        }
+
+        if (decisionIt != m_impl->highPrecisionDecisionHistory.end()
+            && decisionIt->second.allowed
+            && std::isfinite(decisionIt->second.tofIndex)
+            && std::isfinite(decisionIt->second.thicknessMm)) {
+            replayBackfillFinalValid = true;
+            replayBackfillFinalTof = decisionIt->second.tofIndex;
+            replayBackfillFinalThickness = decisionIt->second.thicknessMm;
+            return;
+        }
+
+        const bool clippedSafe = finalizedWaveform.fallbackPeakUsed
+            && finalizedWaveform.fallbackReason == QStringLiteral("THEORETICAL_WINDOW_CLIPPED");
+        const bool nccUnavailable = decisionIt != m_impl->highPrecisionDecisionHistory.end()
+            && !decisionIt->second.nccAvailable;
+        const bool startupSafe = nccUnavailable
+            && std::isfinite(finalizedWaveform.snrDb)
+            && finalizedWaveform.snrDb >= p.minLocalSnrDb
+            && finalizedWaveform.candidateCount >= 1 && finalizedWaveform.candidateCount <= 2
+            && !finalizedWaveform.fallbackPeakUsed
+            && ((finalizedWaveform.fitSucceeded && std::isfinite(finalizedWaveform.fitR2)
+                 && ((finalizedWaveform.candidateCount == 1 && finalizedWaveform.fitR2 >= 0.80)
+                     || (finalizedWaveform.candidateCount == 2 && finalizedWaveform.fitR2 >= 0.93)))
+                || (finalizedWaveform.echoConfirmed && std::isfinite(finalizedWaveform.echoCorrelation)
+                    && finalizedWaveform.echoCorrelation >= std::max(p.echoMinCorrelation, 0.80)));
+        const bool residualSafe = std::isfinite(finalizedWaveform.trackingResidualSamples)
+            && std::abs(finalizedWaveform.trackingResidualSamples) <= 2.0;
+        if (clippedSafe || startupSafe || residualSafe) {
+            replayBackfillFinalValid = true;
+            replayBackfillFinalTof = finalizedWaveform.interpolatedPeakIndex;
+            replayBackfillFinalThickness = finalizedWaveform.thicknessMm;
+            replayBackfillHighPrecision.allowed = true;
+            replayBackfillHighPrecision.tofIndex = replayBackfillFinalTof;
+            replayBackfillHighPrecision.thicknessMm = replayBackfillFinalThickness;
+        }
+    };
+
     int replayedBackfillClock = 0;
-    auto replayCandidateFromBackfill = [&](int targetClock, const WaveformResult &finalizedWaveform) {
+
+    auto replayFinalPrimaryFrom = [&](std::deque<Impl::CandidateReplayFrame>::iterator targetIt) {
+        if (targetIt == m_impl->candidateReplayHistory.end())
+            return;
+        m_impl->finalPrimary = targetIt->finalPrimaryStateBefore;
+        for (auto it = targetIt; it != m_impl->candidateReplayHistory.end(); ++it) {
+            it->finalPrimaryStateBefore = m_impl->finalPrimary;
+            const TofEvidenceFrame evidence = makeFinalPrimaryEvidenceFrame(
+                it->input, it->highPrecision, it->finalBaselineValid,
+                it->finalBaselineTof, it->finalBaselineThicknessMm,
+                it->hypothesisDecision);
+            it->finalPrimaryDecision = m_impl->finalPrimary.resolve(
+                evidence, it->hypothesisDecision.observedCenter,
+                it->hypothesisDecision.source);
+        }
+    };
+
+    auto replayHistoryFromCoreBackfill = [&](int targetClock,
+                                             const WaveformResult &finalizedWaveform,
+                                             bool targetFinalValid,
+                                             double targetFinalTof,
+                                             double targetFinalThickness,
+                                             const HighPrecisionDecision &targetHighPrecision) {
         if (targetClock <= 0)
             return;
         auto targetIt = std::find_if(
@@ -7484,53 +7941,110 @@ ThicknessResult ThicknessProcessor::process(
         if (targetIt == m_impl->candidateReplayHistory.end())
             return;
 
-        m_impl->candidateTof = targetIt->stateBefore;
+        m_impl->identityHypothesis = targetIt->identityStateBefore;
+        m_impl->finalPrimary = targetIt->finalPrimaryStateBefore;
         bool first = true;
         for (auto it = targetIt; it != m_impl->candidateReplayHistory.end(); ++it) {
             if (first) {
                 it->input = waveformDiagnostics(finalizedWaveform);
                 it->input[QStringLiteral("fileName")] = QString::number(targetClock);
+                it->highPrecision = targetHighPrecision;
+                it->finalBaselineValid = targetFinalValid;
+                it->finalBaselineTof = targetFinalTof;
+                it->finalBaselineThicknessMm = targetFinalThickness;
             }
-            it->stateBefore = m_impl->candidateTof;
-            const CandidateTof::OutputDecision replayed =
-                m_impl->candidateTof.process(it->input);
+            it->identityStateBefore = m_impl->identityHypothesis;
+            it->finalPrimaryStateBefore = m_impl->finalPrimary;
+            it->hypothesisDecision = m_impl->identityHypothesis.process(it->input);
+            const TofEvidenceFrame evidence = makeFinalPrimaryEvidenceFrame(
+                it->input, it->highPrecision, it->finalBaselineValid,
+                it->finalBaselineTof, it->finalBaselineThicknessMm,
+                it->hypothesisDecision);
+            it->finalPrimaryDecision = m_impl->finalPrimary.resolve(
+                evidence, it->hypothesisDecision.observedCenter,
+                it->hypothesisDecision.source);
             if (first) {
-                replayedBackfillCandidate = replayed;
                 replayedBackfillClock = targetClock;
                 first = false;
             }
         }
     };
 
-    if (hasBackfill)
-        replayCandidateFromBackfill(backfillTargetClock, backfillWaveform);
-    else if (startupEnvelopeConfirmed)
-        replayCandidateFromBackfill(startupBackfillClock, startupBackfillWaveform);
+    if (hasBackfill) {
+        resolveBackfillBaseline(backfillTargetClock, backfillWaveform, false, NaN);
+        replayHistoryFromCoreBackfill(
+            backfillTargetClock, backfillWaveform,
+            replayBackfillFinalValid, replayBackfillFinalTof,
+            replayBackfillFinalThickness, replayBackfillHighPrecision);
+    } else if (startupEnvelopeConfirmed) {
+        resolveBackfillBaseline(
+            startupBackfillClock, startupBackfillWaveform, true, startupBackfillTof);
+        replayHistoryFromCoreBackfill(
+            startupBackfillClock, startupBackfillWaveform,
+            replayBackfillFinalValid, replayBackfillFinalTof,
+            replayBackfillFinalThickness, replayBackfillHighPrecision);
+    }
 
-    const CandidateTof::CandidateTofOutputChain candidateStateBefore = m_impl->candidateTof;
-    const CandidateTof::OutputDecision candidateDecision =
-        m_impl->candidateTof.process(candidateInput);
+    const IdentityHypothesis::Chain identityStateBefore = m_impl->identityHypothesis;
+    IdentityHypothesis::Decision identityDecision =
+        m_impl->identityHypothesis.process(candidateInput);
+
+    // Identity当前帧确认旧PENDING时，测试程序会在FinalPrimary运行前先改写旧帧Hypothesis。
+    // 实时链因此只重放FinalPrimary历史，不回滚已经正确推进到当前帧的Identity状态。
+    if (identityDecision.backfillPrevious
+        && std::isfinite(identityDecision.backfillObservedCenter)) {
+        bool clockOk = false;
+        const int targetClock = identityDecision.backfillFile.toInt(&clockOk);
+        if (clockOk && targetClock > 0) {
+            auto targetIt = std::find_if(
+                m_impl->candidateReplayHistory.begin(),
+                m_impl->candidateReplayHistory.end(),
+                [&](const Impl::CandidateReplayFrame &frame) { return frame.clock == targetClock; });
+            if (targetIt != m_impl->candidateReplayHistory.end()) {
+                targetIt->hypothesisDecision.identity = identityDecision.identity;
+                targetIt->hypothesisDecision.identityEstablished = identityDecision.identityEstablished;
+                targetIt->hypothesisDecision.stage = identityDecision.stage;
+                targetIt->hypothesisDecision.observedCenter = identityDecision.backfillObservedCenter;
+                targetIt->hypothesisDecision.source = identityDecision.backfillUsedRaw
+                    ? QStringLiteral("CONFIRMED_BACKFILL_RAW")
+                    : QStringLiteral("CONFIRMED_BACKFILL");
+                targetIt->hypothesisDecision.state = IdentityHypothesis::State::ConfirmedShift;
+                targetIt->hypothesisDecision.backfillPrevious = false;
+                replayFinalPrimaryFrom(targetIt);
+                replayedBackfillClock = targetClock;
+            }
+        }
+    }
+
+    const FinalPrimary::DecisionEngine finalPrimaryStateBefore = m_impl->finalPrimary;
+    const TofEvidenceFrame currentEvidence = makeFinalPrimaryEvidenceFrame(
+        candidateInput, highPrecision, currentFinalBaselineValid,
+        currentFinalBaselineTof, currentFinalBaselineThickness, identityDecision);
+    const FinalPrimary::Decision finalPrimaryDecision = m_impl->finalPrimary.resolve(
+        currentEvidence, identityDecision.observedCenter, identityDecision.source);
+
     m_impl->candidateReplayHistory.push_back({
-        m_impl->history.clock, candidateInput, candidateStateBefore});
+        m_impl->history.clock, candidateInput, identityStateBefore,
+        finalPrimaryStateBefore, highPrecision,
+        currentFinalBaselineValid, currentFinalBaselineTof,
+        currentFinalBaselineThickness, identityDecision, finalPrimaryDecision});
     while (m_impl->candidateReplayHistory.size() > 32)
         m_impl->candidateReplayHistory.pop_front();
 
     ThicknessResult result;
-    const bool legacyCoreValid = waveform.measurementStatus == QStringLiteral("VALID")
-        && std::isfinite(waveform.thicknessMm)
-        && std::isfinite(waveform.interpolatedPeakIndex);
-    // 现有核心身份链 + 高精度Final仍唯一决定VALID；Candidate绝不把INVALID/NO_SIGNAL升级。
-    result.valid = legacyCoreValid
-        && highPrecision.allowed && std::isfinite(highPrecision.thicknessMm)
-        && std::isfinite(highPrecision.tofIndex);
+    // 正式输出切换：HighPrecision Final继续唯一决定VALID和绝对TOF标定；
+    // Identity/Candidate只能经FinalPrimaryIdentityDecisionEngine对齐、证据融合后做稀疏身份纠错。
+    // Candidate不再直接覆盖每帧Final，也绝不把INVALID/NO_SIGNAL升级为VALID。
+    result.valid = currentFinalBaselineValid;
 
-    double finalTof = result.valid ? highPrecision.tofIndex : NaN;
-    double finalThickness = result.valid ? highPrecision.thicknessMm : NaN;
-    if (result.valid && std::isfinite(candidateDecision.center)) {
-        finalTof = candidateDecision.center;
-        finalThickness = p.longitudinalVelocityMps
-            * (finalTof + p.delayCount) / p.sampleRateHz / 2.0 * 1000.0
-            - CURRENT_FIXED_BIAS_MM;
+    double finalTof = NaN;
+    double finalThickness = NaN;
+    if (result.valid && std::isfinite(finalPrimaryDecision.outputCenter)) {
+        const double mmPerSample = p.longitudinalVelocityMps
+            / p.sampleRateHz * 0.5 * 1000.0;
+        finalTof = finalPrimaryDecision.outputCenter;
+        finalThickness = currentFinalBaselineThickness
+            + (finalTof - currentFinalBaselineTof) * mmPerSample;
     }
 
     result.thicknessMm = result.valid ? finalThickness : NaN;
@@ -7539,6 +8053,19 @@ ThicknessResult ThicknessProcessor::process(
     result.snrDb = result.valid ? waveform.snrDb : NaN;
     result.peakIndex = result.valid
         ? static_cast<int>(std::llround(finalTof)) : -1;
+
+    // 守护shadow与正式Final-primary输出同源保留，用于持续逐帧回归检查二者是否分叉。
+    result.finalPrimaryShadowConfidenceClass = finalPrimaryDecision.confidenceClass;
+    result.finalPrimaryShadowReason = finalPrimaryDecision.reason;
+    result.finalPrimaryShadowValid = currentFinalBaselineValid
+        && std::isfinite(finalPrimaryDecision.outputCenter);
+    if (result.finalPrimaryShadowValid) {
+        const double mmPerSample = p.longitudinalVelocityMps
+            / p.sampleRateHz * 0.5 * 1000.0;
+        result.finalPrimaryShadowTofIndex = finalPrimaryDecision.outputCenter;
+        result.finalPrimaryShadowThicknessMm = currentFinalBaselineThickness
+            + (finalPrimaryDecision.outputCenter - currentFinalBaselineTof) * mmPerSample;
+    }
 
     if (hasBackfill && std::isfinite(backfillWaveform.thicknessMm)) {
         const auto decisionIt = std::find_if(
@@ -7607,38 +8134,10 @@ ThicknessResult ThicknessProcessor::process(
         result.backfillPeakIndex = static_cast<int>(std::llround(startupBackfillTof));
     }
 
-    // Candidate只修正TOF身份，不负责把无效帧升级为VALID。
-    // 对已经由核心/启动链确认有效的backfill，先应用“重放后的该帧Candidate中心”；
-    // 随后若当前帧的PENDING/CONFIRMED又明确要求回填同一目标，则以当前确认中心覆盖，
-    // 顺序与测试程序整批回填后再跑Candidate完全一致。
+    // 核心/启动backfill一旦恢复旧帧为VALID，先同步历史元数据；随后正式回填TOF
+    // 统一使用重放后的FinalPrimary决策，而不是Candidate原始身份坐标。
     if (result.hasBackfill && result.backfillFramesAgo > 0) {
         const int activeTargetClock = m_impl->history.clock - result.backfillFramesAgo;
-        double candidateBackfillTof = NaN;
-        if (replayedBackfillClock == activeTargetClock
-            && std::isfinite(replayedBackfillCandidate.center)) {
-            candidateBackfillTof = replayedBackfillCandidate.center;
-        }
-
-        if (candidateDecision.backfillPrevious
-            && std::isfinite(candidateDecision.backfillCenter)) {
-            bool clockOk = false;
-            const int decisionTargetClock = candidateDecision.backfillFile.toInt(&clockOk);
-            if (clockOk && decisionTargetClock == activeTargetClock)
-                candidateBackfillTof = candidateDecision.backfillCenter;
-        }
-
-        if (std::isfinite(candidateBackfillTof)) {
-            const double candidateBackfillThickness = p.longitudinalVelocityMps
-                * (candidateBackfillTof + p.delayCount) / p.sampleRateHz / 2.0 * 1000.0
-                - CURRENT_FIXED_BIAS_MM;
-            if (std::isfinite(candidateBackfillThickness)) {
-                result.backfillThicknessMm = candidateBackfillThickness;
-                result.backfillPeakTimeSec = candidateBackfillTof / p.sampleRateHz;
-                result.backfillPeakIndex = static_cast<int>(std::llround(candidateBackfillTof));
-            }
-        }
-
-        // 该旧帧现在已经被核心链正式恢复为VALID；同步Candidate回填快照，供后续周期确认使用。
         auto snapshotIt = std::find_if(
             m_impl->candidateOutputHistory.begin(),
             m_impl->candidateOutputHistory.end(),
@@ -7652,34 +8151,52 @@ ThicknessResult ThicknessProcessor::process(
         }
     }
 
-    // 没有核心backfill占用输出通道时，Candidate确认仍可修正一个“原本已经VALID”的旧帧。
-    if (!result.hasBackfill && candidateDecision.backfillPrevious
-        && std::isfinite(candidateDecision.backfillCenter)) {
-        bool clockOk = false;
-        const int targetClock = candidateDecision.backfillFile.toInt(&clockOk);
-        if (clockOk && targetClock > 0) {
-            const auto snapshotIt = std::find_if(
-                m_impl->candidateOutputHistory.begin(),
-                m_impl->candidateOutputHistory.end(),
-                [&](const Impl::CandidateOutputSnapshot &snapshot) {
-                    return snapshot.clock == targetClock;
-                });
-            if (snapshotIt != m_impl->candidateOutputHistory.end() && snapshotIt->valid) {
-                const double backfillTof = candidateDecision.backfillCenter;
-                const double backfillThickness = p.longitudinalVelocityMps
-                    * (backfillTof + p.delayCount) / p.sampleRateHz / 2.0 * 1000.0
-                    - CURRENT_FIXED_BIAS_MM;
-                if (std::isfinite(backfillThickness)) {
-                    result.hasBackfill = true;
-                    result.backfillFramesAgo =
-                        (std::max)(1, m_impl->history.clock - targetClock);
-                    result.backfillThicknessMm = backfillThickness;
-                    result.backfillPeakTimeSec = backfillTof / p.sampleRateHz;
-                    result.backfillPeakVoltage = snapshotIt->peakVoltage;
-                    result.backfillSnrDb = snapshotIt->snrDb;
-                    result.backfillPeakIndex = static_cast<int>(std::llround(backfillTof));
-                }
+    if (replayedBackfillClock > 0) {
+        const auto replayIt = std::find_if(
+            m_impl->candidateReplayHistory.begin(),
+            m_impl->candidateReplayHistory.end(),
+            [&](const Impl::CandidateReplayFrame &frame) {
+                return frame.clock == replayedBackfillClock;
+            });
+        const auto snapshotIt = std::find_if(
+            m_impl->candidateOutputHistory.begin(),
+            m_impl->candidateOutputHistory.end(),
+            [&](const Impl::CandidateOutputSnapshot &snapshot) {
+                return snapshot.clock == replayedBackfillClock;
+            });
+        if (replayIt != m_impl->candidateReplayHistory.end()
+            && replayIt->finalBaselineValid
+            && std::isfinite(replayIt->finalPrimaryDecision.outputCenter)
+            && std::isfinite(replayIt->finalBaselineTof)
+            && std::isfinite(replayIt->finalBaselineThicknessMm)) {
+            const double mmPerSample = p.longitudinalVelocityMps
+                / p.sampleRateHz * 0.5 * 1000.0;
+            const double backfillTof = replayIt->finalPrimaryDecision.outputCenter;
+            const double backfillThickness = replayIt->finalBaselineThicknessMm
+                + (backfillTof - replayIt->finalBaselineTof) * mmPerSample;
+            const int framesAgo =
+                (std::max)(1, m_impl->history.clock - replayedBackfillClock);
+
+            // 正式回填：核心backfill或Identity确认旧VALID帧都走同一个FinalPrimary结果。
+            result.hasBackfill = true;
+            result.backfillFramesAgo = framesAgo;
+            result.backfillThicknessMm = backfillThickness;
+            result.backfillPeakTimeSec = backfillTof / p.sampleRateHz;
+            result.backfillPeakIndex = static_cast<int>(std::llround(backfillTof));
+            if (snapshotIt != m_impl->candidateOutputHistory.end()) {
+                result.backfillPeakVoltage = snapshotIt->peakVoltage;
+                result.backfillSnrDb = snapshotIt->snrDb;
             }
+
+            // 保留shadow字段用于正式输出后的逐帧守护回归；两者此时应完全同源。
+            result.hasFinalPrimaryShadowBackfill = true;
+            result.finalPrimaryShadowBackfillFramesAgo = framesAgo;
+            result.finalPrimaryShadowBackfillTofIndex = backfillTof;
+            result.finalPrimaryShadowBackfillThicknessMm = backfillThickness;
+            result.finalPrimaryShadowBackfillConfidenceClass =
+                replayIt->finalPrimaryDecision.confidenceClass;
+            result.finalPrimaryShadowBackfillReason =
+                replayIt->finalPrimaryDecision.reason;
         }
     }
 

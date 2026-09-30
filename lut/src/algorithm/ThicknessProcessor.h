@@ -5,6 +5,8 @@
 #include <memory>
 #include <vector>
 
+#include <QString>
+
 enum class ThicknessDetectionMode
 {
     Auto,
@@ -112,6 +114,22 @@ struct ThicknessResult
     double peakVoltage = std::numeric_limits<double>::quiet_NaN();
     double snrDb = std::numeric_limits<double>::quiet_NaN();
     int peakIndex = -1;
+
+    // Final-primary + Identity守护shadow：正式thicknessMm已由同一决策链接管；
+    // 这些字段保留用于主程序/测试程序逐帧一致性回归和后续防回退检查。
+    bool finalPrimaryShadowValid = false;
+    double finalPrimaryShadowTofIndex = std::numeric_limits<double>::quiet_NaN();
+    double finalPrimaryShadowThicknessMm = std::numeric_limits<double>::quiet_NaN();
+    QString finalPrimaryShadowConfidenceClass;
+    QString finalPrimaryShadowReason;
+
+    // shadow backfill与正式回填使用同一历史目标，测试工具据此修正过去帧的shadow序列。
+    bool hasFinalPrimaryShadowBackfill = false;
+    int finalPrimaryShadowBackfillFramesAgo = 0;
+    double finalPrimaryShadowBackfillTofIndex = std::numeric_limits<double>::quiet_NaN();
+    double finalPrimaryShadowBackfillThicknessMm = std::numeric_limits<double>::quiet_NaN();
+    QString finalPrimaryShadowBackfillConfidenceClass;
+    QString finalPrimaryShadowBackfillReason;
 
     // 与测试程序的延迟确认回填一致：当前帧完成重锁时，修正此前的PENDING帧。
     bool hasBackfill = false;
