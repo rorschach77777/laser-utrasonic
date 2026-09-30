@@ -80,9 +80,13 @@ struct ThicknessAlgorithmParameters
     int fitFootConfirmSamples = 3;
     int fitFootSmoothRadius = 1;
     double fitCenterHalfRange = 0.75;
-    double fitAmplitudeMinRatio = 1.75;
-    double fitAmplitudeMaxRatio = 3.50;
+    double fitAmplitudeMinRatio = 0.75;
+    double fitAmplitudeMaxRatio = 1.50;
     double fitMinR2 = 0.50;
+
+    // FirstEcho最终输出层Raw carrier phase小增益修正；0表示关闭。
+    // 该参数只作用于FinalPrimary之后的发布值，不回写Prediction/模板/状态机。
+    double firstEchoPhaseRefinementAlpha = 0.13;
 
     int adaptiveWidthHistorySize = 21;
     int adaptiveWidthMinHistory = 7;
@@ -122,6 +126,13 @@ struct ThicknessResult
     double finalPrimaryShadowThicknessMm = std::numeric_limits<double>::quiet_NaN();
     QString finalPrimaryShadowConfidenceClass;
     QString finalPrimaryShadowReason;
+
+    // FinalPrimary之后的FirstEcho Raw phase输出层微调诊断。
+    bool firstEchoPhaseRefinementApplied = false;
+    double firstEchoPhaseRefinementCorrectionSamples = 0.0;
+    double firstEchoPhaseRefinementBaseTofIndex = std::numeric_limits<double>::quiet_NaN();
+    double firstEchoPhaseRefinementBaseThicknessMm = std::numeric_limits<double>::quiet_NaN();
+    QString firstEchoPhaseRefinementReason;
 
     // shadow backfill与正式回填使用同一历史目标，测试工具据此修正过去帧的shadow序列。
     bool hasFinalPrimaryShadowBackfill = false;

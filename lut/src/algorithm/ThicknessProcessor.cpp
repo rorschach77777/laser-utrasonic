@@ -4,6 +4,8 @@
 #include "IdentityHypothesisChain.h"
 #include "FinalPrimaryIdentityDecisionEngine.h"
 #include "FirstEchoStartupTracker.h"
+#include "FirstEchoRawPhaseTracker.h"
+#include "FirstEchoPhaseRefinement.h"
 
 #include <QString>
 #include <QStringList>
@@ -261,6 +263,8 @@ struct TestParameters
     double fitAmplitudeMaxRatio = 1.50;
     // 累计能量分布与固定脉宽高斯的一致性质量门。
     double fitMinR2 = 0.50;
+    // FirstEcho最终输出层Raw phase小增益微调；0关闭。
+    double firstEchoPhaseRefinementAlpha = 0.13;
 
     // ------------------------- 自适应拟合脉宽模型 -------------------------
     // 仅作为质量证据，不直接改变 VALID / INVALID。模型使用最近高质量拟合脉宽的
@@ -5182,6 +5186,9 @@ struct HighPrecisionHistory
     std::vector<double> echoPeriodThicknessScaleHistory;
     std::vector<double> echoAbsoluteResidualHistory;
     std::vector<double> packetInternalDelayHistory;
+    // Envelope-NCC约束下的Raw carrier phase独立旁路。只学习raw-envelope残差，
+    // 不写PeakHistory/Prediction/模板/FinalPrimary。
+    FirstEchoRawPhaseTracker firstEchoRawPhaseTracker;
 
     void prepare(int count)
     {
@@ -5190,6 +5197,7 @@ struct HighPrecisionHistory
             echoPeriodThicknessScaleHistory.clear();
             echoAbsoluteResidualHistory.clear();
             packetInternalDelayHistory.clear();
+            firstEchoRawPhaseTracker.reset();
         }
         sampleCount = count;
     }
@@ -5255,6 +5263,12 @@ struct HighPrecisionDecision
     double nccT50DeltaSamples = NaN;
     double echoChainPeriodDifferenceSamples = NaN;
     double echoChainResidualDeviationMm = NaN;
+    // FirstEcho Raw phase只读旁路；最终是否用于正式输出由FinalPrimary之后的
+    // FirstEchoPhaseRefinement独立决定。
+    double firstEchoRawPhaseTofIndex = NaN;
+    double firstEchoRawPhaseAnchorResidualSamples = NaN;
+    bool firstEchoRawPhaseModelReady = false;
+    bool firstEchoRawPhaseSelected = false;
 };
 
 bool highPrecisionHilbertEnvelope(const std::vector<double> &signal,
@@ -5355,6 +5369,97 @@ double highPrecisionInterpolateCrossing(double x0, double y0,
     if (!std::isfinite(dy) || std::abs(dy) <= 1e-18)
         return x0;
     return x0 + std::clamp((target - y0) / dy, 0.0, 1.0) * (x1 - x0);
+}
+
+std::vector<FirstEchoRawPhaseTracker::Candidate> findFirstEchoRawPhaseCandidates(
+    const std::vector<double> &signal,
+    int packetLeft,
+    int packetRight,
+    double envelopeAnchorTof,
+    double directReferenceTof,
+    const QString &detectMode)
+{
+    std::vector<FirstEchoRawPhaseTracker::Candidate> candidates;
+    if (signal.size() < 5 || !std::isfinite(envelopeAnchorTof))
+        return candidates;
+
+    const int n = static_cast<int>(signal.size());
+    packetLeft = std::clamp(packetLeft, 1, n - 3);
+    packetRight = std::clamp(packetRight, packetLeft + 2, n - 2);
+    const int left = std::max(packetLeft,
+        static_cast<int>(std::floor(envelopeAnchorTof - 14.0)));
+    const int right = std::min(packetRight,
+        static_cast<int>(std::ceil(envelopeAnchorTof + 14.0)));
+    if (left + 2 > right)
+        return candidates;
+
+    const int edgeCount = std::clamp((packetRight - packetLeft + 1) / 8, 2, 8);
+    double leftMean = 0.0;
+    double rightMean = 0.0;
+    for (int i = 0; i < edgeCount; ++i) {
+        leftMean += signal[static_cast<size_t>(packetLeft + i)];
+        rightMean += signal[static_cast<size_t>(packetRight - i)];
+    }
+    leftMean /= edgeCount;
+    rightMean /= edgeCount;
+    const double leftX = packetLeft + 0.5 * (edgeCount - 1);
+    const double rightX = packetRight - 0.5 * (edgeCount - 1);
+    const double baselineOrigin = 0.5 * (leftX + rightX);
+    const double baselineSlope = rightX > leftX
+        ? (rightMean - leftMean) / (rightX - leftX) : 0.0;
+    const double baselineIntercept = 0.5 * (leftMean + rightMean);
+    auto residual = [&](int index) {
+        const double baseline = baselineIntercept
+            + baselineSlope * (index - baselineOrigin);
+        return signal[static_cast<size_t>(index)] - baseline;
+    };
+
+    double polarity = 1.0;
+    if (detectMode == QStringLiteral("valley")) {
+        polarity = -1.0;
+    } else if (detectMode == QStringLiteral("auto") && std::isfinite(directReferenceTof)) {
+        const int referenceIndex = std::clamp(
+            static_cast<int>(std::llround(directReferenceTof)), packetLeft, packetRight);
+        polarity = residual(referenceIndex) >= 0.0 ? 1.0 : -1.0;
+    }
+
+    struct RawCandidate {
+        double tof = NaN;
+        double amplitude = NaN;
+    };
+    std::vector<RawCandidate> rawCandidates;
+    rawCandidates.reserve(8);
+    double strongest = 0.0;
+    for (int i = left + 1; i < right; ++i) {
+        const double yl = polarity * residual(i - 1);
+        const double yc = polarity * residual(i);
+        const double yr = polarity * residual(i + 1);
+        if (!(std::isfinite(yl) && std::isfinite(yc) && std::isfinite(yr)) || yc <= 0.0)
+            continue;
+        if (yc < yl || yc < yr || (yc == yl && yc == yr))
+            continue;
+        double delta = 0.0;
+        const double curvature = yl - 2.0 * yc + yr;
+        if (std::isfinite(curvature) && curvature < -1e-15)
+            delta = std::clamp(0.5 * (yl - yr) / curvature, -0.5, 0.5);
+        const double amplitude = yc - 0.25 * (yl - yr) * delta;
+        if (!(std::isfinite(amplitude) && amplitude > 0.0))
+            continue;
+        rawCandidates.push_back({i + delta, amplitude});
+        strongest = std::max(strongest, amplitude);
+    }
+    if (!(strongest > 0.0))
+        return candidates;
+
+    for (const RawCandidate &candidate : rawCandidates) {
+        const double strength = candidate.amplitude / strongest;
+        if (strength < 0.10)
+            continue;
+        candidates.push_back({candidate.tof, strength});
+    }
+    std::sort(candidates.begin(), candidates.end(),
+        [](const auto &a, const auto &b) { return a.tofSamples < b.tofSamples; });
+    return candidates;
 }
 
 bool highPrecisionExtractTemplate(const std::vector<double> &envelope,
@@ -6264,6 +6369,53 @@ HighPrecisionDecision computeHighPrecisionDecision(
     const double deltaNccT50 = hasNcc && hasT50 ? std::abs(nccTof - t50) : NaN;
     decision.envelopeNccCorrelation = nccCorrelation;
     decision.nccT50DeltaSamples = deltaNccT50;
+
+    // FirstEcho Raw phase独立旁路：Envelope-NCC确定物理packet后，只在当前packet内
+    // 选择同一raw-envelope residual branch的原始载波极值。该状态完全独立于
+    // PeakHistory/Prediction/模板/FinalPrimary，仅供最终output-only refinement读取。
+    if (history && std::isfinite(nccTof)
+        && r.packetLeftIndex >= 0 && r.packetRightIndex > r.packetLeftIndex) {
+        const auto phaseCandidates = findFirstEchoRawPhaseCandidates(
+            filtered, r.packetLeftIndex, r.packetRightIndex,
+            nccTof, r.directParabolicPeakIndex, p.detectMode);
+
+        const bool reliableEnvelope = std::isfinite(nccCorrelation)
+            && nccCorrelation >= 0.92;
+        if (!history->firstEchoRawPhaseTracker.ready()
+            && reliableEnvelope && std::isfinite(r.directParabolicPeakIndex)
+            && std::abs(r.directParabolicPeakIndex - nccTof) <= 4.5) {
+            double directStrength = NaN;
+            double nearestDistance = std::numeric_limits<double>::infinity();
+            for (const auto &candidate : phaseCandidates) {
+                const double distance = std::abs(candidate.tofSamples - r.directParabolicPeakIndex);
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    directStrength = candidate.normalizedStrength;
+                }
+            }
+            if (nearestDistance <= 0.75 && std::isfinite(directStrength)) {
+                history->firstEchoRawPhaseTracker.observeReliable(
+                    nccTof, r.directParabolicPeakIndex,
+                    directStrength, phaseCandidates);
+            }
+        }
+
+        auto phaseSelection = history->firstEchoRawPhaseTracker.select(
+            nccTof, phaseCandidates);
+        if (phaseSelection.selected && reliableEnvelope) {
+            history->firstEchoRawPhaseTracker.observeReliable(
+                nccTof, phaseSelection.selectedTofSamples,
+                phaseSelection.selectedStrength, phaseCandidates);
+            phaseSelection = history->firstEchoRawPhaseTracker.select(
+                nccTof, phaseCandidates);
+        }
+
+        decision.firstEchoRawPhaseModelReady = phaseSelection.modelReady;
+        decision.firstEchoRawPhaseSelected = phaseSelection.selected;
+        decision.firstEchoRawPhaseAnchorResidualSamples = phaseSelection.anchorResidualSamples;
+        if (phaseSelection.selected)
+            decision.firstEchoRawPhaseTofIndex = phaseSelection.selectedTofSamples;
+    }
 
     bool highPrecisionAllowed = false;
     if (hasNcc && templateReliable) {
@@ -7456,6 +7608,10 @@ ThicknessResult ThicknessProcessor::process(
     p.fitAmplitudeMinRatio = parameters.fitAmplitudeMinRatio;
     p.fitAmplitudeMaxRatio = parameters.fitAmplitudeMaxRatio;
     p.fitMinR2 = parameters.fitMinR2;
+    p.firstEchoPhaseRefinementAlpha = std::clamp(
+        std::isfinite(parameters.firstEchoPhaseRefinementAlpha)
+            ? parameters.firstEchoPhaseRefinementAlpha : 0.13,
+        0.0, 1.0);
     p.adaptiveWidthHistorySize = parameters.adaptiveWidthHistorySize;
     p.adaptiveWidthMinHistory = parameters.adaptiveWidthMinHistory;
     p.adaptiveWidthMadMultiplier = parameters.adaptiveWidthMadMultiplier;
@@ -8037,14 +8193,63 @@ ThicknessResult ThicknessProcessor::process(
     // Candidate不再直接覆盖每帧Final，也绝不把INVALID/NO_SIGNAL升级为VALID。
     result.valid = currentFinalBaselineValid;
 
+    const double mmPerSample = p.longitudinalVelocityMps
+        / p.sampleRateHz * 0.5 * 1000.0;
+    auto evaluateOutputPhaseRefinement = [&](const HighPrecisionDecision &hp,
+                                             const FinalPrimary::Decision &fp,
+                                             bool formalValid,
+                                             double formalTof,
+                                             double formalThickness) {
+        FirstEchoPhaseRefinementInput input;
+        input.enabled = p.firstEchoPhaseRefinementAlpha > 0.0;
+        input.alpha = p.firstEchoPhaseRefinementAlpha;
+        input.formalOutputValid = formalValid;
+        input.triEvidenceUsedMainFallback = hp.usedMainFallback;
+        input.finalPrimaryIdentityCorrected = fp.corrected;
+        input.rawPhaseModelReady = hp.firstEchoRawPhaseModelReady;
+        input.rawPhaseSelected = hp.firstEchoRawPhaseSelected;
+        input.formalOutputTofSamples = formalTof;
+        input.formalOutputThicknessMm = formalThickness;
+        input.envelopeNccTofSamples = hp.envelopeNccTofIndex;
+        input.rawPhaseTofSamples = hp.firstEchoRawPhaseTofIndex;
+        input.anchorResidualSamples = hp.firstEchoRawPhaseAnchorResidualSamples;
+        input.mmPerSample = mmPerSample;
+        return evaluateFirstEchoPhaseRefinement(input);
+    };
+
+    // FinalPrimary是身份/物理运动判定的最后一级；Phase Refinement严格放在它之后，
+    // 只改发布TOF/厚度，不允许任何结果回写Prediction、模板、Identity或状态机。
     double finalTof = NaN;
     double finalThickness = NaN;
     if (result.valid && std::isfinite(finalPrimaryDecision.outputCenter)) {
-        const double mmPerSample = p.longitudinalVelocityMps
-            / p.sampleRateHz * 0.5 * 1000.0;
         finalTof = finalPrimaryDecision.outputCenter;
         finalThickness = currentFinalBaselineThickness
             + (finalTof - currentFinalBaselineTof) * mmPerSample;
+    }
+
+    // FinalPrimary shadow保留“相位微调前”的正式身份输出，便于区分身份修正与亚采样修正。
+    result.finalPrimaryShadowConfidenceClass = finalPrimaryDecision.confidenceClass;
+    result.finalPrimaryShadowReason = finalPrimaryDecision.reason;
+    result.finalPrimaryShadowValid = currentFinalBaselineValid
+        && std::isfinite(finalPrimaryDecision.outputCenter);
+    if (result.finalPrimaryShadowValid) {
+        result.finalPrimaryShadowTofIndex = finalPrimaryDecision.outputCenter;
+        result.finalPrimaryShadowThicknessMm = currentFinalBaselineThickness
+            + (finalPrimaryDecision.outputCenter - currentFinalBaselineTof) * mmPerSample;
+    }
+
+    const auto phaseRefinement = evaluateOutputPhaseRefinement(
+        highPrecision, finalPrimaryDecision,
+        result.valid && std::isfinite(finalTof) && std::isfinite(finalThickness),
+        finalTof, finalThickness);
+    result.firstEchoPhaseRefinementApplied = phaseRefinement.applied;
+    result.firstEchoPhaseRefinementCorrectionSamples = phaseRefinement.correctionSamples;
+    result.firstEchoPhaseRefinementBaseTofIndex = finalTof;
+    result.firstEchoPhaseRefinementBaseThicknessMm = finalThickness;
+    result.firstEchoPhaseRefinementReason = QString::fromLatin1(phaseRefinement.reason);
+    if (phaseRefinement.applied) {
+        finalTof = phaseRefinement.outputTofSamples;
+        finalThickness = phaseRefinement.outputThicknessMm;
     }
 
     result.thicknessMm = result.valid ? finalThickness : NaN;
@@ -8053,19 +8258,6 @@ ThicknessResult ThicknessProcessor::process(
     result.snrDb = result.valid ? waveform.snrDb : NaN;
     result.peakIndex = result.valid
         ? static_cast<int>(std::llround(finalTof)) : -1;
-
-    // 守护shadow与正式Final-primary输出同源保留，用于持续逐帧回归检查二者是否分叉。
-    result.finalPrimaryShadowConfidenceClass = finalPrimaryDecision.confidenceClass;
-    result.finalPrimaryShadowReason = finalPrimaryDecision.reason;
-    result.finalPrimaryShadowValid = currentFinalBaselineValid
-        && std::isfinite(finalPrimaryDecision.outputCenter);
-    if (result.finalPrimaryShadowValid) {
-        const double mmPerSample = p.longitudinalVelocityMps
-            / p.sampleRateHz * 0.5 * 1000.0;
-        result.finalPrimaryShadowTofIndex = finalPrimaryDecision.outputCenter;
-        result.finalPrimaryShadowThicknessMm = currentFinalBaselineThickness
-            + (finalPrimaryDecision.outputCenter - currentFinalBaselineTof) * mmPerSample;
-    }
 
     if (hasBackfill && std::isfinite(backfillWaveform.thicknessMm)) {
         const auto decisionIt = std::find_if(
@@ -8171,13 +8363,20 @@ ThicknessResult ThicknessProcessor::process(
             && std::isfinite(replayIt->finalBaselineThicknessMm)) {
             const double mmPerSample = p.longitudinalVelocityMps
                 / p.sampleRateHz * 0.5 * 1000.0;
-            const double backfillTof = replayIt->finalPrimaryDecision.outputCenter;
-            const double backfillThickness = replayIt->finalBaselineThicknessMm
-                + (backfillTof - replayIt->finalBaselineTof) * mmPerSample;
+            const double baseBackfillTof = replayIt->finalPrimaryDecision.outputCenter;
+            const double baseBackfillThickness = replayIt->finalBaselineThicknessMm
+                + (baseBackfillTof - replayIt->finalBaselineTof) * mmPerSample;
+            const auto backfillPhaseRefinement = evaluateOutputPhaseRefinement(
+                replayIt->highPrecision, replayIt->finalPrimaryDecision,
+                true, baseBackfillTof, baseBackfillThickness);
+            const double backfillTof = backfillPhaseRefinement.applied
+                ? backfillPhaseRefinement.outputTofSamples : baseBackfillTof;
+            const double backfillThickness = backfillPhaseRefinement.applied
+                ? backfillPhaseRefinement.outputThicknessMm : baseBackfillThickness;
             const int framesAgo =
                 (std::max)(1, m_impl->history.clock - replayedBackfillClock);
 
-            // 正式回填：核心backfill或Identity确认旧VALID帧都走同一个FinalPrimary结果。
+            // 正式回填：先完成FinalPrimary身份决策，再对满足同一安全门的旧帧应用output-only phase微调。
             result.hasBackfill = true;
             result.backfillFramesAgo = framesAgo;
             result.backfillThicknessMm = backfillThickness;
@@ -8191,8 +8390,8 @@ ThicknessResult ThicknessProcessor::process(
             // 保留shadow字段用于正式输出后的逐帧守护回归；两者此时应完全同源。
             result.hasFinalPrimaryShadowBackfill = true;
             result.finalPrimaryShadowBackfillFramesAgo = framesAgo;
-            result.finalPrimaryShadowBackfillTofIndex = backfillTof;
-            result.finalPrimaryShadowBackfillThicknessMm = backfillThickness;
+            result.finalPrimaryShadowBackfillTofIndex = baseBackfillTof;
+            result.finalPrimaryShadowBackfillThicknessMm = baseBackfillThickness;
             result.finalPrimaryShadowBackfillConfidenceClass =
                 replayIt->finalPrimaryDecision.confidenceClass;
             result.finalPrimaryShadowBackfillReason =

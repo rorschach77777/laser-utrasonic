@@ -191,7 +191,8 @@ int main(int argc, char* argv[])
 
     std::cout << std::setprecision(17);
     std::cout << "File,Valid,Thickness(mm),PeakIndex,PeakTime(us),PeakVoltage,SNR(dB),ReferenceThickness(mm),Backfilled,"
-                 "ShadowValid,ShadowTOF,ShadowThickness(mm),ShadowConfidence,ShadowReason,ShadowBackfilled,Processing(ms)\n";
+                 "ShadowValid,ShadowTOF,ShadowThickness(mm),ShadowConfidence,ShadowReason,ShadowBackfilled,"
+                 "PhaseApplied,PhaseCorrectionSamples,PhaseReason,Processing(ms)\n";
 
     int failures = 0;
     int shadowComparisonFailures = 0;
@@ -280,6 +281,9 @@ int main(int argc, char* argv[])
                   << result.finalPrimaryShadowConfidenceClass.toStdString() << ','
                   << result.finalPrimaryShadowReason.toStdString() << ','
                   << (row.shadowReplacedByBackfill ? "true" : "false") << ','
+                  << (result.firstEchoPhaseRefinementApplied ? "true" : "false") << ','
+                  << result.firstEchoPhaseRefinementCorrectionSamples << ','
+                  << result.firstEchoPhaseRefinementReason.toStdString() << ','
                   << row.processingMs << '\n';
     }
 

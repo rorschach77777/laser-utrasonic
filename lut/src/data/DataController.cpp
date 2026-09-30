@@ -671,6 +671,8 @@ void DataController::setThicknessAlgorithmParameter(const QString &name, double 
             std::max(bounded(0.05, 5.0), p.fitAmplitudeMinRatio);
     } else if (name == QStringLiteral("fitMinR2")) {
         p.fitMinR2 = bounded(0.1, 0.9999);
+    } else if (name == QStringLiteral("firstEchoPhaseRefinementAlpha")) {
+        p.firstEchoPhaseRefinementAlpha = bounded(0.0, 1.0);
     } else if (name == QStringLiteral("adaptiveWidthHistorySize")) {
         p.adaptiveWidthHistorySize = asInt(5, 101);
         p.adaptiveWidthMinHistory =
