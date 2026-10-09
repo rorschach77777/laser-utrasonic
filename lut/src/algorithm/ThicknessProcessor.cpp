@@ -6,6 +6,12 @@
 #include "FirstEchoStartupTracker.h"
 #include "FirstEchoRawPhaseTracker.h"
 #include "FirstEchoPhaseRefinement.h"
+#include "SecondEchoOnlyTracker.h"
+#include "SecondEchoSearchWindow.h"
+#include "EchoPairTracker.h"
+#include "RawPhaseBranchTracker.h"
+#include "WeakRawTemporalTracker.h"
+#include "RecoveryTemporalConfirmTracker.h"
 
 #include <QString>
 #include <QStringList>
@@ -86,6 +92,10 @@ struct TestParameters
     // 当前代码计算理论位置时还叠加固定 CURRENT_FIXED_BIAS_MM = 1.1 mm。
     // 改它会“移动搜索窗”，不是改变信号强弱阈值。
     double thicknessStdMm = 5.6;
+    double echoPairBiasMm = 0.425577;
+    // 仅T2-only模式开启测试程序同源的Independent EchoPair身份证据链；
+    // T1-only保持原算法路径与性能不变。
+    bool enableT2OnlyIndependentPairEvidence = false;
 
     // 厚度参考容差 [mm]：保留用于界面显示/评价兼容，不参与 measurementStatus 判废。
     // 只要寻峰、波包、SNR、跟踪等算法质量判据通过，就输出实际计算厚度。
@@ -5087,6 +5097,60 @@ void fft(std::vector<std::complex<double>> &a)
     }
 }
 
+std::vector<double> secondEchoOnlyHilbertEnvelope(const std::vector<double> &signal)
+{
+    const int n = static_cast<int>(signal.size());
+    if (n < 3)
+        return {};
+
+    // 与LSTAlgorithmTest的T2-only候选生成完全一致：镜像扩展 + FFT Hilbert。
+    const int extendedCount = 3 * n;
+    const int fftCount = nextPowerOfTwo(extendedCount);
+    std::vector<std::complex<double>> spectrum(
+        static_cast<size_t>(fftCount), std::complex<double>(0.0, 0.0));
+    for (int i = 0; i < n; ++i) {
+        spectrum[static_cast<size_t>(i)] = signal[static_cast<size_t>(n - 1 - i)];
+        spectrum[static_cast<size_t>(n + i)] = signal[static_cast<size_t>(i)];
+        spectrum[static_cast<size_t>(2 * n + i)] = signal[static_cast<size_t>(n - 1 - i)];
+    }
+
+    fft(spectrum);
+    const int half = fftCount / 2;
+    for (int k = 1; k < half; ++k)
+        spectrum[static_cast<size_t>(k)] *= 2.0;
+    for (int k = half + 1; k < fftCount; ++k)
+        spectrum[static_cast<size_t>(k)] = std::complex<double>(0.0, 0.0);
+
+    for (auto &v : spectrum)
+        v = std::conj(v);
+    fft(spectrum);
+    for (auto &v : spectrum)
+        v = std::conj(v) / static_cast<double>(fftCount);
+
+    std::vector<double> envelope(static_cast<size_t>(n), 0.0);
+    for (int i = 0; i < n; ++i)
+        envelope[static_cast<size_t>(i)] =
+            std::abs(spectrum[static_cast<size_t>(n + i)]);
+    return envelope;
+}
+
+void secondEchoOnlySmoothThreePoint(
+    const std::vector<double> &source,
+    std::vector<double> &dest)
+{
+    dest.resize(source.size());
+    if (source.empty())
+        return;
+    for (int i = 0; i < static_cast<int>(source.size()); ++i) {
+        const int left = std::max(0, i - 1);
+        const int right = std::min(static_cast<int>(source.size()) - 1, i + 1);
+        double sum = 0.0;
+        for (int j = left; j <= right; ++j)
+            sum += source[static_cast<size_t>(j)];
+        dest[static_cast<size_t>(i)] = sum / (right - left + 1);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // 最终高精度TOF输出层：Hilbert包络 + 宽packet二次分解 + t50 + Envelope NCC
 // + LeadingEdge三证据质量判别。该层只接管最终厚度，不改变上面的候选检测、LOCK/LOST
@@ -5189,6 +5253,11 @@ struct HighPrecisionHistory
     // Envelope-NCC约束下的Raw carrier phase独立旁路。只学习raw-envelope残差，
     // 不写PeakHistory/Prediction/模板/FinalPrimary。
     FirstEchoRawPhaseTracker firstEchoRawPhaseTracker;
+    // 与测试程序保持逐帧一致的 Independent EchoPair 身份链。
+    EchoPairTracker echoPairTracker;
+    WeakRawTemporalTracker weakRawTemporalTracker;
+    RawPhaseBranchTracker rawPhaseBranchTracker;
+    RecoveryTemporalConfirmTracker recoveryTemporalTracker;
 
     void prepare(int count)
     {
@@ -5198,6 +5267,10 @@ struct HighPrecisionHistory
             echoAbsoluteResidualHistory.clear();
             packetInternalDelayHistory.clear();
             firstEchoRawPhaseTracker.reset();
+            echoPairTracker.reset();
+            weakRawTemporalTracker.reset();
+            rawPhaseBranchTracker.reset();
+            recoveryTemporalTracker.reset();
         }
         sampleCount = count;
     }
@@ -5258,11 +5331,106 @@ struct HighPrecisionDecision
     double cfd30TofIndex = NaN;
     double leadingEdgeFitTofIndex = NaN;
     double energyMedianT50Index = NaN;
+    int componentLeftIndex = -1;
+    int componentRightIndex = -1;
     double envelopeNccTofIndex = NaN;
     double envelopeNccCorrelation = NaN;
     double nccT50DeltaSamples = NaN;
     double echoChainPeriodDifferenceSamples = NaN;
     double echoChainResidualDeviationMm = NaN;
+    // Independent EchoPair identity/evidence mirror from LSTAlgorithmTest.
+    double independentEchoPairFirstTofIndex = NaN;
+    double independentEchoPairSecondTofIndex = NaN;
+    double independentEchoPairThirdTofIndex = NaN;
+    double independentEchoPairDifferentialTofSamples = NaN;
+    double independentEchoPairCorrelation12 = NaN;
+    double independentEchoPairCorrelation23 = NaN;
+    double independentEchoPairCorrelation13 = NaN;
+    double independentEchoPairEnergyRatio2 = NaN;
+    double independentEchoPairEnergyRatio3 = NaN;
+    int independentEchoPairCandidateCount = 0;
+    bool independentEchoPairChainCertified = false;
+    QString independentEchoPairStatus;
+    QString independentEchoPairCandidateSummary;
+    double independentEchoPairThicknessMm = NaN;
+    bool independentEchoPairPeriodModelReady = false;
+    double independentEchoPairPredictedPeriodSamples = NaN;
+    double independentEchoPairPeriodResidualSamples = NaN;
+    int independentEchoPairPeriodHistoryCount = 0;
+    int independentEchoPairHarmonicSupportCount = 0;
+    QString independentEchoPairSelectionPolicy;
+    QString independentEchoPairTrackerStage;
+    int independentEchoPairSearchHalfWidthSamples = 0;
+    double independentEchoPairFrozenPreviousPeriodSamples = NaN;
+    bool independentEchoPairReacquiringFromFrozenPeriod = false;
+    QString independentEchoPairGlobalIdentityPolicy;
+    int independentEchoPairStartupClusterFramesObserved = 0;
+    int independentEchoPairStartupClusterVotes = 0;
+    int independentEchoPairStartupClusterPeriodicVotes = 0;
+    int independentEchoPairStartupClusterCount = 0;
+    double independentEchoPairStartupConsensusPeriodSamples = NaN;
+    double independentEchoPairStartupConsensusMeanScore = NaN;
+    double independentEchoPairEnvelopeLagSamples = NaN;
+    double independentEchoPairEnvelopeCorrelation = NaN;
+    double independentEchoPairEnvelopeMargin = NaN;
+    double independentEchoPairRawCorrelation = NaN;
+    double independentEchoPairRawAbsCorrelation = NaN;
+    bool independentEchoPairRawPhaseBranchModelReady = false;
+    int independentEchoPairRawPhaseBranchHistoryCount = 0;
+    int independentEchoPairRawPhaseBranchIndex = 0;
+    double independentEchoPairRawPhaseCarrierPeriodSamples = NaN;
+    int independentEchoPairRawPhaseBestAnyBranchIndex = 0;
+    double independentEchoPairRawPhaseBranchCenterResidualSamples = NaN;
+    bool independentEchoPairRawPhaseBranchEvaluated = false;
+    bool independentEchoPairRawPhaseBranchSelectionApplied = false;
+    bool independentEchoPairRawPhaseBranchMismatch = false;
+    double independentEchoPairRawPhaseBranchSelectedResidualSamples = NaN;
+    double independentEchoPairRawPhaseBranchResidualErrorSamples = NaN;
+    double independentEchoPairRawPhaseBranchBestAnyResidualSamples = NaN;
+    // LOCK旁路诊断：不参与正式Echo Pair输出，只用于区分“Echo2物理弱/不存在”与
+    // “原Hilbert包络形态不稳”。OriginalUngated取消最低能量门；LocalEnergy使用
+    // 带通信号9点局部RMS；EnhancedEnergy在LocalEnergy上再平滑一次。
+    double independentEchoPairDiagnosticOriginalLagSamples = NaN;
+    double independentEchoPairDiagnosticOriginalCorrelation = NaN;
+    double independentEchoPairDiagnosticOriginalEnergyRatio = NaN;
+    double independentEchoPairDiagnosticOriginalMaxEnergyRatio = NaN;
+    double independentEchoPairDiagnosticLocalEnergyLagSamples = NaN;
+    double independentEchoPairDiagnosticLocalEnergyCorrelation = NaN;
+    double independentEchoPairDiagnosticLocalEnergyRatio = NaN;
+    double independentEchoPairDiagnosticEnhancedLagSamples = NaN;
+    double independentEchoPairDiagnosticEnhancedCorrelation = NaN;
+    double independentEchoPairDiagnosticEnhancedEnergyRatio = NaN;
+    double independentEchoPairDiagnosticEnhancedRawLagSamples = NaN;
+    double independentEchoPairDiagnosticEnhancedRawAbsCorrelation = NaN;
+    double independentEchoPairDiagnosticEnhancedRawResidualSamples = NaN;
+    // 直接局部匹配滤波旁路：不依赖Envelope候选，在预测窗内扫描Echo1与后续
+    // 带通信号的归一化互相关，只作诊断；用于判断“包络不可见但载波波形仍存在”。
+    double independentEchoPairDiagnosticMatchedRawLagSamples = NaN;
+    double independentEchoPairDiagnosticMatchedRawAbsCorrelation = NaN;
+    double independentEchoPairDiagnosticMatchedRawSecondLagSamples = NaN;
+    double independentEchoPairDiagnosticMatchedRawSecondAbsCorrelation = NaN;
+    double independentEchoPairDiagnosticMatchedRawSecondEnergyRatio = NaN;
+    double independentEchoPairDiagnosticMatchedRawMargin = NaN;
+    double independentEchoPairDiagnosticMatchedRawEnergyRatio = NaN;
+    QString independentEchoPairWeakRawTemporalState;
+    int independentEchoPairWeakRawTemporalCount = 0;
+    int independentEchoPairWeakRawTemporalRequiredFrames = 0;
+    int independentEchoPairWeakRawTemporalSelectedRank = 0;
+    double independentEchoPairWeakRawTemporalSelectedLagSamples = NaN;
+    double independentEchoPairWeakRawTemporalSelectedCorrelation = NaN;
+    double independentEchoPairWeakRawTemporalSelectedEnergyRatio = NaN;
+    double independentEchoPairWeakRawTemporalPendingCenterSamples = NaN;
+    bool independentEchoPairWeakRawTemporalConfirmed = false;
+    double independentEchoPairDiagnosticSubband10To30LagSamples = NaN;
+    double independentEchoPairDiagnosticSubband10To30AbsCorrelation = NaN;
+    double independentEchoPairDiagnosticSubband10To30Margin = NaN;
+    double independentEchoPairDiagnosticSubband18To30LagSamples = NaN;
+    double independentEchoPairDiagnosticSubband18To30AbsCorrelation = NaN;
+    double independentEchoPairDiagnosticSubband18To30Margin = NaN;
+    bool independentEchoPairEcho3ValidationAvailable = false;
+    double independentEchoPairEcho3PeriodDifferenceSamples = NaN;
+    double independentEchoPairProcessingMs = NaN;
+
     // FirstEcho Raw phase只读旁路；最终是否用于正式输出由FinalPrimary之后的
     // FirstEchoPhaseRefinement独立决定。
     double firstEchoRawPhaseTofIndex = NaN;
@@ -6154,6 +6322,8 @@ HighPrecisionDecision computeHighPrecisionDecision(
         }
     }
     decision.energyMedianT50Index = t50;
+    decision.componentLeftIndex = componentLeft;
+    decision.componentRightIndex = componentRight;
     decision.leadingEdgeFitTofIndex = leadingTof;
 
     // Envelope NCC：整个当前packet内自由搜索，三点抛物线亚采样，不使用历史绝对位置门。
@@ -6358,6 +6528,15 @@ HighPrecisionDecision computeHighPrecisionDecision(
                 }
             }
         }
+    }
+
+    if (p.enableT2OnlyIndependentPairEvidence) {
+        if (history)
+            history->recoveryTemporalTracker.beginFrame();
+#include "IndependentEchoPairEvidence_part1.inc"
+#include "IndependentEchoPairEvidence_part2.inc"
+#include "IndependentEchoPairEvidence_part3.inc"
+#include "IndependentEchoPairEvidence_part4.inc"
     }
 
     const bool hasNcc = std::isfinite(nccTof);
@@ -7474,6 +7653,11 @@ struct ThicknessProcessor::Impl
     PeakHistory history;
     AlgorithmWorkspace workspace;
     HighPrecisionHistory highPrecisionHistory;
+    SecondEchoOnlyTracker secondEchoOnlyTracker;
+    EchoPairTracker secondEchoPeriodTracker;
+    RawPhaseBranchTracker secondEchoRawPhaseTracker;
+    WeakRawTemporalTracker secondEchoWeakRawTemporalTracker;
+    RecoveryTemporalConfirmTracker secondEchoRecoveryTemporalTracker;
     StartupProvisionalState startupProvisional;
     IdentityHypothesis::Chain identityHypothesis;
     FinalPrimary::DecisionEngine finalPrimary;
@@ -7532,6 +7716,8 @@ ThicknessResult ThicknessProcessor::process(
     p.highFreqMHz = highFreqMHz;
     p.filterOrder = filterOrder;
     p.thicknessStdMm = thicknessStdMm;
+    p.echoPairBiasMm = parameters.echoPairBiasMm;
+    p.enableT2OnlyIndependentPairEvidence = parameters.echoMode == ThicknessEchoMode::T2Only;
     p.thicknessToleranceMm = thicknessToleranceMm;
     p.structLen = structLen;
     p.minWidth = minWidth;
@@ -7646,6 +7832,11 @@ ThicknessResult ThicknessProcessor::process(
         m_impl->history.resetAll();
         m_impl->workspace = AlgorithmWorkspace{};
         m_impl->highPrecisionHistory = HighPrecisionHistory{};
+        m_impl->secondEchoOnlyTracker.reset();
+        m_impl->secondEchoPeriodTracker.reset();
+        m_impl->secondEchoRawPhaseTracker.reset();
+        m_impl->secondEchoWeakRawTemporalTracker.reset();
+        m_impl->secondEchoRecoveryTemporalTracker.reset();
         m_impl->startupProvisional.reset();
         m_impl->highPrecisionDecisionHistory.clear();
         m_impl->identityHypothesis = IdentityHypothesis::Chain{};
@@ -7673,9 +7864,16 @@ ThicknessResult ThicknessProcessor::process(
     m_impl->highPrecisionHistory.prepare(static_cast<int>(raw.size()));
     const PredictionGate prediction = m_impl->history.predict(p);
 
+    // T2-only离线回归/实时路径都需要同一份带通信号做独立T2候选发现。
+    // 调用方不需要滤波输出时（如IndustrialAlgorithmFileTest），内部保留一份临时结果。
+    std::vector<double> t2FilteredLocal;
+    std::vector<double> *algorithmFilteredOut = filteredOut;
+    if (parameters.echoMode == ThicknessEchoMode::T2Only && !algorithmFilteredOut)
+        algorithmFilteredOut = &t2FilteredLocal;
+
     // 测厚、界面显示和逐帧保存共用同源核心生成的唯一滤波结果。
     WaveformResult waveform = runCurrentWaveformAlgorithm(
-        raw, p, filteredOut, prediction, &m_impl->workspace);
+        raw, p, algorithmFilteredOut, prediction, &m_impl->workspace);
 
     // FirstEcho冷启动多候选：只生成当前帧output-only候选，不提前改写PeakHistory。
     // 旧provisional/PeakHistory会在下面完整按原逻辑推进；只有旧结果仍无效时，
@@ -7961,6 +8159,19 @@ ThicknessResult ThicknessProcessor::process(
     if ((startupEnvelopeConfirmed || startupHypothesisOutputApplied)
         && std::isfinite(waveform.interpolatedPeakIndex)
         && std::isfinite(waveform.thicknessMm)) {
+        if (p.enableT2OnlyIndependentPairEvidence) {
+            // 与测试程序一致：启动恢复帧仍运行一次高精度诊断，使Independent Pair
+            // 的GLOBAL/WARMUP/LOCK节奏不因T1 output-only启动分支而丢帧。
+            // 诊断波形显式标INVALID，避免训练正式FirstEcho模板；新的2-of-3路径
+            // 进一步传nullptr，保持其完全只读语义。
+            WaveformResult diagnosticWaveform = waveform;
+            diagnosticWaveform.measurementStatus = QStringLiteral("INVALID");
+            diagnosticWaveform.thicknessMm = NaN;
+            HighPrecisionHistory *diagnosticHistory = startupHypothesisOutputApplied
+                ? nullptr : &m_impl->highPrecisionHistory;
+            highPrecision = computeHighPrecisionDecision(
+                m_impl->workspace.filtered, diagnosticWaveform, p, diagnosticHistory);
+        }
         highPrecision.allowed = true;
         highPrecision.usedMainFallback = false;
         highPrecision.tofIndex = waveform.interpolatedPeakIndex;
@@ -8403,6 +8614,550 @@ ThicknessResult ThicknessProcessor::process(
         m_impl->history.clock, result.valid, waveform.peakVoltage, waveform.snrDb});
     while (m_impl->candidateOutputHistory.size() > 32)
         m_impl->candidateOutputHistory.pop_front();
+
+    // 在任何T2覆盖发生前冻结当前FirstEcho正式输出；这与测试程序
+    // firstEchoFormalTofSamples（模式路由前的FirstEcho结果）语义一致。
+    const double formalT1ForT2Only = result.valid && std::isfinite(result.peakTimeSec)
+        ? result.peakTimeSec * p.sampleRateHz : NaN;
+
+    // ---------------------------------------------------------------------
+    // T2-only最终发布分支
+    // ---------------------------------------------------------------------
+    // T1-only保持上述正式链完全不变。T2-only只在所有T1历史/模板/FinalPrimary更新
+    // 完成之后覆盖当前发布值，不回写任何T1状态。DeltaT/echo period仅作为身份佐证，
+    // 最终厚度严格由T2 absolute ordinal公式计算。
+    if (parameters.echoMode == ThicknessEchoMode::T2Only) {
+        const std::vector<double> &t2Filtered =
+            filteredOut ? *filteredOut : t2FilteredLocal;
+
+        SecondEchoOnlyTracker::Frame t2Frame;
+        SecondEchoSearchWindow::Config windowConfig;
+        windowConfig.sampleRateHz = p.sampleRateHz;
+        windowConfig.longitudinalVelocityMps = p.longitudinalVelocityMps;
+        windowConfig.delayCount = p.delayCount;
+        windowConfig.firstEchoBiasMm = CURRENT_FIXED_BIAS_MM;
+        windowConfig.deltaTBiasMm = parameters.echoPairBiasMm;
+        windowConfig.t2CorrectionMm = parameters.secondEchoOrdinalCorrectionMm;
+        windowConfig.referenceThicknessMm = p.thicknessStdMm;
+        windowConfig.modeUpperThicknessMm = 15.0;
+        windowConfig.packetMaxWidth = p.packetMaxWidth;
+        windowConfig.predictionHalfWidth = p.predictionHalfWidth;
+        windowConfig.filterOrder = p.filterOrder;
+        const auto t2Window = SecondEchoSearchWindow::calculate(windowConfig);
+
+        if (t2Window.valid && !t2Filtered.empty()
+            && std::isfinite(waveform.noiseEnergy) && waveform.noiseEnergy > 0.0) {
+            t2Frame.referenceTofSamples = t2Window.referenceTofSamples;
+
+            const double mmPerSampleT2 = p.longitudinalVelocityMps
+                / p.sampleRateHz * 0.5 * 1000.0;
+            const double sequenceOrigin = -static_cast<double>(p.delayCount)
+                + (CURRENT_FIXED_BIAS_MM - parameters.echoPairBiasMm) / mmPerSampleT2;
+            if (std::isfinite(sequenceOrigin))
+                t2Frame.referencePeriodSamples =
+                    0.5 * (t2Frame.referenceTofSamples - sequenceOrigin);
+
+            const int n = static_cast<int>(t2Filtered.size());
+            const int energyHalf = std::max(1, p.energyWindowSamples / 2);
+            const int left = std::clamp(
+                t2Window.requestedLeftIndex, energyHalf, n - 1 - energyHalf);
+            const int right = std::clamp(
+                t2Window.requestedRightIndex, left, n - 1 - energyHalf);
+            const int candidateLeft = std::clamp(
+                static_cast<int>(std::ceil(t2Window.minTofSamples)), left, right);
+            const int candidateRight = std::clamp(
+                static_cast<int>(std::floor(t2Window.maxTofSamples)), candidateLeft, right);
+
+            struct T2Peak {
+                int index = -1;
+                double tof = NaN;
+                double envelope = 0.0;
+                double snr = NaN;
+            };
+
+            std::vector<T2Peak> peaks;
+            std::vector<double> t2Envelope;
+            if (candidateRight > candidateLeft + 2) {
+                const std::vector<double> rawT2Envelope =
+                    secondEchoOnlyHilbertEnvelope(t2Filtered);
+                secondEchoOnlySmoothThreePoint(rawT2Envelope, t2Envelope);
+            }
+            if (candidateRight > candidateLeft + 2
+                && t2Envelope.size() == t2Filtered.size()) {
+                peaks.reserve(static_cast<size_t>(candidateRight - candidateLeft + 1) / 8 + 1);
+                for (int i = candidateLeft + 1; i < candidateRight; ++i) {
+                    const double ym = t2Envelope[static_cast<size_t>(i - 1)];
+                    const double y0 = t2Envelope[static_cast<size_t>(i)];
+                    const double yp = t2Envelope[static_cast<size_t>(i + 1)];
+                    if (!(y0 >= ym && y0 >= yp) || y0 <= 1e-24)
+                        continue;
+
+                    const double energy = localEnergy(t2Filtered, i, energyHalf);
+                    const double snr = energySnrDb(energy, waveform.noiseEnergy);
+                    if (!std::isfinite(snr) || snr < std::max(2.5, p.echoMinSnrDb))
+                        continue;
+
+                    const int t50Half = std::clamp(p.packetMaxWidth / 4, 12, 24);
+                    const int supportLeft = std::max(left, i - t50Half);
+                    const int supportRight = std::min(right, i + t50Half);
+                    double total = 0.0;
+                    for (int j = supportLeft; j <= supportRight; ++j) {
+                        const double e = t2Envelope[static_cast<size_t>(j)];
+                        total += e * e;
+                    }
+
+                    double tof = static_cast<double>(i);
+                    if (total > 1e-24) {
+                        const double target = 0.5 * total;
+                        double cumulative = 0.0;
+                        for (int j = supportLeft; j <= supportRight; ++j) {
+                            const double e = t2Envelope[static_cast<size_t>(j)];
+                            const double w = e * e;
+                            if (cumulative + w >= target) {
+                                const double fraction = w > 1e-24
+                                    ? std::clamp((target - cumulative) / w, 0.0, 1.0)
+                                    : 0.5;
+                                tof = static_cast<double>(j) - 0.5 + fraction;
+                                break;
+                            }
+                            cumulative += w;
+                        }
+                    }
+                    peaks.push_back({i, tof, y0, snr});
+                }
+            }
+
+            std::sort(peaks.begin(), peaks.end(), [](const T2Peak &a, const T2Peak &b) {
+                if (std::abs(a.envelope - b.envelope) > 1e-24)
+                    return a.envelope > b.envelope;
+                return a.index < b.index;
+            });
+
+            const int separation = std::max(
+                p.candidateSeparationSamples, std::max(8, p.packetMinWidth));
+            constexpr int topK = 8;
+            std::vector<T2Peak> selected;
+            for (const auto &peak : peaks) {
+                bool separated = true;
+                for (const auto &kept : selected) {
+                    if (std::abs(peak.tof - kept.tof) < separation) {
+                        separated = false;
+                        break;
+                    }
+                }
+                if (!separated)
+                    continue;
+                selected.push_back(peak);
+                if (static_cast<int>(selected.size()) >= topK)
+                    break;
+            }
+
+            result.t2OnlyCandidateCount = static_cast<int>(selected.size());
+            QStringList t2CandidateSummary;
+            t2Frame.candidates.reserve(selected.size());
+            constexpr int templateHalf = 20;
+            for (int rank = 0; rank < static_cast<int>(selected.size()); ++rank) {
+                const auto &peak = selected[static_cast<size_t>(rank)];
+                SecondEchoOnlyTracker::Candidate candidate;
+                candidate.tofSamples = peak.tof;
+                candidate.snrDb = peak.snr;
+                candidate.score = peak.snr / 10.0;
+                candidate.rank = rank;
+                candidate.envelopeTemplate.reserve(2 * templateHalf + 1);
+                const int center = static_cast<int>(std::llround(peak.tof));
+                for (int j = center - templateHalf; j <= center + templateHalf; ++j) {
+                    candidate.envelopeTemplate.push_back(
+                        j >= 0 && j < static_cast<int>(t2Envelope.size())
+                            ? t2Envelope[static_cast<size_t>(j)] : 0.0);
+                }
+                t2CandidateSummary << QStringLiteral("%1:%2:%3")
+                    .arg(peak.tof, 0, 'f', 6)
+                    .arg(peak.snr, 0, 'f', 3)
+                    .arg(rank);
+                t2Frame.candidates.push_back(std::move(candidate));
+            }
+            result.t2OnlyCandidateSummary = t2CandidateSummary.join(QLatin1Char('|'));
+
+            // 当前帧Independent T1->T2 period evidence，使用与测试程序相同的
+            // HighPrecision物理component，而不是围绕最终T1固定41点相关。
+            // 与测试程序 firstEchoFormalTofSamples 语义一致：T2身份佐证读取
+            // FinalPrimary 的formal T1锚，而不是依赖该T1本帧最终是否发布。T2-only
+            // 自己的valid状态绝不能反向抹掉可用的T1 ordinal证据。
+            // 与测试程序 firstEchoFormalTofSamples 对齐：正常情况下只有
+            // FinalPrimary 正式发布的T1才可作为T2 ordinal anchor。
+            t2Frame.formalT1TofSamples = result.finalPrimaryShadowValid
+                && result.valid && std::isfinite(result.peakTimeSec)
+                ? result.peakTimeSec * p.sampleRateHz : NaN;
+            const auto periodPlan = m_impl->secondEchoPeriodTracker.plan();
+            const auto &pairEnvelope = m_impl->highPrecisionHistory.hilbertCorrected;
+            const int firstLeft = highPrecision.componentLeftIndex;
+            const int firstRight = highPrecision.componentRightIndex;
+            const int firstCount = firstRight >= firstLeft ? firstRight - firstLeft + 1 : 0;
+            const int pairN = static_cast<int>(t2Filtered.size());
+            const int independentGap = std::max(
+                p.candidateSeparationSamples,
+                firstCount + std::max(1, p.packetMergeGap));
+            const int lagLeft = std::max(1, independentGap);
+            const int lagRight = firstRight >= 0 ? pairN - firstRight - 1 : -1;
+            const double minEcho2EnergyRatio = std::max(0.001, p.echoMinRelativeEnergy);
+
+            struct PairMatch {
+                bool available = false;
+                double lag = NaN;
+                double correlation = NaN;
+                double absoluteCorrelation = NaN;
+                double energyRatio = NaN;
+            };
+
+            double firstEnergy = 0.0;
+            if (firstCount >= 8
+                && static_cast<int>(pairEnvelope.size()) == pairN
+                && firstLeft >= 0 && firstRight < pairN) {
+                for (int i = firstLeft; i <= firstRight; ++i) {
+                    const double v = pairEnvelope[static_cast<size_t>(i)];
+                    firstEnergy += v * v;
+                }
+            }
+
+            auto searchEnvelopeLag = [&](int searchLeft, int searchRight) {
+                PairMatch out;
+                if (!(firstEnergy > 1e-24) || firstCount < 8)
+                    return out;
+                searchLeft = std::max(lagLeft, searchLeft);
+                searchRight = std::min(lagRight, searchRight);
+                if (searchLeft > searchRight)
+                    return out;
+
+                struct Sample { int lag; double rho; double ratio; };
+                std::vector<Sample> samples;
+                samples.reserve(static_cast<size_t>(searchRight - searchLeft + 1));
+                for (int lag = searchLeft; lag <= searchRight; ++lag) {
+                    const int secondLeft = firstLeft + lag;
+                    double energy2 = 0.0;
+                    for (int k = 0; k < firstCount; ++k) {
+                        const double v = pairEnvelope[static_cast<size_t>(secondLeft + k)];
+                        energy2 += v * v;
+                    }
+                    const double ratio = energy2 / firstEnergy;
+                    double rho = -1.0;
+                    if (ratio >= minEcho2EnergyRatio) {
+                        const double value = packetCorrelation(
+                            pairEnvelope.data() + firstLeft,
+                            pairEnvelope.data() + secondLeft,
+                            static_cast<size_t>(firstCount));
+                        if (std::isfinite(value))
+                            rho = value;
+                    }
+                    samples.push_back({lag, rho, ratio});
+                }
+                if (samples.empty())
+                    return out;
+                const auto best = std::max_element(
+                    samples.begin(), samples.end(),
+                    [](const Sample &a, const Sample &b) { return a.rho < b.rho; });
+                if (best == samples.end() || !std::isfinite(best->rho) || best->rho <= 0.0)
+                    return out;
+                const int bi = static_cast<int>(std::distance(samples.begin(), best));
+                double delta = 0.0;
+                if (bi > 0 && bi + 1 < static_cast<int>(samples.size())) {
+                    const double ym = samples[static_cast<size_t>(bi - 1)].rho;
+                    const double y0 = best->rho;
+                    const double yp = samples[static_cast<size_t>(bi + 1)].rho;
+                    const double curvature = ym - 2.0 * y0 + yp;
+                    if (std::isfinite(curvature) && curvature < -1e-12)
+                        delta = std::clamp(0.5 * (ym - yp) / curvature, -0.5, 0.5);
+                }
+                out.available = true;
+                out.lag = best->lag + delta;
+                out.correlation = best->rho;
+                out.absoluteCorrelation = std::abs(best->rho);
+                out.energyRatio = best->ratio;
+                return out;
+            };
+
+            auto refineRawLag = [&](double envelopeLag, double preferredLag) {
+                PairMatch out;
+                if (!std::isfinite(envelopeLag) || firstCount < 8)
+                    return out;
+                const double centerValue = std::isfinite(preferredLag)
+                    ? preferredLag : envelopeLag;
+                const int centerLag = static_cast<int>(std::llround(centerValue));
+                constexpr int rawHalfWidth = 3;
+                constexpr int envelopeHalfWidth = 4;
+                const int rawLeft = std::max({
+                    lagLeft, centerLag - rawHalfWidth,
+                    static_cast<int>(std::floor(envelopeLag - envelopeHalfWidth))});
+                const int rawRight = std::min({
+                    lagRight, centerLag + rawHalfWidth,
+                    static_cast<int>(std::ceil(envelopeLag + envelopeHalfWidth))});
+                if (rawLeft > rawRight)
+                    return out;
+                struct Sample { int lag; double rho; double score; };
+                std::vector<Sample> samples;
+                for (int lag = rawLeft; lag <= rawRight; ++lag) {
+                    const double rho = packetCorrelation(
+                        t2Filtered.data() + firstLeft,
+                        t2Filtered.data() + firstLeft + lag,
+                        static_cast<size_t>(firstCount));
+                    if (std::isfinite(rho))
+                        samples.push_back({lag, rho, std::abs(rho)});
+                }
+                if (samples.empty())
+                    return out;
+                const auto best = std::max_element(
+                    samples.begin(), samples.end(),
+                    [](const Sample &a, const Sample &b) { return a.score < b.score; });
+                const int bi = static_cast<int>(std::distance(samples.begin(), best));
+                double delta = 0.0;
+                if (bi > 0 && bi + 1 < static_cast<int>(samples.size())) {
+                    const double ym = samples[static_cast<size_t>(bi - 1)].score;
+                    const double y0 = best->score;
+                    const double yp = samples[static_cast<size_t>(bi + 1)].score;
+                    const double curvature = ym - 2.0 * y0 + yp;
+                    if (std::isfinite(curvature) && curvature < -1e-12)
+                        delta = std::clamp(0.5 * (ym - yp) / curvature, -0.5, 0.5);
+                }
+                out.available = true;
+                out.lag = best->lag + delta;
+                out.correlation = best->rho;
+                out.absoluteCorrelation = best->score;
+                return out;
+            };
+
+            bool periodPublished = false;
+            double publishedPeriod = NaN;
+            double identityPeriod = NaN;
+            double periodResidual = NaN;
+            double pairEnvelopeLag = NaN;
+            double pairEnvelopeCorrelation = NaN;
+            double pairRawAbsCorrelation = NaN;
+
+            if (firstCount >= 8 && lagRight >= lagLeft) {
+                PairMatch envelopeMatch;
+                if (!periodPlan.useGlobalSearch
+                    && std::isfinite(periodPlan.predictedPeriodSamples)) {
+                    const int center = static_cast<int>(
+                        std::llround(periodPlan.predictedPeriodSamples));
+                    envelopeMatch = searchEnvelopeLag(
+                        center - periodPlan.halfWidthSamples,
+                        center + periodPlan.halfWidthSamples);
+
+                    pairEnvelopeLag = envelopeMatch.lag;
+                    pairEnvelopeCorrelation = envelopeMatch.correlation;
+                    const bool energyAccepted = envelopeMatch.available
+                        && envelopeMatch.energyRatio >= minEcho2EnergyRatio;
+                    const bool envelopeAccepted = energyAccepted
+                        && envelopeMatch.correlation >= std::max(0.80, p.echoMinCorrelation);
+                    const bool softEnvelopeCandidate = energyAccepted
+                        && !envelopeAccepted
+                        && envelopeMatch.correlation >= std::max(0.72, p.echoMinCorrelation);
+
+                    double preferredRaw = periodPlan.predictedPeriodSamples;
+                    bool recentered = false;
+                    if (envelopeAccepted && periodPlan.halfWidthSamples > 8
+                        && std::abs(envelopeMatch.lag - periodPlan.predictedPeriodSamples) > 4.0) {
+                        preferredRaw = envelopeMatch.lag;
+                        recentered = true;
+                    }
+                    const PairMatch rawMatch =
+                        (envelopeAccepted || softEnvelopeCandidate)
+                        ? refineRawLag(envelopeMatch.lag, preferredRaw) : PairMatch{};
+                    pairRawAbsCorrelation = rawMatch.absoluteCorrelation;
+                    const bool rawAccepted = rawMatch.available
+                        && rawMatch.absoluteCorrelation >= 0.25;
+                    periodResidual = rawAccepted
+                        ? rawMatch.lag - periodPlan.predictedPeriodSamples : NaN;
+                    const bool softAccepted = softEnvelopeCandidate
+                        && rawMatch.available && rawMatch.absoluteCorrelation >= 0.85
+                        && std::isfinite(periodResidual)
+                        && std::abs(periodResidual) <= 4.0;
+
+                    const bool normalAccepted = envelopeAccepted && rawAccepted
+                        && (!recentered
+                            || (std::isfinite(periodResidual)
+                                && std::abs(periodResidual) <= 6.0));
+                    if (softAccepted || normalAccepted) {
+                        m_impl->secondEchoPeriodTracker.observeLocked(rawMatch.lag);
+                        publishedPeriod = rawMatch.lag;
+                        identityPeriod = rawMatch.lag;
+                        periodPublished = true;
+                    } else {
+                        // T2-only这里只需要回答“当前候选是不是第二回波”。扩窗时如果
+                        // Envelope物理包本身高度可信、Raw也确实存在，但Raw载波相位支路
+                        // 相对旧预测偏了6~10点，则允许Envelope周期作为ordinal身份证据；
+                        // 它不进入T2厚度公式，也不作为DeltaT精密厚度发布。
+                        const double envelopeResidual = envelopeMatch.available
+                            && std::isfinite(periodPlan.predictedPeriodSamples)
+                            ? envelopeMatch.lag - periodPlan.predictedPeriodSamples : NaN;
+                        const bool envelopeIdentityAccepted = envelopeAccepted
+                            && rawMatch.available && rawMatch.absoluteCorrelation >= 0.25
+                            && std::isfinite(envelopeResidual)
+                            && std::abs(envelopeResidual) <= 10.0;
+                        if (envelopeIdentityAccepted)
+                            identityPeriod = envelopeMatch.lag;
+                        m_impl->secondEchoPeriodTracker.observeMiss();
+                    }
+                } else {
+                    // GLOBAL/WARMUP：在参考/frozen fundamental族内发现当前Echo2，
+                    // 两个一致物理帧后才建立LOCK并向T2 tracker提供period证据。
+                    double center = t2Frame.referencePeriodSamples;
+                    double gate = 96.0;
+                    if (std::isfinite(periodPlan.frozenPreviousPeriodSamples)) {
+                        center = periodPlan.frozenPreviousPeriodSamples;
+                        gate = std::max(14.0, 0.05 * std::abs(center));
+                    }
+                    const int gl = std::isfinite(center)
+                        ? static_cast<int>(std::floor(center - gate)) : lagLeft;
+                    const int gr = std::isfinite(center)
+                        ? static_cast<int>(std::ceil(center + gate)) : lagRight;
+                    envelopeMatch = searchEnvelopeLag(gl, gr);
+                    pairEnvelopeLag = envelopeMatch.lag;
+                    pairEnvelopeCorrelation = envelopeMatch.correlation;
+                    const bool envelopeAccepted = envelopeMatch.available
+                        && envelopeMatch.energyRatio >= minEcho2EnergyRatio
+                        && envelopeMatch.correlation >= std::max(0.80, p.echoMinCorrelation);
+                    const PairMatch rawMatch = envelopeAccepted
+                        ? refineRawLag(envelopeMatch.lag, NaN) : PairMatch{};
+                    pairRawAbsCorrelation = rawMatch.absoluteCorrelation;
+                    const bool measurementReady = envelopeAccepted
+                        && rawMatch.available && rawMatch.absoluteCorrelation >= 0.25;
+                    if (measurementReady) {
+                        periodPublished =
+                            m_impl->secondEchoPeriodTracker.observeGlobalCandidate(rawMatch.lag, 2);
+                        if (periodPublished) {
+                            publishedPeriod = rawMatch.lag;
+                            identityPeriod = rawMatch.lag;
+                        }
+                    } else {
+                        m_impl->secondEchoPeriodTracker.observeMiss();
+                    }
+                }
+            } else {
+                m_impl->secondEchoPeriodTracker.observeMiss();
+            }
+
+            const bool trackerLocked =
+                m_impl->secondEchoPeriodTracker.stage() == EchoPairTracker::Stage::Locked;
+            const bool periodIdentityTrusted = trackerLocked
+                && std::isfinite(identityPeriod)
+                && (!periodPublished || !std::isfinite(periodResidual)
+                    || std::abs(periodResidual) <= 10.0);
+            t2Frame.periodEvidenceAvailable = periodIdentityTrusted;
+            t2Frame.periodSamples = periodIdentityTrusted ? identityPeriod : NaN;
+            result.t2OnlyPairStage = QString::fromLatin1(
+                EchoPairTracker::stageName(periodPlan.stage));
+            result.t2OnlyPairPredictedPeriod = periodPlan.predictedPeriodSamples;
+            result.t2OnlyPairSearchHalfWidth = periodPlan.halfWidthSamples;
+            result.t2OnlyPairEnvelopeCorrelation = pairEnvelopeCorrelation;
+            result.t2OnlyPairRawAbsCorrelation = pairRawAbsCorrelation;
+            result.t2OnlyPairResidualSamples = periodResidual;
+            result.t2OnlyPairPublished = periodPublished;
+        }
+
+        // 最终给T2 tracker的身份证据严格使用与测试程序同源的Independent EchoPair镜像链。
+        // 上方旧简化Pair只保留作过渡诊断，不影响最终T2身份输入。
+        {
+            const double pairT1 = highPrecision.independentEchoPairFirstTofIndex;
+            const double pairT2 = highPrecision.independentEchoPairSecondTofIndex;
+            const double pairT3 = highPrecision.independentEchoPairThirdTofIndex;
+            const double d12 = std::isfinite(pairT1) && std::isfinite(pairT2)
+                ? pairT2 - pairT1
+                : highPrecision.independentEchoPairDifferentialTofSamples;
+            const double d23 = std::isfinite(pairT2) && std::isfinite(pairT3)
+                ? pairT3 - pairT2 : NaN;
+            const bool raw12Available = std::isfinite(d12) && d12 > 0.0;
+            const double raw12Residual = highPrecision.independentEchoPairPeriodResidualSamples;
+            const bool raw12IdentityTrusted = raw12Available
+                && highPrecision.independentEchoPairTrackerStage == QStringLiteral("LOCK")
+                && (!std::isfinite(raw12Residual) || std::abs(raw12Residual) <= 10.0);
+            const bool chain23Available = std::isfinite(d23) && d23 > 0.0
+                && highPrecision.independentEchoPairChainCertified
+                && std::isfinite(highPrecision.independentEchoPairCorrelation23)
+                && highPrecision.independentEchoPairCorrelation23 >= 0.80;
+
+            // 实时链无法像Batch后处理那样提前看到未来T1 backfill。只有核心已经确认
+            // “有信号但当前身份/连续性不通过”(INVALID)时，才允许LOCK中的Independent Pair
+            // 用自身T1作为ordinal anchor；NO_SIGNAL明确禁止反向制造T1证据。
+            // 该anchor只回答“这个后续包是不是T2”，绝不进入T2厚度公式。
+            if (!(std::isfinite(t2Frame.formalT1TofSamples)
+                  && t2Frame.formalT1TofSamples > 0.0)
+                && waveform.measurementStatus == QStringLiteral("INVALID")
+                && waveform.trackingState == QStringLiteral("JUMP_PENDING")
+                && m_impl->secondEchoOnlyTracker.stage() == SecondEchoOnlyTracker::Stage::Locked
+                && raw12IdentityTrusted && std::isfinite(pairT1) && pairT1 > 0.0) {
+                t2Frame.formalT1TofSamples = pairT1;
+            }
+
+            if (!(std::isfinite(t2Frame.formalT1TofSamples)
+                  && t2Frame.formalT1TofSamples > 0.0))
+                t2Frame.formalT1TofSamples = NaN;
+
+            t2Frame.periodEvidenceAvailable = raw12IdentityTrusted
+                && std::isfinite(t2Frame.formalT1TofSamples)
+                && t2Frame.formalT1TofSamples > 0.0;
+            t2Frame.periodSamples = t2Frame.periodEvidenceAvailable
+                ? d12 : (chain23Available ? d23 : NaN);
+            t2Frame.t2T3EvidenceAvailable = chain23Available;
+            t2Frame.t3TofSamples = pairT3;
+
+            result.t2OnlyPairStage = highPrecision.independentEchoPairTrackerStage;
+            result.t2OnlyPairPredictedPeriod =
+                highPrecision.independentEchoPairPredictedPeriodSamples;
+            result.t2OnlyPairSearchHalfWidth =
+                highPrecision.independentEchoPairSearchHalfWidthSamples;
+            result.t2OnlyPairEnvelopeCorrelation =
+                highPrecision.independentEchoPairEnvelopeCorrelation;
+            result.t2OnlyPairRawAbsCorrelation =
+                highPrecision.independentEchoPairRawAbsCorrelation;
+            result.t2OnlyPairResidualSamples = raw12Residual;
+            result.t2OnlyPairPublished = raw12Available;
+        }
+
+        const auto t2Decision = m_impl->secondEchoOnlyTracker.process(t2Frame);
+        result.t2OnlyStage = QString::fromLatin1(
+            SecondEchoOnlyTracker::stageName(t2Decision.stage));
+        result.t2OnlyReason = QString::fromLatin1(t2Decision.reason);
+        result.t2OnlyFormalT1CoreStatus = waveform.measurementStatus;
+        result.t2OnlyFormalT1CoreTrackingState = waveform.trackingState;
+        result.t2OnlyFormalT1TofSamples = t2Frame.formalT1TofSamples;
+        result.t2OnlyPeriodEvidenceAvailable = t2Frame.periodEvidenceAvailable;
+        result.t2OnlyPeriodSamples = t2Frame.periodSamples;
+        result.t2OnlyTofSamples = t2Decision.tofSamples;
+        result.t2OnlyTemplateCorrelation = t2Decision.templateCorrelation;
+
+        bool t2Valid = false;
+        double t2ThicknessMm = NaN;
+        if (t2Decision.available && std::isfinite(t2Decision.tofSamples)) {
+            const double k = p.longitudinalVelocityMps
+                / p.sampleRateHz * 0.5 * 1000.0;
+            if (k > 0.0) {
+                const double a = -static_cast<double>(p.delayCount)
+                    + (CURRENT_FIXED_BIAS_MM - parameters.echoPairBiasMm) / k;
+                const double d = (t2Decision.tofSamples - a) / 2.0;
+                t2ThicknessMm = k * d
+                    - parameters.echoPairBiasMm
+                    + parameters.secondEchoOrdinalCorrectionMm
+                    - parameters.secondEchoT50BiasMm;
+                t2Valid = std::isfinite(t2ThicknessMm) && t2ThicknessMm > 0.0;
+            }
+        }
+
+        // T2-only不继承T1的延迟回填；其startup/reacquire由独立T2状态机决定。
+        result.hasBackfill = false;
+        result.hasFinalPrimaryShadowBackfill = false;
+        result.valid = t2Valid;
+        result.thicknessMm = t2Valid ? t2ThicknessMm : NaN;
+        result.peakTimeSec = t2Valid ? t2Decision.tofSamples / p.sampleRateHz : NaN;
+        result.peakIndex = t2Valid
+            ? static_cast<int>(std::llround(t2Decision.tofSamples)) : -1;
+        result.snrDb = t2Valid ? t2Decision.selectedSnrDb : NaN;
+        if (t2Valid && result.peakIndex >= 0
+            && result.peakIndex < static_cast<int>(t2Filtered.size())) {
+            result.peakVoltage = t2Filtered[static_cast<size_t>(result.peakIndex)];
+        } else {
+            result.peakVoltage = NaN;
+        }
+    }
 
     return result;
 }

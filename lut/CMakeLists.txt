@@ -101,6 +101,13 @@ set(DATA_SOURCES
 set(DATA_HEADERS
     src/data/DataController.h
     src/algorithm/ThicknessProcessor.h
+    src/algorithm/EchoMeasurementModeRouter.h
+    src/algorithm/SecondEchoSearchWindow.h
+    src/algorithm/SecondEchoOnlyTracker.h
+    src/algorithm/EchoPairTracker.h
+    src/algorithm/RawPhaseBranchTracker.h
+    src/algorithm/WeakRawTemporalTracker.h
+    src/algorithm/RecoveryTemporalConfirmTracker.h
     src/algorithm/PacketSpline.h
     src/data/SimpleGraphItem.h
     src/data/ThicknessHistoryItem.h

@@ -265,6 +265,19 @@ ScrollView {
 
                     Comp.InlineParamRow {
                         Layout.fillWidth: true
+                        label: "测厚回波"
+                        editorType: "combo"
+                        editorWidth: 140
+                        comboOptions: ["T1-only", "T2-only"]
+                        comboIndex: dataController && dataController.thicknessEchoMode === "T2-only" ? 1 : 0
+                        enabled: dataController != null && !dataController.running
+                        onValueCommitted: function(value) {
+                            if (dataController) dataController.setThicknessEchoMode(value === 1 ? "T2-only" : "T1-only")
+                        }
+                    }
+
+                    Comp.InlineParamRow {
+                        Layout.fillWidth: true
                         label: "参考厚度"
                         unit: "mm"
                         editorType: "doublefield"

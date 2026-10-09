@@ -79,6 +79,7 @@ class DataController : public QObject
     Q_PROPERTY(QStringList triggerSourceList READ triggerSourceList NOTIFY triggerSourceListChanged)
     Q_PROPERTY(QStringList triggerEdgeList READ triggerEdgeList NOTIFY triggerEdgeListChanged)
     Q_PROPERTY(bool triggerSupported READ isTriggerSupported NOTIFY triggerSourceListChanged)
+    Q_PROPERTY(QString thicknessEchoMode READ thicknessEchoMode NOTIFY thicknessEchoModeChanged)
 
 public:
     explicit DataController(QObject *parent = nullptr);
@@ -139,6 +140,7 @@ public:
     QString maxThicknessText() const;
     QString minThicknessText() const;
     QString avgThicknessText() const;
+    QString thicknessEchoMode() const;
 
     Q_INVOKABLE void setAutoScale(bool enabled);
     Q_INVOKABLE void setShowOriginal(bool enabled);
@@ -161,6 +163,7 @@ public:
     Q_INVOKABLE void setStructLen(int val);
     Q_INVOKABLE void setMinWidth(int val);
     Q_INVOKABLE void setThicknessAlgorithmParameter(const QString &name, double value);
+    Q_INVOKABLE void setThicknessEchoMode(const QString &mode);
 
     // Graph data access
     Q_INVOKABLE QVector<double> getThicknessHistory() const;
@@ -185,6 +188,7 @@ signals:
     void showOriginalChanged();
     void savePerFrameChanged();
     void waveformRefreshIntervalChanged();
+    void thicknessEchoModeChanged();
 
     // Data ready signal for graph update
     void dataReady(const QVector<double> &data, int plotCount, int pointsPerChan,

@@ -186,13 +186,23 @@ int main(int argc, char* argv[])
     // 与当前LSTAlgorithmTest真实数据批处理参数一致，用于迁移后的逐帧一致性验证。
     constexpr double sampleRateHz = 160e6;
     constexpr int delayCount = 240;
-    constexpr double thicknessStdMm = 5.6;
+    const double thicknessStdMm = [] {
+        bool ok = false;
+        const double value = qEnvironmentVariable("LST_MAIN_THICKNESS_STD_MM").toDouble(&ok);
+        return ok && std::isfinite(value) && value > 0.0 ? value : 5.6;
+    }();
     constexpr int filterOrder = 50;
+    ThicknessAlgorithmParameters algorithmParameters;
+    const QString echoMode = qEnvironmentVariable("LST_MAIN_ECHO_MODE").trimmed().toLower();
+    if (echoMode == QStringLiteral("t2") || echoMode == QStringLiteral("t2-only")
+        || echoMode == QStringLiteral("second_echo")) {
+        algorithmParameters.echoMode = ThicknessEchoMode::T2Only;
+    }
 
     std::cout << std::setprecision(17);
     std::cout << "File,Valid,Thickness(mm),PeakIndex,PeakTime(us),PeakVoltage,SNR(dB),ReferenceThickness(mm),Backfilled,"
                  "ShadowValid,ShadowTOF,ShadowThickness(mm),ShadowConfidence,ShadowReason,ShadowBackfilled,"
-                 "PhaseApplied,PhaseCorrectionSamples,PhaseReason,Processing(ms)\n";
+                 "PhaseApplied,PhaseCorrectionSamples,PhaseReason,T2Stage,T2Reason,T2CoreStatus,T2CoreTracking,T2FormalT1,T2PeriodEvidence,T2Period,T2TOF,T2TemplateCorrelation,T2CandidateCount,T2CandidateSummary,T2PairStage,T2PairPredictedPeriod,T2PairHalfWidth,T2PairEnvelopeCorrelation,T2PairRawAbsCorrelation,T2PairResidual,T2PairPublished,Processing(ms)\n";
 
     int failures = 0;
     int shadowComparisonFailures = 0;
@@ -230,7 +240,7 @@ int main(int argc, char* argv[])
             1,
             ThicknessDetectionMode::Auto,
             filterOrder,
-            ThicknessAlgorithmParameters{});
+            algorithmParameters);
         const double processingMs = processTimer.nsecsElapsed() / 1e6;
         processingTimesMs.push_back(processingMs);
 
@@ -284,6 +294,24 @@ int main(int argc, char* argv[])
                   << (result.firstEchoPhaseRefinementApplied ? "true" : "false") << ','
                   << result.firstEchoPhaseRefinementCorrectionSamples << ','
                   << result.firstEchoPhaseRefinementReason.toStdString() << ','
+                  << result.t2OnlyStage.toStdString() << ','
+                  << result.t2OnlyReason.toStdString() << ','
+                  << result.t2OnlyFormalT1CoreStatus.toStdString() << ','
+                  << result.t2OnlyFormalT1CoreTrackingState.toStdString() << ','
+                  << result.t2OnlyFormalT1TofSamples << ','
+                  << (result.t2OnlyPeriodEvidenceAvailable ? "true" : "false") << ','
+                  << result.t2OnlyPeriodSamples << ','
+                  << result.t2OnlyTofSamples << ','
+                  << result.t2OnlyTemplateCorrelation << ','
+                  << result.t2OnlyCandidateCount << ','
+                  << result.t2OnlyCandidateSummary.toStdString() << ','
+                  << result.t2OnlyPairStage.toStdString() << ','
+                  << result.t2OnlyPairPredictedPeriod << ','
+                  << result.t2OnlyPairSearchHalfWidth << ','
+                  << result.t2OnlyPairEnvelopeCorrelation << ','
+                  << result.t2OnlyPairRawAbsCorrelation << ','
+                  << result.t2OnlyPairResidualSamples << ','
+                  << (result.t2OnlyPairPublished ? "true" : "false") << ','
                   << row.processingMs << '\n';
     }
 

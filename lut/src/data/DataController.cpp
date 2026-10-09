@@ -303,6 +303,13 @@ QString DataController::avgThicknessText() const
     return QString("%1 mm").arg(avg, 0, 'f', 3);
 }
 
+QString DataController::thicknessEchoMode() const
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    return m_configure.thicknessAlgorithm.echoMode == ThicknessEchoMode::T2Only
+        ? QStringLiteral("T2-only") : QStringLiteral("T1-only");
+}
+
 double DataController::avgThickness() const
 {
     if (m_thicknessCount == 0) return 0.0;
@@ -537,6 +544,27 @@ void DataController::setThicknessTolerance(double val)
 {
     std::lock_guard<std::mutex> locker(m_configMutex);
     m_configure.thicknessTolerance = val;
+}
+
+void DataController::setThicknessEchoMode(const QString &mode)
+{
+    if (m_running) {
+        emit errorOccurred(tr("请先停止采集，再切换T1/T2测厚模式。"));
+        return;
+    }
+
+    const ThicknessEchoMode next = mode.compare(QStringLiteral("T2-only"), Qt::CaseInsensitive) == 0
+        ? ThicknessEchoMode::T2Only : ThicknessEchoMode::T1Only;
+    {
+        std::lock_guard<std::mutex> locker(m_configMutex);
+        auto &p = m_configure.thicknessAlgorithm;
+        if (p.echoMode == next)
+            return;
+        p.echoMode = next;
+        ++p.revision;
+    }
+    m_thicknessProcessor.reset();
+    emit thicknessEchoModeChanged();
 }
 
 void DataController::setStructLen(int val)

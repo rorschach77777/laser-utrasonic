@@ -14,6 +14,12 @@ enum class ThicknessDetectionMode
     Valley
 };
 
+enum class ThicknessEchoMode
+{
+    T1Only,
+    T2Only
+};
+
 // 与 LSTAlgorithmTest 界面默认值一致的核心测厚参数。
 // 主程序已有的采样率、带通频率、FIR阶数、寻峰模式、参考厚度和Delay Count不在此重复。
 struct ThicknessAlgorithmParameters
@@ -84,6 +90,14 @@ struct ThicknessAlgorithmParameters
     double fitAmplitudeMaxRatio = 1.50;
     double fitMinR2 = 0.50;
 
+    // 测厚回波模式。T1Only保持当前正式算法完全不变；T2Only启用独立第二回波分支。
+    ThicknessEchoMode echoMode = ThicknessEchoMode::T1Only;
+
+    // T2-only绝对厚度标定。DeltaT只作为身份/周期证据，不参与最终厚度输出。
+    double echoPairBiasMm = 0.425577;
+    double secondEchoOrdinalCorrectionMm = 0.000320;
+    double secondEchoT50BiasMm = 0.0280164674111623;
+
     // FirstEcho最终输出层Raw carrier phase小增益修正；0表示关闭。
     // 该参数只作用于FinalPrimary之后的发布值，不回写Prediction/模板/状态机。
     double firstEchoPhaseRefinementAlpha = 0.13;
@@ -128,6 +142,26 @@ struct ThicknessResult
     QString finalPrimaryShadowReason;
 
     // FinalPrimary之后的FirstEcho Raw phase输出层微调诊断。
+    // T2-only分支只读诊断，便于主/测试程序逐帧一致性回归。
+    QString t2OnlyStage;
+    QString t2OnlyReason;
+    bool t2OnlyPeriodEvidenceAvailable = false;
+    QString t2OnlyFormalT1CoreStatus;
+    QString t2OnlyFormalT1CoreTrackingState;
+    double t2OnlyFormalT1TofSamples = std::numeric_limits<double>::quiet_NaN();
+    double t2OnlyPeriodSamples = std::numeric_limits<double>::quiet_NaN();
+    double t2OnlyTofSamples = std::numeric_limits<double>::quiet_NaN();
+    double t2OnlyTemplateCorrelation = std::numeric_limits<double>::quiet_NaN();
+    int t2OnlyCandidateCount = 0;
+    QString t2OnlyCandidateSummary;
+    QString t2OnlyPairStage;
+    double t2OnlyPairPredictedPeriod = std::numeric_limits<double>::quiet_NaN();
+    int t2OnlyPairSearchHalfWidth = 0;
+    double t2OnlyPairEnvelopeCorrelation = std::numeric_limits<double>::quiet_NaN();
+    double t2OnlyPairRawAbsCorrelation = std::numeric_limits<double>::quiet_NaN();
+    double t2OnlyPairResidualSamples = std::numeric_limits<double>::quiet_NaN();
+    bool t2OnlyPairPublished = false;
+
     bool firstEchoPhaseRefinementApplied = false;
     double firstEchoPhaseRefinementCorrectionSamples = 0.0;
     double firstEchoPhaseRefinementBaseTofIndex = std::numeric_limits<double>::quiet_NaN();
