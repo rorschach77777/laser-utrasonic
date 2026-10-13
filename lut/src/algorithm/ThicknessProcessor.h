@@ -96,7 +96,13 @@ struct ThicknessAlgorithmParameters
     // T2-only绝对厚度标定。DeltaT只作为身份/周期证据，不参与最终厚度输出。
     double echoPairBiasMm = 0.425577;
     double secondEchoOrdinalCorrectionMm = 0.000320;
+    // 与LSTAlgorithmTest当前正式T2厚度输出保持一致的绝对零点标定补偿。
+    // 逐帧TOF完全一致时必须保留此偏移，避免固定的0.028016mm厚度差。
     double secondEchoT50BiasMm = 0.0280164674111623;
+    // 与LSTAlgorithmTest保持一致：T2-only局部ROI Hilbert为默认正式发布链。
+    // false表示回退旧整帧Hilbert供离线逐帧比较；两侧外扩128点。
+    bool t2RoiHilbertEnabled = true;
+    int t2RoiMarginSamples = 128;
 
     // FirstEcho最终输出层Raw carrier phase小增益修正；0表示关闭。
     // 该参数只作用于FinalPrimary之后的发布值，不回写Prediction/模板/状态机。

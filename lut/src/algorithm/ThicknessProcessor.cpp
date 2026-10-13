@@ -7,6 +7,7 @@
 #include "FirstEchoRawPhaseTracker.h"
 #include "FirstEchoPhaseRefinement.h"
 #include "SecondEchoOnlyTracker.h"
+#include "SecondEchoRoiHilbert.h"
 #include "SecondEchoSearchWindow.h"
 #include "EchoPairTracker.h"
 #include "RawPhaseBranchTracker.h"
@@ -7654,6 +7655,7 @@ struct ThicknessProcessor::Impl
     AlgorithmWorkspace workspace;
     HighPrecisionHistory highPrecisionHistory;
     SecondEchoOnlyTracker secondEchoOnlyTracker;
+    SecondEchoRoiHilbert secondEchoRoiHilbert;
     EchoPairTracker secondEchoPeriodTracker;
     RawPhaseBranchTracker secondEchoRawPhaseTracker;
     WeakRawTemporalTracker secondEchoWeakRawTemporalTracker;
@@ -8412,7 +8414,10 @@ ThicknessResult ThicknessProcessor::process(
                                              double formalTof,
                                              double formalThickness) {
         FirstEchoPhaseRefinementInput input;
-        input.enabled = p.firstEchoPhaseRefinementAlpha > 0.0;
+        // 测试程序在second_echo正式模式下不启用T1输出相位微调。
+        // T2的ordinal身份辅助T1锚必须与测试程序同口径，T1-only行为不变。
+        input.enabled = parameters.echoMode == ThicknessEchoMode::T1Only
+            && p.firstEchoPhaseRefinementAlpha > 0.0;
         input.alpha = p.firstEchoPhaseRefinementAlpha;
         input.formalOutputValid = formalValid;
         input.triEvidenceUsedMainFallback = hp.usedMainFallback;
@@ -8678,9 +8683,17 @@ ThicknessResult ThicknessProcessor::process(
             std::vector<T2Peak> peaks;
             std::vector<double> t2Envelope;
             if (candidateRight > candidateLeft + 2) {
-                const std::vector<double> rawT2Envelope =
-                    secondEchoOnlyHilbertEnvelope(t2Filtered);
-                secondEchoOnlySmoothThreePoint(rawT2Envelope, t2Envelope);
+                // 与测试程序的独立T2 ROI Hilbert输入/裁剪/镜像约定一致。
+                // 全帧模式仅用于回归对照；默认T2使用局部ROI+128 sample。
+                if (parameters.t2RoiHilbertEnabled) {
+                    const auto &roiT2Envelope = m_impl->secondEchoRoiHilbert.calculate(
+                        t2Filtered, left, right, parameters.t2RoiMarginSamples);
+                    secondEchoOnlySmoothThreePoint(roiT2Envelope, t2Envelope);
+                } else {
+                    const std::vector<double> rawT2Envelope =
+                        secondEchoOnlyHilbertEnvelope(t2Filtered);
+                    secondEchoOnlySmoothThreePoint(rawT2Envelope, t2Envelope);
+                }
             }
             if (candidateRight > candidateLeft + 2
                 && t2Envelope.size() == t2Filtered.size()) {
@@ -9075,18 +9088,9 @@ ThicknessResult ThicknessProcessor::process(
                 && std::isfinite(highPrecision.independentEchoPairCorrelation23)
                 && highPrecision.independentEchoPairCorrelation23 >= 0.80;
 
-            // 实时链无法像Batch后处理那样提前看到未来T1 backfill。只有核心已经确认
-            // “有信号但当前身份/连续性不通过”(INVALID)时，才允许LOCK中的Independent Pair
-            // 用自身T1作为ordinal anchor；NO_SIGNAL明确禁止反向制造T1证据。
-            // 该anchor只回答“这个后续包是不是T2”，绝不进入T2厚度公式。
-            if (!(std::isfinite(t2Frame.formalT1TofSamples)
-                  && t2Frame.formalT1TofSamples > 0.0)
-                && waveform.measurementStatus == QStringLiteral("INVALID")
-                && waveform.trackingState == QStringLiteral("JUMP_PENDING")
-                && m_impl->secondEchoOnlyTracker.stage() == SecondEchoOnlyTracker::Stage::Locked
-                && raw12IdentityTrusted && std::isfinite(pairT1) && pairT1 > 0.0) {
-                t2Frame.formalT1TofSamples = pairT1;
-            }
+            // 严格跟随测试程序：正式T1不可用时禁止借用Pair T1补造T2
+            // period锚点；该旧补锚会导致INVALID/JUMP_PENDING帧虚假认证。
+            // 测试程序离线回填所造成的真实T1发布差异另行按时序分析。
 
             if (!(std::isfinite(t2Frame.formalT1TofSamples)
                   && t2Frame.formalT1TofSamples > 0.0))

@@ -7,6 +7,7 @@
 #include <QTextStream>
 #include <QElapsedTimer>
 #include <QHash>
+#include <QMap>
 
 #include <algorithm>
 #include <cmath>
@@ -101,6 +102,104 @@ static QHash<QString, ExpectedShadowRow> readExpectedShadow(const QString &path)
     return rows;
 }
 
+struct T2ExpectedRow
+{
+    bool available = false;
+    double thicknessMm = std::numeric_limits<double>::quiet_NaN();
+    double tof = std::numeric_limits<double>::quiet_NaN();
+    QString reason;
+    double formalT1 = std::numeric_limits<double>::quiet_NaN();
+    double observedPeriod = std::numeric_limits<double>::quiet_NaN();
+    bool pairSupport = false;
+    bool t2T3Support = false;
+    QString coreStatus, finalStatus, tracking, finalPrimaryReason;
+    bool formalT1Available = false;
+};
+
+static QString readLogicalCsvRow(QTextStream &in)
+{
+    if (in.atEnd())
+        return {};
+    QString row = in.readLine();
+    bool insideQuotes = false;
+    auto consume = [&](const QString &part) {
+        for (int i = 0; i < part.size(); ++i) {
+            if (part[i] == '"') {
+                if (insideQuotes && i + 1 < part.size() && part[i + 1] == '"')
+                    ++i;
+                else
+                    insideQuotes = !insideQuotes;
+            }
+        }
+    };
+    consume(row);
+    while (insideQuotes && !in.atEnd()) {
+        const QString part = in.readLine();
+        row += QLatin1Char('\n') + part;
+        consume(part);
+    }
+    return row;
+}
+
+static QHash<QString, T2ExpectedRow> readExpectedT2(const QString &path)
+{
+    QHash<QString, T2ExpectedRow> out;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return out;
+    QTextStream in(&file);
+    if (in.atEnd())
+        return out;
+    const QStringList head = splitCsvQuoted(readLogicalCsvRow(in));
+    const int nameIx = head.indexOf(QStringLiteral("File"));
+    const int validIx = head.indexOf(QStringLiteral("SecondEchoOnlyAvailable"));
+    const int mmIx = head.indexOf(QStringLiteral("SecondEchoOnlyThickness"));
+    const int tofIx = head.indexOf(QStringLiteral("SecondEchoOnlyTOF"));
+    const int reasonIx = head.indexOf(QStringLiteral("SecondEchoOnlyReason"));
+    const int t1Ix = head.indexOf(QStringLiteral("FirstEchoFormalTOF"));
+    const int periodIx = head.indexOf(QStringLiteral("EchoSequencePeriodObserved"));
+    const int supportIx = head.indexOf(QStringLiteral("SecondEchoOnlyDeltaTSupportAvailable"));
+    const int t2t3Ix = head.indexOf(QStringLiteral("SecondEchoOnlyT2T3Support"));
+    const int coreStatusIx = head.indexOf(QStringLiteral("MeasurementStatus"));
+    const int finalStatusIx = head.indexOf(QStringLiteral("FinalMeasurementStatus"));
+    const int trackingIx = head.indexOf(QStringLiteral("TrackingState"));
+    const int fpReasonIx = head.indexOf(QStringLiteral("FinalPrimaryIdentityReason"));
+    const int formalAvailableIx = head.indexOf(QStringLiteral("FirstEchoFormalAvailable"));
+    if (std::min({nameIx, validIx, mmIx, tofIx, reasonIx}) < 0)
+        return out;
+    const int maxIx = std::max({nameIx, validIx, mmIx, tofIx, reasonIx});
+    while (!in.atEnd()) {
+        const auto cols = splitCsvQuoted(readLogicalCsvRow(in));
+        if (cols.size() <= maxIx)
+            continue;
+        T2ExpectedRow frame;
+        frame.available = cols[validIx].compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
+        frame.thicknessMm = cols[mmIx].toDouble();
+        frame.tof = cols[tofIx].toDouble();
+        frame.reason = cols[reasonIx];
+        if (t1Ix >= 0 && cols.size() > t1Ix)
+            frame.formalT1 = cols[t1Ix].toDouble();
+        if (periodIx >= 0 && cols.size() > periodIx)
+            frame.observedPeriod = cols[periodIx].toDouble();
+        if (supportIx >= 0 && cols.size() > supportIx)
+            frame.pairSupport = cols[supportIx] == QStringLiteral("true");
+        if (t2t3Ix >= 0 && cols.size() > t2t3Ix)
+            frame.t2T3Support = cols[t2t3Ix] == QStringLiteral("true");
+        if (coreStatusIx >= 0 && cols.size() > coreStatusIx)
+            frame.coreStatus = cols[coreStatusIx];
+        if (finalStatusIx >= 0 && cols.size() > finalStatusIx)
+            frame.finalStatus = cols[finalStatusIx];
+        if (trackingIx >= 0 && cols.size() > trackingIx)
+            frame.tracking = cols[trackingIx];
+        if (fpReasonIx >= 0 && cols.size() > fpReasonIx)
+            frame.finalPrimaryReason = cols[fpReasonIx];
+        if (formalAvailableIx >= 0 && cols.size() > formalAvailableIx)
+            frame.formalT1Available = cols[formalAvailableIx] == QStringLiteral("true");
+        out.insert(cols[nameIx], frame);
+    }
+    return out;
+}
+
 static CsvData readCsv(const QString& filePath)
 {
     CsvData data;
@@ -193,6 +292,12 @@ int main(int argc, char* argv[])
     }();
     constexpr int filterOrder = 50;
     ThicknessAlgorithmParameters algorithmParameters;
+    if (qEnvironmentVariableIsSet("LST_MAIN_T2_FULL_HILBERT"))
+        algorithmParameters.t2RoiHilbertEnabled = false;
+    bool roiMarginOk = false;
+    const int roiMargin = qEnvironmentVariable("LST_MAIN_T2_ROI_MARGIN").toInt(&roiMarginOk);
+    if (roiMarginOk)
+        algorithmParameters.t2RoiMarginSamples = std::clamp(roiMargin, 0, 1600);
     const QString echoMode = qEnvironmentVariable("LST_MAIN_ECHO_MODE").trimmed().toLower();
     if (echoMode == QStringLiteral("t2") || echoMode == QStringLiteral("t2-only")
         || echoMode == QStringLiteral("second_echo")) {
@@ -274,7 +379,7 @@ int main(int argc, char* argv[])
         outputRows.push_back({fileInfo.fileName(), result, csv.referenceThickness, false, false, processingMs});
     }
 
-    for (const OutputRow &row : outputRows) {
+    if (!qEnvironmentVariableIsSet("LST_MAIN_T2_SUMMARY_ONLY")) for (const OutputRow &row : outputRows) {
         const ThicknessResult &result = row.result;
         std::cout << row.fileName.toStdString() << ','
                   << (result.valid ? "true" : "false") << ','
@@ -313,6 +418,68 @@ int main(int argc, char* argv[])
                   << result.t2OnlyPairResidualSamples << ','
                   << (result.t2OnlyPairPublished ? "true" : "false") << ','
                   << row.processingMs << '\n';
+    }
+
+    const QString t2ExpectedPath = qEnvironmentVariable("LST_MAIN_T2_EXPECTED_CSV");
+    if (!t2ExpectedPath.isEmpty()) {
+        const auto expected = readExpectedT2(t2ExpectedPath);
+        int missing = 0, validMismatches = 0, tofMismatches = 0, thicknessMismatches = 0;
+        double maxTofDelta = 0.0, maxThicknessDelta = 0.0;
+        QStringList mismatchExamples;
+        for (const auto &row : outputRows) {
+            auto it = expected.constFind(row.fileName);
+            if (it == expected.cend()) {
+                ++missing;
+                continue;
+            }
+            if (row.result.valid != it->available) {
+                ++validMismatches;
+                if (mismatchExamples.size() < 12)
+                    mismatchExamples << QStringLiteral("%1 VALID main=%2 expected=%3 reason=%4 expectedReason=%5")
+                        .arg(row.fileName).arg(row.result.valid).arg(it->available)
+                        .arg(row.result.t2OnlyReason, it->reason)
+                        + QStringLiteral(" t1=%1/%2 period=%3/%4 periodValid=%5/%6")
+                            .arg(row.result.t2OnlyFormalT1TofSamples,0,'f',3)
+                            .arg(it->formalT1,0,'f',3)
+                            .arg(row.result.t2OnlyPeriodSamples,0,'f',3)
+                            .arg(it->observedPeriod,0,'f',3)
+                            .arg(row.result.t2OnlyPeriodEvidenceAvailable)
+                            .arg(it->pairSupport)
+                        + QStringLiteral(" core=%1/%2 track=%3/%4 formal=%5 fp=%6")
+                            .arg(row.result.t2OnlyFormalT1CoreStatus, it->coreStatus)
+                            .arg(row.result.t2OnlyFormalT1CoreTrackingState, it->tracking)
+                            .arg(it->formalT1Available)
+                            .arg(it->finalPrimaryReason);
+                continue;
+            }
+            if (!it->available)
+                continue;
+            const double deltaTof = std::abs(row.result.t2OnlyTofSamples - it->tof);
+            const double deltaMm = std::abs(row.result.thicknessMm - it->thicknessMm);
+            maxTofDelta = std::max(maxTofDelta, deltaTof);
+            maxThicknessDelta = std::max(maxThicknessDelta, deltaMm);
+            if (deltaTof > 1e-6 || !std::isfinite(deltaTof)) {
+                ++tofMismatches;
+                if (mismatchExamples.size() < 12)
+                    mismatchExamples << QStringLiteral("%1 TOF main=%2 expected=%3 reason=%4/%5")
+                        .arg(row.fileName).arg(row.result.t2OnlyTofSamples, 0, 'f', 7)
+                        .arg(it->tof, 0, 'f', 7).arg(row.result.t2OnlyReason, it->reason);
+            }
+            if (deltaMm > 1e-6 || !std::isfinite(deltaMm))
+                ++thicknessMismatches;
+        }
+        std::cerr << "T2_PARITY expected_rows=" << expected.size()
+                  << " measured=" << outputRows.size()
+                  << " missing=" << missing << " valid_mismatches=" << validMismatches
+                  << " tof_mismatches=" << tofMismatches
+                  << " thickness_mismatches=" << thicknessMismatches
+                  << " max_tof_delta=" << maxTofDelta
+                  << " max_thickness_delta_mm=" << maxThicknessDelta << '\n';
+        for (const auto &example : mismatchExamples)
+            std::cerr << "T2_PARITY_DETAIL " << example.toStdString() << '\n';
+        if (expected.size() != outputRows.size() || missing || validMismatches ||
+            tofMismatches || thicknessMismatches)
+            failures++;
     }
 
     if (!expectedConfidencePath.isEmpty()) {
