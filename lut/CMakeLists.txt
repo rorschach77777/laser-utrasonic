@@ -170,6 +170,14 @@ target_link_libraries(IndustrialAlgorithmFileTest
         lst_data
 )
 
+# Header-only T2 tracker regression (shape changes must not lose LOCK).
+add_executable(SecondEchoThickWallTrackerTests
+    tools/SecondEchoThickWallTrackerTests.cpp
+)
+target_include_directories(SecondEchoThickWallTrackerTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
 qt_add_executable(appLST
     main.cpp
     src/monitor/HealthMonitor.cpp

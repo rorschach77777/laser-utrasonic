@@ -310,6 +310,12 @@ QString DataController::thicknessEchoMode() const
         ? QStringLiteral("T2-only") : QStringLiteral("T1-only");
 }
 
+bool DataController::t2HighPrecisionDetectionEnabled() const
+{
+    std::lock_guard<std::mutex> locker(m_configMutex);
+    return m_configure.thicknessAlgorithm.t2HighPrecisionDetectionEnabled;
+}
+
 double DataController::avgThickness() const
 {
     if (m_thicknessCount == 0) return 0.0;
@@ -565,6 +571,24 @@ void DataController::setThicknessEchoMode(const QString &mode)
     }
     m_thicknessProcessor.reset();
     emit thicknessEchoModeChanged();
+}
+
+void DataController::setT2HighPrecisionDetectionEnabled(bool enabled)
+{
+    if (m_running) {
+        emit errorOccurred(tr("请先停止采集，再切换T2高精度检测。"));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> locker(m_configMutex);
+        auto &p = m_configure.thicknessAlgorithm;
+        if (p.t2HighPrecisionDetectionEnabled == enabled)
+            return;
+        // Output-only change; do not change algorithm revision, replay
+        // templates, reset the tracker, or modify any SNR thresholds.
+        p.t2HighPrecisionDetectionEnabled = enabled;
+    }
+    emit t2HighPrecisionDetectionEnabledChanged();
 }
 
 void DataController::setStructLen(int val)

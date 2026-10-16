@@ -278,6 +278,19 @@ ScrollView {
 
                     Comp.InlineParamRow {
                         Layout.fillWidth: true
+                        label: "采用高精度检测"
+                        editorType: "switch"
+                        editorWidth: 140
+                        switchValue: dataController ? dataController.t2HighPrecisionDetectionEnabled : true
+                        visible: dataController && dataController.thicknessEchoMode === "T2-only"
+                        enabled: dataController != null && !dataController.running
+                        onValueCommitted: function(value) {
+                            if (dataController) dataController.setT2HighPrecisionDetectionEnabled(value)
+                        }
+                    }
+
+                    Comp.InlineParamRow {
+                        Layout.fillWidth: true
                         label: "参考厚度"
                         unit: "mm"
                         editorType: "doublefield"

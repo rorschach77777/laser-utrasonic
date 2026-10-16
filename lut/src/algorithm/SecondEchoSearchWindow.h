@@ -14,6 +14,9 @@ struct Config {
     double deltaTBiasMm = 0.425577;
     double t2CorrectionMm = 0.000320;
     double referenceThicknessMm = 5.6;
+    // For explicitly selected T2-only at >=15 mm, the same tracker follows
+    // the first physical packet; thinner walls continue targeting Echo2.
+    int targetOrdinal = 2; // 1: first echo, 2: second echo
     double modeUpperThicknessMm = 15.0;
     double minimumHalfRangeMm = 3.0;
     double relativeHalfRange = 0.25;
@@ -40,7 +43,8 @@ inline Result calculate(const Config &cfg)
 {
     Result out;
     if (!(cfg.sampleRateHz > 0.0) || !(cfg.longitudinalVelocityMps > 0.0)
-        || !(cfg.referenceThicknessMm > 0.0) || !(cfg.modeUpperThicknessMm > 0.0))
+        || !(cfg.referenceThicknessMm > 0.0) || !(cfg.modeUpperThicknessMm > 0.0)
+        || (cfg.targetOrdinal != 1 && cfg.targetOrdinal != 2))
         return out;
 
     const double k = cfg.longitudinalVelocityMps / cfg.sampleRateHz * 0.5 * 1000.0;
@@ -48,7 +52,10 @@ inline Result calculate(const Config &cfg)
         return out;
     const double a = -static_cast<double>(cfg.delayCount)
         + (cfg.firstEchoBiasMm - cfg.deltaTBiasMm) / k;
-    const auto wallToT2 = [&](double h) {
+    const auto wallToTarget = [&](double h) {
+        if (cfg.targetOrdinal == 1)
+            return -static_cast<double>(cfg.delayCount)
+                + (h + cfg.firstEchoBiasMm) / k;
         const double d = (h + cfg.deltaTBiasMm - cfg.t2CorrectionMm) / k;
         return a + 2.0 * d;
     };
@@ -63,9 +70,9 @@ inline Result calculate(const Config &cfg)
     if (out.maxThicknessMm <= out.minThicknessMm)
         return out;
 
-    out.referenceTofSamples = wallToT2(cfg.referenceThicknessMm);
-    out.minTofSamples = wallToT2(out.minThicknessMm);
-    out.maxTofSamples = wallToT2(out.maxThicknessMm);
+    out.referenceTofSamples = wallToTarget(cfg.referenceThicknessMm);
+    out.minTofSamples = wallToTarget(out.minThicknessMm);
+    out.maxTofSamples = wallToTarget(out.maxThicknessMm);
     out.safetyMarginSamples = std::max({
         8,
         std::max(0, cfg.packetMaxWidth / 2),

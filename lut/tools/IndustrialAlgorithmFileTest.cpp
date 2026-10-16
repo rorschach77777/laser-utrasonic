@@ -292,6 +292,10 @@ int main(int argc, char* argv[])
     }();
     constexpr int filterOrder = 50;
     ThicknessAlgorithmParameters algorithmParameters;
+    // Regression A/B only: the actual UI uses DataController's bool setting.
+    if (qEnvironmentVariableIsSet("LST_MAIN_T2_HIGH_PRECISION"))
+        algorithmParameters.t2HighPrecisionDetectionEnabled =
+            qEnvironmentVariable("LST_MAIN_T2_HIGH_PRECISION").trimmed() != QStringLiteral("0");
     if (qEnvironmentVariableIsSet("LST_MAIN_T2_FULL_HILBERT"))
         algorithmParameters.t2RoiHilbertEnabled = false;
     bool roiMarginOk = false;

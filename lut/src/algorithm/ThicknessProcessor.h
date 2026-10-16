@@ -92,6 +92,8 @@ struct ThicknessAlgorithmParameters
 
     // 测厚回波模式。T1Only保持当前正式算法完全不变；T2Only启用独立第二回波分支。
     ThicknessEchoMode echoMode = ThicknessEchoMode::T1Only;
+    // T2-only output locator only; internal NCC/identity stays on t50.
+    bool t2HighPrecisionDetectionEnabled = true;
 
     // T2-only绝对厚度标定。DeltaT只作为身份/周期证据，不参与最终厚度输出。
     double echoPairBiasMm = 0.425577;

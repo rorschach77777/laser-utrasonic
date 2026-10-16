@@ -8634,8 +8634,13 @@ ThicknessResult ThicknessProcessor::process(
     if (parameters.echoMode == ThicknessEchoMode::T2Only) {
         const std::vector<double> &t2Filtered =
             filteredOut ? *filteredOut : t2FilteredLocal;
+        // Match LSTAlgorithmTest's explicit T2-only thick-wall route: at >=15 mm
+        // track the FIRST physical echo in the nominal thickness ROI, without
+        // any T1->T2 or T2->T3 period authentication.
+        const bool thickWallT2 = p.thicknessStdMm >= 15.0;
 
         SecondEchoOnlyTracker::Frame t2Frame;
+        t2Frame.thickWallRangeOnly = thickWallT2;
         SecondEchoSearchWindow::Config windowConfig;
         windowConfig.sampleRateHz = p.sampleRateHz;
         windowConfig.longitudinalVelocityMps = p.longitudinalVelocityMps;
@@ -8644,7 +8649,9 @@ ThicknessResult ThicknessProcessor::process(
         windowConfig.deltaTBiasMm = parameters.echoPairBiasMm;
         windowConfig.t2CorrectionMm = parameters.secondEchoOrdinalCorrectionMm;
         windowConfig.referenceThicknessMm = p.thicknessStdMm;
-        windowConfig.modeUpperThicknessMm = 15.0;
+        windowConfig.targetOrdinal = thickWallT2 ? 1 : 2;
+        windowConfig.modeUpperThicknessMm = thickWallT2
+            ? std::max(30.0, p.thicknessStdMm) : 15.0;
         windowConfig.packetMaxWidth = p.packetMaxWidth;
         windowConfig.predictionHalfWidth = p.predictionHalfWidth;
         windowConfig.filterOrder = p.filterOrder;
@@ -8658,7 +8665,7 @@ ThicknessResult ThicknessProcessor::process(
                 / p.sampleRateHz * 0.5 * 1000.0;
             const double sequenceOrigin = -static_cast<double>(p.delayCount)
                 + (CURRENT_FIXED_BIAS_MM - parameters.echoPairBiasMm) / mmPerSampleT2;
-            if (std::isfinite(sequenceOrigin))
+            if (!thickWallT2 && std::isfinite(sequenceOrigin))
                 t2Frame.referencePeriodSamples =
                     0.5 * (t2Frame.referenceTofSamples - sequenceOrigin);
 
@@ -8698,6 +8705,31 @@ ThicknessResult ThicknessProcessor::process(
             if (candidateRight > candidateLeft + 2
                 && t2Envelope.size() == t2Filtered.size()) {
                 peaks.reserve(static_cast<size_t>(candidateRight - candidateLeft + 1) / 8 + 1);
+                if (thickWallT2) {
+                    // Exact test-program direct waveform fallback input.
+                    // These envelope samples and local-max SNRs are collected
+                    // BEFORE the normal 2.5dB prefilter, peak separation and
+                    // Top-8 selection; they are NOT formal tracker candidates.
+                    const int directStart = std::max(0, candidateLeft - 26);
+                    const int directEnd = std::min(n - 1, candidateRight + 26);
+                    t2Frame.directEnvelopeFirstIndex = directStart;
+                    t2Frame.directSupportLeft = left;
+                    t2Frame.directSupportRight = right;
+                    t2Frame.directT50HalfWidth = std::clamp(
+                        p.packetMaxWidth / 4, 12, 24);
+                    t2Frame.directEnvelope.assign(
+                        t2Envelope.begin() + directStart,
+                        t2Envelope.begin() + directEnd + 1);
+                    // Independent local net-SNR source; exact same indexing
+                    // as the candidate Hilbert envelope. Original global
+                    // noiseEnergy still serves formal/weak T2 candidates.
+                    t2Frame.directFilteredSignal.assign(
+                        t2Filtered.begin() + directStart,
+                        t2Filtered.begin() + directEnd + 1);
+                    t2Frame.directEnergyHalfWidth = energyHalf;
+                    t2Frame.directLocalMaxSnrDb.assign(
+                        static_cast<size_t>(directEnd - directStart + 1), NaN);
+                }
                 for (int i = candidateLeft + 1; i < candidateRight; ++i) {
                     const double ym = t2Envelope[static_cast<size_t>(i - 1)];
                     const double y0 = t2Envelope[static_cast<size_t>(i)];
@@ -8707,6 +8739,14 @@ ThicknessResult ThicknessProcessor::process(
 
                     const double energy = localEnergy(t2Filtered, i, energyHalf);
                     const double snr = energySnrDb(energy, waveform.noiseEnergy);
+                    if (!t2Frame.directLocalMaxSnrDb.empty()) {
+                        const int idx = i - t2Frame.directEnvelopeFirstIndex;
+                        if (idx >= 0 && idx < static_cast<int>(
+                                t2Frame.directLocalMaxSnrDb.size()))
+                            t2Frame.directLocalMaxSnrDb[static_cast<size_t>(idx)] = snr;
+                    }
+                    // Preserve original candidate selection. Only the
+                    // post-primary single-peak fallback uses lower SNR >1.3.
                     if (!std::isfinite(snr) || snr < std::max(2.5, p.echoMinSnrDb))
                         continue;
 
@@ -8776,6 +8816,7 @@ ThicknessResult ThicknessProcessor::process(
                 candidate.snrDb = peak.snr;
                 candidate.score = peak.snr / 10.0;
                 candidate.rank = rank;
+                candidate.envelopePeakIndex = peak.index; // actual smoothed Hilbert max
                 candidate.envelopeTemplate.reserve(2 * templateHalf + 1);
                 const int center = static_cast<int>(std::llround(peak.tof));
                 for (int j = center - templateHalf; j <= center + templateHalf; ++j) {
@@ -8791,6 +8832,9 @@ ThicknessResult ThicknessProcessor::process(
             }
             result.t2OnlyCandidateSummary = t2CandidateSummary.join(QLatin1Char('|'));
 
+            // Thick-wall T2-only is a pure ROI + temporal-template tracker.
+            // Do not run the old period-identity chain or pass its anchors to it.
+            if (!thickWallT2) {
             // 当前帧Independent T1->T2 period evidence，使用与测试程序相同的
             // HighPrecision物理component，而不是围绕最终T1固定41点相关。
             // 与测试程序 firstEchoFormalTofSamples 语义一致：T2身份佐证读取
@@ -9116,7 +9160,20 @@ ThicknessResult ThicknessProcessor::process(
             result.t2OnlyPairResidualSamples = raw12Residual;
             result.t2OnlyPairPublished = raw12Available;
         }
+            } // No period/ordinal authentication for the >=15 mm branch.
 
+        if (thickWallT2) {
+            // Explicitly strip every old period anchor before processing.
+            // The first physical echo must never be relocated by Echo2/Echo3.
+            t2Frame.periodEvidenceAvailable = false;
+            t2Frame.t2T3EvidenceAvailable = false;
+            t2Frame.periodSamples = NaN;
+            t2Frame.referencePeriodSamples = NaN;
+            t2Frame.formalT1TofSamples = NaN;
+            t2Frame.t3TofSamples = NaN;
+            result.t2OnlyPairStage = QStringLiteral("THICK_RANGE_ONLY");
+            result.t2OnlyPairPublished = false;
+        }
         const auto t2Decision = m_impl->secondEchoOnlyTracker.process(t2Frame);
         result.t2OnlyStage = QString::fromLatin1(
             SecondEchoOnlyTracker::stageName(t2Decision.stage));
@@ -9126,22 +9183,64 @@ ThicknessResult ThicknessProcessor::process(
         result.t2OnlyFormalT1TofSamples = t2Frame.formalT1TofSamples;
         result.t2OnlyPeriodEvidenceAvailable = t2Frame.periodEvidenceAvailable;
         result.t2OnlyPeriodSamples = t2Frame.periodSamples;
-        result.t2OnlyTofSamples = t2Decision.tofSamples;
         result.t2OnlyTemplateCorrelation = t2Decision.templateCorrelation;
+
+        // Test-program high-precision switch: do not alter the t50-based
+        // tracker state, candidate matching, NCC, or any learned template.
+        // With the switch OFF, publish the largest POSITIVE bandpass sample
+        // within +/-12 of the confirmed Hilbert packet maximum. This is the
+        // carrier crest (Frame_0011=908, Frame_0012=907), not the envelope
+        // maximum or a newly fitted sub-sample peak.
+        double publishedT2Tof = t2Decision.tofSamples;
+        bool outputLocatorAvailable = true;
+        if (t2Decision.available && !parameters.t2HighPrecisionDetectionEnabled) {
+            const int envelopeIndex = t2Decision.selectedEnvelopePeakIndex;
+            const int nFiltered = static_cast<int>(t2Filtered.size());
+            const int halfWidth = std::clamp(
+                t2Frame.directT50HalfWidth, 6, 12);
+            const int crestLeft = std::max(0, envelopeIndex - halfWidth);
+            const int crestRight = std::min(nFiltered - 1, envelopeIndex + halfWidth);
+            outputLocatorAvailable = envelopeIndex >= 0 && crestLeft <= crestRight;
+            if (outputLocatorAvailable) {
+                int bestIndex = -1;
+                double bestValue = -std::numeric_limits<double>::infinity();
+                for (int i = crestLeft; i <= crestRight; ++i) {
+                    const double value = t2Filtered[static_cast<size_t>(i)];
+                    if (std::isfinite(value) && value > bestValue) {
+                        bestIndex = i;
+                        bestValue = value;
+                    }
+                }
+                outputLocatorAvailable = bestIndex >= 0;
+                publishedT2Tof = outputLocatorAvailable
+                    ? static_cast<double>(bestIndex) : NaN;
+            } else {
+                publishedT2Tof = NaN;
+            }
+        }
+        result.t2OnlyTofSamples = publishedT2Tof;
 
         bool t2Valid = false;
         double t2ThicknessMm = NaN;
-        if (t2Decision.available && std::isfinite(t2Decision.tofSamples)) {
+        if (t2Decision.available && outputLocatorAvailable
+            && std::isfinite(publishedT2Tof)) {
             const double k = p.longitudinalVelocityMps
                 / p.sampleRateHz * 0.5 * 1000.0;
             if (k > 0.0) {
-                const double a = -static_cast<double>(p.delayCount)
-                    + (CURRENT_FIXED_BIAS_MM - parameters.echoPairBiasMm) / k;
-                const double d = (t2Decision.tofSamples - a) / 2.0;
-                t2ThicknessMm = k * d
-                    - parameters.echoPairBiasMm
-                    + parameters.secondEchoOrdinalCorrectionMm
-                    - parameters.secondEchoT50BiasMm;
+                if (thickWallT2) {
+                    // Ordinal 1 calibration matches OrdinalThicknessEstimator:
+                    // the second-echo t50/correction offsets do NOT apply.
+                    t2ThicknessMm = k * (publishedT2Tof + p.delayCount)
+                        - CURRENT_FIXED_BIAS_MM;
+                } else {
+                    const double a = -static_cast<double>(p.delayCount)
+                        + (CURRENT_FIXED_BIAS_MM - parameters.echoPairBiasMm) / k;
+                    const double d = (publishedT2Tof - a) / 2.0;
+                    t2ThicknessMm = k * d
+                        - parameters.echoPairBiasMm
+                        + parameters.secondEchoOrdinalCorrectionMm
+                        - parameters.secondEchoT50BiasMm;
+                }
                 t2Valid = std::isfinite(t2ThicknessMm) && t2ThicknessMm > 0.0;
             }
         }
@@ -9151,9 +9250,9 @@ ThicknessResult ThicknessProcessor::process(
         result.hasFinalPrimaryShadowBackfill = false;
         result.valid = t2Valid;
         result.thicknessMm = t2Valid ? t2ThicknessMm : NaN;
-        result.peakTimeSec = t2Valid ? t2Decision.tofSamples / p.sampleRateHz : NaN;
+        result.peakTimeSec = t2Valid ? publishedT2Tof / p.sampleRateHz : NaN;
         result.peakIndex = t2Valid
-            ? static_cast<int>(std::llround(t2Decision.tofSamples)) : -1;
+            ? static_cast<int>(std::llround(publishedT2Tof)) : -1;
         result.snrDb = t2Valid ? t2Decision.selectedSnrDb : NaN;
         if (t2Valid && result.peakIndex >= 0
             && result.peakIndex < static_cast<int>(t2Filtered.size())) {
