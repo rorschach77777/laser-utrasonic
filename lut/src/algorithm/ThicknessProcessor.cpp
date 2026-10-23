@@ -7,6 +7,7 @@
 #include "FirstEchoRawPhaseTracker.h"
 #include "FirstEchoPhaseRefinement.h"
 #include "SecondEchoOnlyTracker.h"
+#include "SecondEchoParabolicTracker.h"
 #include "SecondEchoRoiHilbert.h"
 #include "SecondEchoSearchWindow.h"
 #include "EchoPairTracker.h"
@@ -7655,6 +7656,7 @@ struct ThicknessProcessor::Impl
     AlgorithmWorkspace workspace;
     HighPrecisionHistory highPrecisionHistory;
     SecondEchoOnlyTracker secondEchoOnlyTracker;
+    SecondEchoParabolicTracker secondEchoParabolicTracker;
     SecondEchoRoiHilbert secondEchoRoiHilbert;
     EchoPairTracker secondEchoPeriodTracker;
     RawPhaseBranchTracker secondEchoRawPhaseTracker;
@@ -7835,6 +7837,7 @@ ThicknessResult ThicknessProcessor::process(
         m_impl->workspace = AlgorithmWorkspace{};
         m_impl->highPrecisionHistory = HighPrecisionHistory{};
         m_impl->secondEchoOnlyTracker.reset();
+        m_impl->secondEchoParabolicTracker.reset();
         m_impl->secondEchoPeriodTracker.reset();
         m_impl->secondEchoRawPhaseTracker.reset();
         m_impl->secondEchoWeakRawTemporalTracker.reset();
@@ -8638,6 +8641,10 @@ ThicknessResult ThicknessProcessor::process(
         // track the FIRST physical echo in the nominal thickness ROI, without
         // any T1->T2 or T2->T3 period authentication.
         const bool thickWallT2 = p.thicknessStdMm >= 15.0;
+        // Thin second-echo uses the already-proven same-frame final fallback.
+        // Unlike the main T2 candidate tracker, fallback alone is allowed
+        // to read low-energy packet samples before the normal SNR/Top-8 gate.
+        const bool thinT2FinalFallback = !thickWallT2;
 
         SecondEchoOnlyTracker::Frame t2Frame;
         t2Frame.thickWallRangeOnly = thickWallT2;
@@ -8705,7 +8712,7 @@ ThicknessResult ThicknessProcessor::process(
             if (candidateRight > candidateLeft + 2
                 && t2Envelope.size() == t2Filtered.size()) {
                 peaks.reserve(static_cast<size_t>(candidateRight - candidateLeft + 1) / 8 + 1);
-                if (thickWallT2) {
+                if (thickWallT2 || thinT2FinalFallback) {
                     // Exact test-program direct waveform fallback input.
                     // These envelope samples and local-max SNRs are collected
                     // BEFORE the normal 2.5dB prefilter, peak separation and
@@ -9174,7 +9181,81 @@ ThicknessResult ThicknessProcessor::process(
             result.t2OnlyPairStage = QStringLiteral("THICK_RANGE_ONLY");
             result.t2OnlyPairPublished = false;
         }
-        const auto t2Decision = m_impl->secondEchoOnlyTracker.process(t2Frame);
+        // Keep the original t50 tracker completely unchanged when high precision
+        // is enabled. Only the former integer-output branch is replaced by the
+        // test program's full parabolic-crest tracker (including candidates,
+        // prediction, identity and terminal single-peak fallback).
+        SecondEchoOnlyTracker::Decision t2Decision;
+        if (parameters.t2HighPrecisionDetectionEnabled) {
+            m_impl->secondEchoOnlyTracker.setThinFinalSinglePeakFallbackEnabled(
+                thinT2FinalFallback);
+            t2Decision = m_impl->secondEchoOnlyTracker.process(t2Frame);
+        } else {
+            SecondEchoParabolicTracker::Frame parabolaFrame;
+            parabolaFrame.thickWallRangeOnly = t2Frame.thickWallRangeOnly;
+            parabolaFrame.referenceTofSamples = t2Frame.referenceTofSamples;
+            parabolaFrame.formalT1TofSamples = t2Frame.formalT1TofSamples;
+            parabolaFrame.periodEvidenceAvailable = t2Frame.periodEvidenceAvailable;
+            parabolaFrame.periodSamples = t2Frame.periodSamples;
+            parabolaFrame.referencePeriodSamples = t2Frame.referencePeriodSamples;
+            parabolaFrame.t2T3EvidenceAvailable = t2Frame.t2T3EvidenceAvailable;
+            parabolaFrame.t3TofSamples = t2Frame.t3TofSamples;
+            parabolaFrame.directEnvelopeFirstIndex = t2Frame.directEnvelopeFirstIndex;
+            parabolaFrame.directSupportLeft = t2Frame.directSupportLeft;
+            parabolaFrame.directSupportRight = t2Frame.directSupportRight;
+            parabolaFrame.directT50HalfWidth = t2Frame.directT50HalfWidth;
+            parabolaFrame.directEnergyHalfWidth = t2Frame.directEnergyHalfWidth;
+            parabolaFrame.directEnvelope = std::move(t2Frame.directEnvelope);
+            parabolaFrame.directFilteredSignal = std::move(t2Frame.directFilteredSignal);
+            parabolaFrame.directLocalMaxSnrDb = std::move(t2Frame.directLocalMaxSnrDb);
+            parabolaFrame.integerPeakTrackingEnabled = true;
+            parabolaFrame.filteredPeakMode =
+                SecondEchoParabolicTracker::FilteredPeakMode::Parabolic;
+            parabolaFrame.parabolicPositivePeakSearchHalfWidth = 16;
+
+            // Keep each original envelope shape / SNR / rank. Only the TOF
+            // coordinate changes to the fitted positive carrier crest.
+            auto appendParabolicCandidate =
+                [&](const SecondEchoOnlyTracker::Candidate &source,
+                    std::vector<SecondEchoParabolicTracker::Candidate> &destination) {
+                    if (source.envelopePeakIndex < 0)
+                        return;
+                    const double crest = SecondEchoParabolicTracker::
+                        matchedFilteredPeakTofSamples(
+                            parabolaFrame, source.envelopePeakIndex);
+                    if (!std::isfinite(crest))
+                        return; // Never substitute t50 or integer TOF on fit failure.
+                    SecondEchoParabolicTracker::Candidate dest;
+                    dest.tofSamples = crest;
+                    dest.snrDb = source.snrDb;
+                    dest.score = source.score;
+                    dest.rank = source.rank;
+                    dest.envelopePeakIndex = source.envelopePeakIndex;
+                    dest.envelopeTemplate = source.envelopeTemplate;
+                    destination.push_back(std::move(dest));
+                };
+            parabolaFrame.candidates.reserve(t2Frame.candidates.size());
+            for (const auto &candidate : t2Frame.candidates)
+                appendParabolicCandidate(candidate, parabolaFrame.candidates);
+            parabolaFrame.weakLockCandidates.reserve(t2Frame.weakLockCandidates.size());
+            for (const auto &candidate : t2Frame.weakLockCandidates)
+                appendParabolicCandidate(candidate, parabolaFrame.weakLockCandidates);
+
+            m_impl->secondEchoParabolicTracker.setThinFinalSinglePeakFallbackEnabled(
+                thinT2FinalFallback);
+            const auto parabolaDecision =
+                m_impl->secondEchoParabolicTracker.process(parabolaFrame);
+            t2Decision.available = parabolaDecision.available;
+            t2Decision.certified = parabolaDecision.certified;
+            t2Decision.stage = static_cast<SecondEchoOnlyTracker::Stage>(
+                parabolaDecision.stage);
+            t2Decision.reason = parabolaDecision.reason;
+            t2Decision.tofSamples = parabolaDecision.tofSamples;
+            t2Decision.templateCorrelation = parabolaDecision.templateCorrelation;
+            t2Decision.selectedSnrDb = parabolaDecision.selectedSnrDb;
+            t2Decision.selectedEnvelopePeakIndex =
+                parabolaDecision.selectedEnvelopePeakIndex;
+        }
         result.t2OnlyStage = QString::fromLatin1(
             SecondEchoOnlyTracker::stageName(t2Decision.stage));
         result.t2OnlyReason = QString::fromLatin1(t2Decision.reason);
@@ -9185,39 +9266,10 @@ ThicknessResult ThicknessProcessor::process(
         result.t2OnlyPeriodSamples = t2Frame.periodSamples;
         result.t2OnlyTemplateCorrelation = t2Decision.templateCorrelation;
 
-        // Test-program high-precision switch: do not alter the t50-based
-        // tracker state, candidate matching, NCC, or any learned template.
-        // With the switch OFF, publish the largest POSITIVE bandpass sample
-        // within +/-12 of the confirmed Hilbert packet maximum. This is the
-        // carrier crest (Frame_0011=908, Frame_0012=907), not the envelope
-        // maximum or a newly fitted sub-sample peak.
-        double publishedT2Tof = t2Decision.tofSamples;
-        bool outputLocatorAvailable = true;
-        if (t2Decision.available && !parameters.t2HighPrecisionDetectionEnabled) {
-            const int envelopeIndex = t2Decision.selectedEnvelopePeakIndex;
-            const int nFiltered = static_cast<int>(t2Filtered.size());
-            const int halfWidth = std::clamp(
-                t2Frame.directT50HalfWidth, 6, 12);
-            const int crestLeft = std::max(0, envelopeIndex - halfWidth);
-            const int crestRight = std::min(nFiltered - 1, envelopeIndex + halfWidth);
-            outputLocatorAvailable = envelopeIndex >= 0 && crestLeft <= crestRight;
-            if (outputLocatorAvailable) {
-                int bestIndex = -1;
-                double bestValue = -std::numeric_limits<double>::infinity();
-                for (int i = crestLeft; i <= crestRight; ++i) {
-                    const double value = t2Filtered[static_cast<size_t>(i)];
-                    if (std::isfinite(value) && value > bestValue) {
-                        bestIndex = i;
-                        bestValue = value;
-                    }
-                }
-                outputLocatorAvailable = bestIndex >= 0;
-                publishedT2Tof = outputLocatorAvailable
-                    ? static_cast<double>(bestIndex) : NaN;
-            } else {
-                publishedT2Tof = NaN;
-            }
-        }
+        // The fitted crest is already the identity/prediction coordinate in
+        // non-high-precision mode. High precision still publishes original t50.
+        const double publishedT2Tof = t2Decision.tofSamples;
+        const bool outputLocatorAvailable = true;
         result.t2OnlyTofSamples = publishedT2Tof;
 
         bool t2Valid = false;
