@@ -97,6 +97,10 @@ public:
         // learning, premature startup vote or LOCK reacquisition is allowed.
         // It uses actual measured SNR>1.3, +/-32 prediction and stable identity.
         bool thickFinalSinglePeakFallbackEnabled = true;
+        // Thin (<15 mm) T2-only shares the same independent packet-net SNR
+        // and adaptive final fallback. It remains opt-in so T1-only and
+        // unrelated modes cannot accidentally activate this path.
+        bool thinFinalSinglePeakFallbackEnabled = false;
         double thickAmbiguousMinSnrDb = 1.3;
         double thickAmbiguousPredictionGateSamples = 32.0;
         double thickAmbiguousCompetitorGateSamples = 32.0;
@@ -226,6 +230,14 @@ public:
     SecondEchoOnlyTracker() = default;
     explicit SecondEchoOnlyTracker(const Config &cfg) : m_cfg(cfg) {}
 
+    // Called by the main T2-only route before processing each frame.
+    // Change the publication-only thin fallback eligibility without
+    // clearing the temporal identity, templates or accepted TOF history.
+    void setThinFinalSinglePeakFallbackEnabled(bool enabled)
+    {
+        m_cfg.thinFinalSinglePeakFallbackEnabled = enabled;
+    }
+
     void reset()
     {
         m_stage = Stage::GlobalSearch;
@@ -280,8 +292,10 @@ public:
                 }
             }
         }
-        if (!m_cfg.thickFinalSinglePeakFallbackEnabled || !f.thickWallRangeOnly
-            || out.available)
+        const bool singlePeakFallbackEnabled = f.thickWallRangeOnly
+            ? m_cfg.thickFinalSinglePeakFallbackEnabled
+            : m_cfg.thinFinalSinglePeakFallbackEnabled;
+        if (!singlePeakFallbackEnabled || out.available)
             return out;
         if (!std::isfinite(anchorBefore)) {
             out.thickFallbackAudit = "FINAL_NO_TRUSTED_PREDICTION";
@@ -866,7 +880,9 @@ private:
         // low-SNR, weak-template observation without independent period
         // evidence. Stable LOCK weak packets do not enter this guard.
         // Keep old history/template unchanged; require a later observation.
-        if (f.thickWallRangeOnly && m_stage == Stage::Locked
+        // The same post-gap identity quarantine applies to both ordinals.
+        // An independently certified second-echo period still bypasses it.
+        if (m_stage == Stage::Locked
             && m_misses > 0 && !currentOrdinalEvidence
             && std::isfinite(out.selectedSnrDb)
             && out.selectedSnrDb < m_cfg.thickPostGapLowIdentitySnrDb

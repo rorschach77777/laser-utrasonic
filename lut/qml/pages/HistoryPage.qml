@@ -204,6 +204,10 @@ Rectangle {
                 function onRecordListChanged() {
                     refreshRecordData()
                 }
+                function onRecordMetadataChanged(changedIndex) {
+                    if (changedIndex === index)
+                        refreshRecordData()
+                }
             }
 
             RowLayout {

@@ -52,6 +52,7 @@ public:
     Q_INVOKABLE QVector<double> getRecordSnrData(int index) const;
     Q_INVOKABLE QVector<int> getRecordValidData(int index) const;
     Q_INVOKABLE void setRecordTitle(int index, const QString &title);
+    Q_INVOKABLE bool setRecordNominalThickness(int index, double nominalThicknessMm);
     Q_INVOKABLE void deleteRecord(int index);
     Q_INVOKABLE void deleteRecords(const QList<int> &indices);
     Q_INVOKABLE void clearAll();
@@ -72,6 +73,7 @@ public:
 
 signals:
     void recordListChanged();
+    void recordMetadataChanged(int index);
     void historyEnabledChanged();
     void sessionActiveChanged();
     void sessionProgressChanged();

@@ -8,6 +8,70 @@ ScrollView {
     contentWidth: availableWidth
     clip: true
 
+    function loadNominalThickness() {
+        var index = recordCombo.currentIndex
+        var record = historyManager && index >= 0 ? historyManager.getRecord(index) : null
+        var nominal = record ? Number(record.nominalThicknessMm) : NaN
+        nominalThicknessField.text = isFinite(nominal) && nominal > 0
+                                     ? String(nominal) : ""
+        nominalEditMessage.text = ""
+    }
+
+    function analyzeSelectedRecord() {
+        var cutoff = Number(cutoffField.text)
+        var minVariation = Number(minVariationField.text)
+        var dominance = Number(dominanceField.text)
+        if (!isFinite(cutoff) || cutoff <= 0) cutoff = 1.0
+        if (!isFinite(minVariation) || minVariation < 0) minVariation = 0.05
+        if (!isFinite(dominance)) dominance = 0.65
+        return processAnalyzer.analyzeRecord(recordCombo.currentIndex,
+                                             cutoff, minVariation, dominance)
+    }
+
+    function analyzeBatchWithCurrentInputs() {
+        var threshold = Number(rangeRateThresholdField.text)
+        var minValid = Number(minValidRateField.text)
+        if (!isFinite(threshold) || threshold < 0) threshold = 5.0
+        if (!isFinite(minValid)) minValid = 80.0
+        return processAnalyzer.analyzeBatch(batchCountBox.value, threshold,
+                                            minValid, plugCountBox.value,
+                                            cycleToleranceBox.value)
+    }
+
+    function saveNominalThickness() {
+        var input = nominalThicknessField.text.trim()
+        var nominal = Number(input)
+        if (input.length === 0 || !isFinite(nominal) || nominal <= 0) {
+            nominalEditMessage.text = "请输入有效的正数"
+            return
+        }
+        if (!historyManager || recordCombo.currentIndex < 0
+                || !historyManager.setRecordNominalThickness(recordCombo.currentIndex, nominal)) {
+            nominalEditMessage.text = "保存失败"
+            return
+        }
+
+        nominalThicknessField.text = String(nominal)
+        nominalEditMessage.text = "已保存"
+        if (processAnalyzer.hasAnalysis)
+            analyzeSelectedRecord()
+        if (processAnalyzer.hasBatchAnalysis)
+            analyzeBatchWithCurrentInputs()
+    }
+
+    Component.onCompleted: loadNominalThickness()
+
+    Connections {
+        target: historyManager
+        function onRecordMetadataChanged(index) {
+            if (index === recordCombo.currentIndex)
+                root.loadNominalThickness()
+        }
+        function onRecordListChanged() {
+            Qt.callLater(root.loadNominalThickness)
+        }
+    }
+
     ColumnLayout {
         width: root.availableWidth
         spacing: 10
@@ -59,6 +123,10 @@ ScrollView {
                     Layout.preferredWidth: 260
                     model: historyManager ? historyManager.recordTitles : []
                     enabled: count > 0
+                    onCurrentIndexChanged: {
+                        Qt.callLater(root.loadNominalThickness)
+                        processAnalyzer.clear()
+                    }
                 }
 
                 Label { text: "长/短周期分界:"; font.pixelSize: 12 }
@@ -106,18 +174,7 @@ ScrollView {
                     enabled: recordCombo.currentIndex >= 0
                     Material.background: "#3F51B5"
                     Material.foreground: "white"
-                    onClicked: {
-                        var cutoff = parseFloat(cutoffField.text)
-                        var minVariation = parseFloat(minVariationField.text)
-                        var dominance = parseFloat(dominanceField.text)
-                        if (!isFinite(cutoff) || cutoff <= 0) cutoff = 1.0
-                        if (!isFinite(minVariation) || minVariation < 0) minVariation = 0.05
-                        if (!isFinite(dominance)) dominance = 0.65
-                        processAnalyzer.analyzeRecord(recordCombo.currentIndex,
-                                                      cutoff,
-                                                      minVariation,
-                                                      dominance)
-                    }
+                    onClicked: root.analyzeSelectedRecord()
                 }
             }
         }
@@ -152,12 +209,33 @@ ScrollView {
                     color: "#424242"
                 }
 
-                Label {
-                    text: "公称厚度: " + (processAnalyzer.hasAnalysis && Number(processAnalyzer.result.nominalThicknessMm) > 0
-                                          ? Number(processAnalyzer.result.nominalThicknessMm).toFixed(3) + " mm"
-                                          : "--")
-                    font.pixelSize: 12
-                    color: "#424242"
+                RowLayout {
+                    spacing: 4
+
+                    Label { text: "公称厚度:"; font.pixelSize: 12; color: "#424242" }
+                    TextField {
+                        id: nominalThicknessField
+                        Layout.preferredWidth: 76
+                        font.pixelSize: 12
+                        placeholderText: "输入壁厚"
+                        inputMethodHints: Qt.ImhFormattedNumbersOnly
+                        enabled: recordCombo.currentIndex >= 0
+                        onAccepted: root.saveNominalThickness()
+                        onTextEdited: nominalEditMessage.text = ""
+                    }
+                    Label { text: "mm"; font.pixelSize: 11; color: "#757575" }
+                    Button {
+                        text: "保存"
+                        font.pixelSize: 12
+                        enabled: nominalThicknessField.enabled
+                        onClicked: root.saveNominalThickness()
+                    }
+                    Label {
+                        id: nominalEditMessage
+                        font.pixelSize: 11
+                        color: text === "已保存" ? "#388E3C" : "#D32F2F"
+                        visible: text.length > 0
+                    }
                 }
 
                 Label {
@@ -620,18 +698,7 @@ ScrollView {
                         Material.background: "#3F51B5"
                         Material.foreground: "white"
                         enabled: historyManager && historyManager.recordCount >= 3
-                        onClicked: {
-                            var threshold = parseFloat(rangeRateThresholdField.text)
-                            var minValid = parseFloat(minValidRateField.text)
-                            if (!isFinite(threshold) || threshold < 0) threshold = 5.0
-                            if (!isFinite(minValid)) minValid = 80.0
-                            processAnalyzer.analyzeBatch(
-                                batchCountBox.value,
-                                threshold,
-                                minValid,
-                                plugCountBox.value,
-                                cycleToleranceBox.value)
-                        }
+                        onClicked: root.analyzeBatchWithCurrentInputs()
                     }
                 }
             }

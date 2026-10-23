@@ -82,6 +82,75 @@ int main()
     const auto normal = envelope(20);
     const auto changed = envelope(8);
 
+    // Thin (<15mm) second-echo mode: its primary ordinal/period tracking
+    // stays intact. Only the same independent packet-net SNR and adaptive
+    // final fallback are additionally permitted for explicit T2-only.
+    auto makeThinFrame = [&](double tof, double snr,
+                         const std::vector<double> &shape) {
+        auto f = frame(tof, snr, shape);
+        f.thickWallRangeOnly = false;
+        return f;
+    };
+    auto seedThin = [&](bool allowFinalFallback) {
+        Tracker t;
+        t.setThinFinalSinglePeakFallbackEnabled(allowFinalFallback);
+        check(!t.process(makeThinFrame(895.0, 15.0, normal)).available,
+              "thin T2 cold startup must not be published by final fallback");
+        check(t.process(makeThinFrame(895.5, 15.0, normal)).available,
+              "thin primary T2 must establish LOCK");
+        check(t.process(makeThinFrame(896.0, 15.0, normal)).available,
+              "thin primary LOCK must remain active");
+        check(t.process(makeThinFrame(896.5, 15.0, normal)).available,
+              "thin primary prediction history must remain established");
+        return t;
+    };
+    auto directThin = makeThinFrame(898.0, 8.0, normal);
+    directThin.candidates.clear();
+    auto notEnabled = seedThin(false);
+    check(!notEnabled.process(directThin).available,
+          "thin T2 fallback is opt-in; disabled route must remain unchanged");
+    auto enabledThin = seedThin(true);
+    const auto recoveredThin = enabledThin.process(directThin);
+    check(recoveredThin.available && !recoveredThin.certified
+              && isFinalFallback(recoveredThin)
+              && recoveredThin.selectedRank == -1
+              && recoveredThin.selectedSnrDb > 1.3
+              && std::abs(recoveredThin.tofSamples - 898.0) < 0.35,
+          "thin T2 must use current-frame packet-local net SNR and no Top-8");
+    const auto afterThin = enabledThin.process(makeThinFrame(898.2, 15.0, normal));
+    check(afterThin.available && afterThin.templateCorrelation > 0.9,
+          "thin fallback must not train or overwrite primary T2 template");
+
+    auto thinIndependentSnr = seedThin(true);
+    auto staleNoise = directThin;
+    std::fill(staleNoise.directLocalMaxSnrDb.begin(),
+              staleNoise.directLocalMaxSnrDb.end(), -100.0);
+    check(thinIndependentSnr.process(staleNoise).available,
+          "thin net SNR must be independent of historic/global noise floor");
+
+    auto postGap = seedThin(true);
+    Tracker::Frame missingThin;
+    missingThin.referenceTofSamples = 805.0;
+    check(!postGap.process(missingThin).available,
+          "thin post-gap identity guard requires an observed miss");
+    const auto shiftedLobe = envelope(6);
+    std::vector<double> borderlineShape(41);
+    for (size_t i = 0; i < borderlineShape.size(); ++i)
+        borderlineShape[i] = normal[i] + 0.58 * shiftedLobe[i];
+    const auto postGapCandidate = postGap.process(
+        makeThinFrame(898.0, 5.0, borderlineShape));
+    check(!postGapCandidate.available
+              && std::string(postGapCandidate.reason)
+                  == "T2_LOCK_POST_GAP_LOW_IDENTITY_PENDING",
+          "thin post-gap weak formal T2 must be isolated without ordinal evidence");
+
+    auto noThinEnvelope = seedThin(true);
+    auto noThinWaveform = directThin;
+    noThinWaveform.directEnvelope.clear();
+    noThinWaveform.directFilteredSignal.clear();
+    check(!noThinEnvelope.process(noThinWaveform).available,
+          "missing thin-bandpass waveform must never produce invented TOF");
+
     // 1. Highest priority: a successful primary measurement must never be
     // replaced by a different, stronger, nearer or more ambiguous fallback.
     auto primary = seeded(normal);

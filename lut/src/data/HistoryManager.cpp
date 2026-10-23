@@ -330,6 +330,25 @@ void HistoryManager::setRecordTitle(int index, const QString &title)
     emit recordListChanged();
 }
 
+bool HistoryManager::setRecordNominalThickness(int index, double nominalThicknessMm)
+{
+    if (!std::isfinite(nominalThicknessMm) || nominalThicknessMm <= 0.0)
+        return false;
+
+    {
+        QMutexLocker locker(&m_mutex);
+        if (index < 0 || index >= m_records.size())
+            return false;
+        if (m_records[index].nominalThicknessMm == nominalThicknessMm)
+            return true;
+        m_records[index].nominalThicknessMm = nominalThicknessMm;
+    }
+
+    saveMetadata();
+    emit recordMetadataChanged(index);
+    return true;
+}
+
 void HistoryManager::deleteRecord(int index)
 {
     {

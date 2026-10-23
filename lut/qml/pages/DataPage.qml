@@ -210,7 +210,7 @@ ScrollView {
                         editorType: "spinbox"
                         intValue: 240
                         intFrom: 0
-                        intTo: 1000
+                        intTo: 10000
                         enabled: dataController && dataController.triggerSupported
                         onValueCommitted: function(value) {
                             if (dataController) dataController.setDelayCount(value)
