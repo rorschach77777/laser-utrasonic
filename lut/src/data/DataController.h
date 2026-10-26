@@ -204,6 +204,7 @@ signals:
 
     // Thickness history update
     void thicknessHistoryUpdated(double thickness);
+    void thicknessHistoryBackfilled(int framesAgo, double thickness);
 
     // History recording
     void historyRecordingChanged();
@@ -275,7 +276,8 @@ private:
         QString fileName;
         std::vector<double> original;
         std::vector<double> filtered;
-        double thickness = std::numeric_limits<double>::quiet_NaN();
+        // Published TOF horizontal position in waveform sample coordinates.
+        double tofSamples = std::numeric_limits<double>::quiet_NaN();
     };
     std::thread m_saveWorker;
     std::mutex m_saveQueueMutex;

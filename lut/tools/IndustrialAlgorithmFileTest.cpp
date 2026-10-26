@@ -291,6 +291,15 @@ int main(int argc, char* argv[])
         return ok && std::isfinite(value) && value > 0.0 ? value : 5.6;
     }();
     constexpr int filterOrder = 50;
+    // Optional regression overrides: exercise on-site filter settings without
+    // modifying the acquisition UI defaults or the production algorithm.
+    const auto filterBound = [](const char *key, double fallback) {
+        bool ok = false;
+        const double v = qEnvironmentVariable(key).toDouble(&ok);
+        return ok && std::isfinite(v) && v > 0.0 ? v : fallback;
+    };
+    const double filterLowMHz = filterBound("LST_MAIN_FILTER_LOW_MHZ", 3.0);
+    const double filterHighMHz = filterBound("LST_MAIN_FILTER_HIGH_MHZ", 30.0);
     ThicknessAlgorithmParameters algorithmParameters;
     // Regression A/B only: the actual UI uses DataController's bool setting.
     if (qEnvironmentVariableIsSet("LST_MAIN_T2_HIGH_PRECISION"))
@@ -340,8 +349,8 @@ int main(int argc, char* argv[])
             csv.raw,
             nullptr,
             sampleRateHz,
-            3.0,
-            30.0,
+            filterLowMHz,
+            filterHighMHz,
             delayCount,
             thicknessStdMm,
             1.0,

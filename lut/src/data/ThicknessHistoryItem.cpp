@@ -52,6 +52,17 @@ void ThicknessHistoryItem::addThickness(double thickness)
     update();
 }
 
+void ThicknessHistoryItem::replaceRecentThickness(int framesAgo, double thickness)
+{
+    // Called before the confirming frame is appended to the plot.
+    const int index = m_thicknesses.size() - framesAgo;
+    if (framesAgo <= 0 || index < 0 || index >= m_thicknesses.size())
+        return;
+    m_thicknesses[index] = thickness;
+    updateYRange();
+    update();
+}
+
 void ThicknessHistoryItem::clear()
 {
     m_thicknesses.clear();

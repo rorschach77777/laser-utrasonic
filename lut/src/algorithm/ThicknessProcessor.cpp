@@ -7658,6 +7658,16 @@ struct ThicknessProcessor::Impl
     SecondEchoOnlyTracker secondEchoOnlyTracker;
     SecondEchoParabolicTracker secondEchoParabolicTracker;
     SecondEchoRoiHilbert secondEchoRoiHilbert;
+    // T2-only scratch lives with this processor instance, never in a shared
+    // thread_local/global cache. Reuse capacity across 100-Hz frames.
+    struct T2PeakScratch {
+        int index = -1;
+        double tof = NaN;
+        double envelope = 0.0;
+        double snr = NaN;
+    };
+    std::vector<double> t2EnvelopeScratch;
+    std::vector<T2PeakScratch> t2PeaksScratch;
     EchoPairTracker secondEchoPeriodTracker;
     RawPhaseBranchTracker secondEchoRawPhaseTracker;
     WeakRawTemporalTracker secondEchoWeakRawTemporalTracker;
@@ -7721,7 +7731,10 @@ ThicknessResult ThicknessProcessor::process(
     p.filterOrder = filterOrder;
     p.thicknessStdMm = thicknessStdMm;
     p.echoPairBiasMm = parameters.echoPairBiasMm;
-    p.enableT2OnlyIndependentPairEvidence = parameters.echoMode == ThicknessEchoMode::T2Only;
+    // Only thin-wall T2 consumes Independent T1/T2/T3 period evidence.
+    // Thick-wall T2 tracks its first physical echo without ordinal anchors.
+    p.enableT2OnlyIndependentPairEvidence =
+        parameters.echoMode == ThicknessEchoMode::T2Only && thicknessStdMm < 15.0;
     p.thicknessToleranceMm = thicknessToleranceMm;
     p.structLen = structLen;
     p.minWidth = minWidth;
@@ -8157,10 +8170,20 @@ ThicknessResult ThicknessProcessor::process(
         startupHypothesisOutputApplied = true;
     }
 
+    // Thick-wall T2-only uses the first physical echo in its independent
+    // ROI. It consumes the shared filtered waveform and noise floor above,
+    // but NONE of T1's high-precision TOF, IdentityHypothesis, FinalPrimary,
+    // replay or period-anchor outputs below. Keep core T1 PeakHistory and its
+    // startup logic intact because they can affect the shared noise estimate.
+    // T1-only and thin-wall T2-only still execute the original full chain.
+    const bool skipUnusedT1Postprocessing =
+        parameters.echoMode == ThicknessEchoMode::T2Only && p.thicknessStdMm >= 15.0;
+    HighPrecisionDecision highPrecision;
+    ThicknessResult result;
+    if (!skipUnusedT1Postprocessing) {
     // 旧核心继续负责纵波身份、候选、LOCK/LOST与预测；最终显示厚度改由高精度TOF层接管。
     // STARTUP_PROVISIONAL确认帧已经由临时Envelope-NCC给出最终ToF，必须保持只读：
-    // 不调用正式高精度模板学习，避免冷启动临时形态污染后续成熟Envelope模板。
-    HighPrecisionDecision highPrecision;
+    // 不调用正式高精度模板学习，避免冷启动临时形态污染后续成熟Envelope模板.
     if ((startupEnvelopeConfirmed || startupHypothesisOutputApplied)
         && std::isfinite(waveform.interpolatedPeakIndex)
         && std::isfinite(waveform.thicknessMm)) {
@@ -8403,7 +8426,6 @@ ThicknessResult ThicknessProcessor::process(
     while (m_impl->candidateReplayHistory.size() > 32)
         m_impl->candidateReplayHistory.pop_front();
 
-    ThicknessResult result;
     // 正式输出切换：HighPrecision Final继续唯一决定VALID和绝对TOF标定；
     // Identity/Candidate只能经FinalPrimaryIdentityDecisionEngine对齐、证据融合后做稀疏身份纠错。
     // Candidate不再直接覆盖每帧Final，也绝不把INVALID/NO_SIGNAL升级为VALID。
@@ -8623,17 +8645,21 @@ ThicknessResult ThicknessProcessor::process(
     while (m_impl->candidateOutputHistory.size() > 32)
         m_impl->candidateOutputHistory.pop_front();
 
-    // 在任何T2覆盖发生前冻结当前FirstEcho正式输出；这与测试程序
-    // firstEchoFormalTofSamples（模式路由前的FirstEcho结果）语义一致。
-    const double formalT1ForT2Only = result.valid && std::isfinite(result.peakTimeSec)
-        ? result.peakTimeSec * p.sampleRateHz : NaN;
+    } else {
+        // T1 PeakHistory can still complete its normal backfill on this
+        // frame; consume the unused T1-only event without publishing it as T2.
+        WaveformResult unusedT1Backfill;
+        int unusedT1BackfillClock = 0;
+        m_impl->history.takeBackfill(unusedT1Backfill, unusedT1BackfillClock);
+    }
 
     // ---------------------------------------------------------------------
     // T2-only最终发布分支
     // ---------------------------------------------------------------------
-    // T1-only保持上述正式链完全不变。T2-only只在所有T1历史/模板/FinalPrimary更新
-    // 完成之后覆盖当前发布值，不回写任何T1状态。DeltaT/echo period仅作为身份佐证，
-    // 最终厚度严格由T2 absolute ordinal公式计算。
+    // T1-only和薄壁T2-only保留完整T1身份链；厚壁T2-only直接跳过不需要的
+    // T1高精度/FinalPrimary处理，但保留共享滤波、噪声估计和T1核心历史。
+    // T2发布不回写T1预测状态；厚壁不读取T1/周期证据，薄壁仍使用原物理认证。
+    // 最终厚度严格由原T2 absolute ordinal公式计算。
     if (parameters.echoMode == ThicknessEchoMode::T2Only) {
         const std::vector<double> &t2Filtered =
             filteredOut ? *filteredOut : t2FilteredLocal;
@@ -8687,15 +8713,13 @@ ThicknessResult ThicknessProcessor::process(
             const int candidateRight = std::clamp(
                 static_cast<int>(std::floor(t2Window.maxTofSamples)), candidateLeft, right);
 
-            struct T2Peak {
-                int index = -1;
-                double tof = NaN;
-                double envelope = 0.0;
-                double snr = NaN;
-            };
-
-            std::vector<T2Peak> peaks;
-            std::vector<double> t2Envelope;
+            // Maintain an empty view on skipped/invalid ROI frames rather
+            // than accidentally processing the preceding frame's envelope.
+            using T2Peak = Impl::T2PeakScratch;
+            auto &peaks = m_impl->t2PeaksScratch;
+            auto &t2Envelope = m_impl->t2EnvelopeScratch;
+            peaks.clear();
+            t2Envelope.clear();
             if (candidateRight > candidateLeft + 2) {
                 // 与测试程序的独立T2 ROI Hilbert输入/裁剪/镜像约定一致。
                 // 全帧模式仅用于回归对照；默认T2使用局部ROI+128 sample。
@@ -8757,33 +8781,11 @@ ThicknessResult ThicknessProcessor::process(
                     if (!std::isfinite(snr) || snr < std::max(2.5, p.echoMinSnrDb))
                         continue;
 
-                    const int t50Half = std::clamp(p.packetMaxWidth / 4, 12, 24);
-                    const int supportLeft = std::max(left, i - t50Half);
-                    const int supportRight = std::min(right, i + t50Half);
-                    double total = 0.0;
-                    for (int j = supportLeft; j <= supportRight; ++j) {
-                        const double e = t2Envelope[static_cast<size_t>(j)];
-                        total += e * e;
-                    }
-
-                    double tof = static_cast<double>(i);
-                    if (total > 1e-24) {
-                        const double target = 0.5 * total;
-                        double cumulative = 0.0;
-                        for (int j = supportLeft; j <= supportRight; ++j) {
-                            const double e = t2Envelope[static_cast<size_t>(j)];
-                            const double w = e * e;
-                            if (cumulative + w >= target) {
-                                const double fraction = w > 1e-24
-                                    ? std::clamp((target - cumulative) / w, 0.0, 1.0)
-                                    : 0.5;
-                                tof = static_cast<double>(j) - 0.5 + fraction;
-                                break;
-                            }
-                            cumulative += w;
-                        }
-                    }
-                    peaks.push_back({i, tof, y0, snr});
+                    // The t50 position is needed only for separation and
+                    // template construction of candidates actually visited
+                    // in sorted Top-8 selection. Defer the two packet-energy
+                    // scans below: comparator uses envelope/index only.
+                    peaks.push_back({i, static_cast<double>(i), y0, snr});
                 }
             }
 
@@ -8796,27 +8798,60 @@ ThicknessResult ThicknessProcessor::process(
             const int separation = std::max(
                 p.candidateSeparationSamples, std::max(8, p.packetMinWidth));
             constexpr int topK = 8;
-            std::vector<T2Peak> selected;
+            // Top-8 is a fixed budget: a stack array avoids a per-frame
+            // vector allocation while preserving the exact stable scan/order.
+            std::array<T2Peak, topK> selected{};
+            int selectedCount = 0;
+            const int t50Half = std::clamp(p.packetMaxWidth / 4, 12, 24);
             for (const auto &peak : peaks) {
+                // Preserve original arithmetic/order for the few candidates
+                // that reach selection. Unvisited/low-ranked peaks no longer
+                // incur two energy-integration passes each frame.
+                const int supportLeft = std::max(left, peak.index - t50Half);
+                const int supportRight = std::min(right, peak.index + t50Half);
+                double total = 0.0;
+                for (int j = supportLeft; j <= supportRight; ++j) {
+                    const double e = t2Envelope[static_cast<size_t>(j)];
+                    total += e * e;
+                }
+                double tof = static_cast<double>(peak.index);
+                if (total > 1e-24) {
+                    const double target = 0.5 * total;
+                    double cumulative = 0.0;
+                    for (int j = supportLeft; j <= supportRight; ++j) {
+                        const double e = t2Envelope[static_cast<size_t>(j)];
+                        const double w = e * e;
+                        if (cumulative + w >= target) {
+                            const double fraction = w > 1e-24
+                                ? std::clamp((target - cumulative) / w, 0.0, 1.0)
+                                : 0.5;
+                            tof = static_cast<double>(j) - 0.5 + fraction;
+                            break;
+                        }
+                        cumulative += w;
+                    }
+                }
                 bool separated = true;
-                for (const auto &kept : selected) {
-                    if (std::abs(peak.tof - kept.tof) < separation) {
+                for (int j = 0; j < selectedCount; ++j) {
+                    if (std::abs(tof - selected[static_cast<size_t>(j)].tof)
+                        < separation) {
                         separated = false;
                         break;
                     }
                 }
                 if (!separated)
                     continue;
-                selected.push_back(peak);
-                if (static_cast<int>(selected.size()) >= topK)
+                selected[static_cast<size_t>(selectedCount)] = peak;
+                selected[static_cast<size_t>(selectedCount++)].tof = tof;
+                if (selectedCount >= topK)
                     break;
             }
 
-            result.t2OnlyCandidateCount = static_cast<int>(selected.size());
+            result.t2OnlyCandidateCount = selectedCount;
             QStringList t2CandidateSummary;
-            t2Frame.candidates.reserve(selected.size());
+            t2Frame.candidates.reserve(static_cast<size_t>(selectedCount));
             constexpr int templateHalf = 20;
-            for (int rank = 0; rank < static_cast<int>(selected.size()); ++rank) {
+            for (int rank = 0; rank < selectedCount; ++rank) {
                 const auto &peak = selected[static_cast<size_t>(rank)];
                 SecondEchoOnlyTracker::Candidate candidate;
                 candidate.tofSamples = peak.tof;
@@ -9186,6 +9221,11 @@ ThicknessResult ThicknessProcessor::process(
         // test program's full parabolic-crest tracker (including candidates,
         // prediction, identity and terminal single-peak fallback).
         SecondEchoOnlyTracker::Decision t2Decision;
+        bool t2StartupBackfill = false;
+        int t2StartupBackfillFramesAgo = 0;
+        double t2StartupBackfillTof = NaN;
+        double t2StartupBackfillSnr = NaN;
+        double t2StartupBackfillVoltage = NaN;
         if (parameters.t2HighPrecisionDetectionEnabled) {
             m_impl->secondEchoOnlyTracker.setThinFinalSinglePeakFallbackEnabled(
                 thinT2FinalFallback);
@@ -9216,7 +9256,7 @@ ThicknessResult ThicknessProcessor::process(
             // Keep each original envelope shape / SNR / rank. Only the TOF
             // coordinate changes to the fitted positive carrier crest.
             auto appendParabolicCandidate =
-                [&](const SecondEchoOnlyTracker::Candidate &source,
+                [&](SecondEchoOnlyTracker::Candidate &source,
                     std::vector<SecondEchoParabolicTracker::Candidate> &destination) {
                     if (source.envelopePeakIndex < 0)
                         return;
@@ -9231,14 +9271,17 @@ ThicknessResult ThicknessProcessor::process(
                     dest.score = source.score;
                     dest.rank = source.rank;
                     dest.envelopePeakIndex = source.envelopePeakIndex;
-                    dest.envelopeTemplate = source.envelopeTemplate;
+                    // The t50 candidate is never read again on this branch.
+                    // Transfer the 41-sample template buffer rather than
+                    // allocate/copy the same packet shape a second time.
+                    dest.envelopeTemplate = std::move(source.envelopeTemplate);
                     destination.push_back(std::move(dest));
                 };
             parabolaFrame.candidates.reserve(t2Frame.candidates.size());
-            for (const auto &candidate : t2Frame.candidates)
+            for (auto &candidate : t2Frame.candidates)
                 appendParabolicCandidate(candidate, parabolaFrame.candidates);
             parabolaFrame.weakLockCandidates.reserve(t2Frame.weakLockCandidates.size());
-            for (const auto &candidate : t2Frame.weakLockCandidates)
+            for (auto &candidate : t2Frame.weakLockCandidates)
                 appendParabolicCandidate(candidate, parabolaFrame.weakLockCandidates);
 
             m_impl->secondEchoParabolicTracker.setThinFinalSinglePeakFallbackEnabled(
@@ -9255,6 +9298,11 @@ ThicknessResult ThicknessProcessor::process(
             t2Decision.selectedSnrDb = parabolaDecision.selectedSnrDb;
             t2Decision.selectedEnvelopePeakIndex =
                 parabolaDecision.selectedEnvelopePeakIndex;
+            t2StartupBackfill = parabolaDecision.hasStartupBackfill;
+            t2StartupBackfillFramesAgo = parabolaDecision.startupBackfillFramesAgo;
+            t2StartupBackfillTof = parabolaDecision.startupBackfillTofSamples;
+            t2StartupBackfillSnr = parabolaDecision.startupBackfillSnrDb;
+            t2StartupBackfillVoltage = parabolaDecision.startupBackfillPeakVoltage;
         }
         result.t2OnlyStage = QString::fromLatin1(
             SecondEchoOnlyTracker::stageName(t2Decision.stage));
@@ -9297,8 +9345,41 @@ ThicknessResult ThicknessProcessor::process(
             }
         }
 
-        // T2-only不继承T1的延迟回填；其startup/reacquire由独立T2状态机决定。
+        // T2-only never inherits T1 backfills. The parabolic tracker may
+        // confirm the previous cold-start candidate on the second frame;
+        // publish that PREVIOUS measured TOF only after normal LOCK, using
+        // the identical thickness formula as the current T2 publication.
         result.hasBackfill = false;
+        if (t2Valid && t2StartupBackfill && t2StartupBackfillFramesAgo == 1
+            && std::isfinite(t2StartupBackfillTof)
+            && std::isfinite(t2StartupBackfillSnr)) {
+            const double k = p.longitudinalVelocityMps
+                / p.sampleRateHz * 0.5 * 1000.0;
+            double priorThickness = NaN;
+            if (k > 0.0) {
+                if (thickWallT2) {
+                    priorThickness = k * (t2StartupBackfillTof + p.delayCount)
+                        - CURRENT_FIXED_BIAS_MM;
+                } else {
+                    const double a = -static_cast<double>(p.delayCount)
+                        + (CURRENT_FIXED_BIAS_MM - parameters.echoPairBiasMm) / k;
+                    priorThickness = k * (t2StartupBackfillTof - a) / 2.0
+                        - parameters.echoPairBiasMm
+                        + parameters.secondEchoOrdinalCorrectionMm
+                        - parameters.secondEchoT50BiasMm;
+                }
+            }
+            if (std::isfinite(priorThickness) && priorThickness > 0.0) {
+                result.hasBackfill = true;
+                result.backfillFramesAgo = 1;
+                result.backfillThicknessMm = priorThickness;
+                result.backfillPeakTimeSec = t2StartupBackfillTof / p.sampleRateHz;
+                result.backfillPeakVoltage = t2StartupBackfillVoltage;
+                result.backfillSnrDb = t2StartupBackfillSnr;
+                result.backfillPeakIndex =
+                    static_cast<int>(std::llround(t2StartupBackfillTof));
+            }
+        }
         result.hasFinalPrimaryShadowBackfill = false;
         result.valid = t2Valid;
         result.thicknessMm = t2Valid ? t2ThicknessMm : NaN;

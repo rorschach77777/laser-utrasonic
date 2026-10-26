@@ -3,6 +3,7 @@
 #include "T2FilteredPeakRefinement.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -14,7 +15,7 @@ class SecondEchoParabolicTracker
 {
 public:
     enum class Stage { GlobalSearch, Warmup, Locked };
-    enum class FilteredPeakMode { Integer, Parabolic, Sinc24 };
+    enum class FilteredPeakMode { Integer, Parabolic };
 
     struct Config {
         int startupConfirmations = 2;
@@ -179,7 +180,7 @@ public:
         int directSupportRight = -1;
         int directT50HalfWidth = 12;
         // Only PARABOLIC mode broadens the positive-crest search around
-        // the matched envelope peak. Keep t50/Integer/Sinc24 unchanged.
+        // the matched envelope peak. Keep Integer unchanged.
         // A/B: 12 = old baseline; default 16; tested up to 20.
         int parabolicPositivePeakSearchHalfWidth = 16;
         std::vector<double> directEnvelope;
@@ -214,6 +215,13 @@ public:
         bool candidateFound = false;
         bool available = false;
         bool certified = false;
+        // Once the ordinary second-frame vote establishes cold-start LOCK,
+        // permit publishing the preceding frame's OWN measured TOF.
+        bool hasStartupBackfill = false;
+        int startupBackfillFramesAgo = 0;
+        double startupBackfillTofSamples = nan();
+        double startupBackfillSnrDb = nan();
+        double startupBackfillPeakVoltage = nan();
         bool deltaTStrongSupport = false;
         bool deltaTAcceptableSupport = false;
         bool t2T3Support = false;
@@ -289,7 +297,7 @@ public:
         const int last = first + static_cast<int>(f.directFilteredSignal.size()) - 1;
         // Parabolic A/B: widen only the matched carrier-crest search.
         // Identity candidate ROI and predictor/NCC gates are unchanged.
-        // Integer/Sinc24 remain at the original <=12-sample search.
+        // Integer remains at the original <=12-sample search.
         const int half = (outputOnlyParabolicWindow
             || (f.integerPeakTrackingEnabled
                 && f.filteredPeakMode == FilteredPeakMode::Parabolic))
@@ -324,11 +332,11 @@ public:
         if (peak < 0) return nan();
         if (f.filteredPeakMode == FilteredPeakMode::Integer)
             return static_cast<double>(peak);
-        const auto fit = T2FilteredPeakRefinement::analyze(
+        // No Sinc12/Sinc24 work: candidate identity and prediction both
+        // use the same three-point parabolic crest position.
+        return T2FilteredPeakRefinement::analyzeParabolic(
             f.directFilteredSignal, f.directEnvelopeFirstIndex, peak,
-            f.directSupportLeft, f.directSupportRight);
-        return f.filteredPeakMode == FilteredPeakMode::Parabolic
-            ? fit.parabolicIndex : fit.sinc24Index;
+            f.directSupportLeft, f.directSupportRight).parabolicIndex;
     }
 
     SecondEchoParabolicTracker() = default;
@@ -346,6 +354,11 @@ public:
         m_stage = Stage::GlobalSearch;
         m_history.clear();
         m_pendingCenters.clear();
+        m_frameClock = 0;
+        m_pendingStartupClock = 0;
+        m_pendingStartupTof = nan();
+        m_pendingStartupSnr = nan();
+        m_pendingStartupVoltage = nan();
         m_frozenTofSamples = nan();
         m_fallbackPredictionTof = nan();
         m_template.clear();
@@ -661,6 +674,7 @@ private:
     Decision processPrimary(const Frame &f)
     {
         Decision out;
+        ++m_frameClock;
         if (m_framesSincePublication < std::numeric_limits<int>::max())
             ++m_framesSincePublication;
         m_thickWallRangeOnly = f.thickWallRangeOnly;
@@ -1118,7 +1132,40 @@ private:
                     m_afterColdRestart = false;
                     confirmed = true;
                 } else {
+                    // Only a matching immediately preceding cold-start frame
+                    // can be backfilled: no gap, mismatch, or later reacquire.
+                    const bool matchedPreviousColdFrame =
+                        m_stage == Stage::Warmup
+                        && m_pendingCenters.size() == 1
+                        && m_pendingStartupClock != 0
+                        && m_pendingStartupClock + 1 == m_frameClock
+                        && !m_afterColdRestart
+                        && !std::isfinite(m_lastPublishedTof)
+                        && std::isfinite(m_pendingStartupTof)
+                        && std::abs(out.tofSamples - m_pendingStartupTof)
+                            <= m_cfg.startupConsistencySamples;
                     confirmed = observeStartup(out.tofSamples);
+                    if (confirmed && matchedPreviousColdFrame) {
+                        out.hasStartupBackfill = true;
+                        out.startupBackfillFramesAgo = 1;
+                        out.startupBackfillTofSamples = m_pendingStartupTof;
+                        out.startupBackfillSnrDb = m_pendingStartupSnr;
+                        out.startupBackfillPeakVoltage = m_pendingStartupVoltage;
+                    }
+                    if (!confirmed && m_stage == Stage::Warmup
+                        && m_pendingCenters.size() == 1) {
+                        // First vote or replacement after inconsistent peaks.
+                        m_pendingStartupClock = m_frameClock;
+                        m_pendingStartupTof = out.tofSamples;
+                        m_pendingStartupSnr = out.selectedSnrDb;
+                        m_pendingStartupVoltage = nan();
+                        const int local = static_cast<int>(std::llround(out.tofSamples))
+                            - f.directEnvelopeFirstIndex;
+                        if (local >= 0
+                            && local < static_cast<int>(f.directFilteredSignal.size()))
+                            m_pendingStartupVoltage =
+                                f.directFilteredSignal[static_cast<size_t>(local)];
+                    }
                 }
             }
             out.stage = m_stage;
@@ -1387,14 +1434,17 @@ private:
     // Estimate background over a SEPARATE wider +/-64-sample region, bounded
     // by the physical T2 support and currently available filtered waveform.
     // Missing bilateral background still makes SNR untrustworthy.
-    static DirectPacketSnr directWindowSnrDb(const Frame &f, int peak,
-                                              int begin, int end)
+    DirectPacketSnr directWindowSnrDb(const Frame &f, int peak,
+                                       int begin, int end) const
     {
         DirectPacketSnr result;
         const int first = f.directEnvelopeFirstIndex;
         const int k = peak - first;
         const double amplitude = f.directEnvelope[static_cast<size_t>(k)];
-        std::vector<double> levels;
+        // Reuse this tracker's scratch across candidates and 100-Hz frames.
+        // nth_element may reorder the scratch but never the source envelope.
+        auto &levels = m_snrLevelsScratch;
+        levels.clear();
         levels.reserve(static_cast<size_t>(end - begin + 1));
         for (int i = begin; i <= end; ++i)
             levels.push_back(f.directEnvelope[static_cast<size_t>(i - first)]);
@@ -1470,7 +1520,10 @@ private:
             availableLeft, begin - backgroundExtraSamples);
         const int backgroundEnd = std::min(
             availableRight, end + backgroundExtraSamples);
-        std::vector<double> bg;
+        auto &bg = m_snrBackgroundScratch;
+        bg.clear();
+        if (backgroundBegin <= backgroundEnd)
+            bg.reserve(static_cast<size_t>((backgroundEnd-backgroundBegin) / stride + 1));
         for (int i = backgroundBegin; i <= backgroundEnd; i += stride) {
             const bool isLeft = i + half < result.left - guard;
             const bool isRight = i - half > result.right + guard;
@@ -1940,6 +1993,11 @@ private:
     Stage m_stage = Stage::GlobalSearch;
     std::deque<double> m_history;
     std::deque<double> m_pendingCenters;
+    std::uint64_t m_frameClock = 0;
+    std::uint64_t m_pendingStartupClock = 0;
+    double m_pendingStartupTof = nan();
+    double m_pendingStartupSnr = nan();
+    double m_pendingStartupVoltage = nan();
     double m_frozenTofSamples = nan();
     // Published fallback TOF for next-frame prediction only. It is not an
     // accepted template or a certified observation in the TOF history.
@@ -1956,4 +2014,8 @@ private:
     bool m_thickWallRangeOnly = false;
     std::vector<double> m_recentTemplate;
     std::vector<double> m_alternateTemplate;
+    // Allocation-free after warmup for the fallback packet-net-SNR scans.
+    // Mutable scratch only: never consulted for history, identity or output.
+    mutable std::vector<double> m_snrLevelsScratch;
+    mutable std::vector<double> m_snrBackgroundScratch;
 };

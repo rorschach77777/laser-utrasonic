@@ -1,4 +1,6 @@
 #include "algorithm/SecondEchoOnlyTracker.h"
+#include "algorithm/SecondEchoParabolicTracker.h"
+#include "algorithm/SecondEchoRoiHilbert.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -81,6 +83,108 @@ int main()
 {
     const auto normal = envelope(20);
     const auto changed = envelope(8);
+
+    // ROI Hilbert caches one FFT plan and its spectrum/output buffers per
+    // processor instance. Identical ROI and input must be bit-for-bit stable.
+    std::vector<double> testSignal(1600);
+    for (size_t i = 0; i < testSignal.size(); ++i)
+        testSignal[i] = std::sin(0.12 * static_cast<double>(i))
+            + 0.15 * std::cos(0.29 * static_cast<double>(i));
+    SecondEchoRoiHilbert roiHilbert;
+    const auto &firstEnvelope = roiHilbert.calculate(testSignal, 700, 1000, 128);
+    const int firstFftSize = roiHilbert.lastFftSize;
+    const double *firstBuffer = firstEnvelope.data();
+    const std::vector<double> firstEnvelopeCopy = firstEnvelope;
+    const auto &secondEnvelope = roiHilbert.calculate(testSignal, 700, 1000, 128);
+    check(roiHilbert.lastFftSize == firstFftSize
+              && secondEnvelope.data() == firstBuffer
+              && secondEnvelope == firstEnvelopeCopy,
+          "stable Hilbert ROI must reuse FFT-sized output without changing samples");
+    roiHilbert.calculate(testSignal, 200, 270, 0);
+    check(roiHilbert.lastFftSize != firstFftSize,
+          "ROI FFT plan size must follow requested support geometry");
+    check(roiHilbert.calculate(testSignal, 700, 1000, 128) == firstEnvelopeCopy,
+          "replanned ROI FFT must return the same envelope samples");
+
+    // T2 parabolic: two cold-start frames certify the identity, then return
+    // the FIRST frame's measured TOF as a one-frame delayed backfill.
+    using Parabolic = SecondEchoParabolicTracker;
+    // The parabolic-only API preserves the original three-point calculation
+    // without invoking either removed Sinc interpolator.
+    const std::vector<double> crest{0.0, 2.0, 4.0, 3.0, 0.0};
+    const auto crestFit = T2FilteredPeakRefinement::analyzeParabolic(
+        crest, 100, 102, 100, 104);
+    check(crestFit.integerIndex == 102
+              && std::abs(crestFit.parabolicIndex - 102.16666666666667) < 1e-12
+              && std::abs(crestFit.parabolicHeight - 4.041666666666667) < 1e-12,
+          "parabolic-only TOF and crest height must match three-point formula");
+    check(!std::isfinite(T2FilteredPeakRefinement::analyzeParabolic(
+              crest, 100, 100, 100, 104).parabolicIndex),
+          "parabolic fitting must reject insufficient left support");
+    auto parabolicFrame = [&](double tof, double snr = 15.0) {
+        Parabolic::Frame f;
+        f.thickWallRangeOnly = true;
+        f.integerPeakTrackingEnabled = true;
+        f.filteredPeakMode = Parabolic::FilteredPeakMode::Parabolic;
+        f.referenceTofSamples = 900.0;
+        Parabolic::Candidate c;
+        c.tofSamples = tof;
+        c.snrDb = snr;
+        c.score = snr / 10.0;
+        c.rank = 0;
+        c.envelopeTemplate = normal;
+        c.envelopePeakIndex = static_cast<int>(std::llround(tof));
+        f.candidates.push_back(c);
+        f.directEnvelopeFirstIndex = 850;
+        f.directFilteredSignal.assign(130, 1.25);
+        return f;
+    };
+    Parabolic startup;
+    const auto first = startup.process(parabolicFrame(895.25, 14.0));
+    check(!first.available && !first.hasStartupBackfill
+              && std::string(first.reason) == "T2_STARTUP_PENDING",
+          "first frame must remain pending until a matching second frame");
+    const auto second = startup.process(parabolicFrame(896.5, 15.0));
+    check(second.available && second.stage == Parabolic::Stage::Locked
+              && second.hasStartupBackfill
+              && second.startupBackfillFramesAgo == 1
+              && std::abs(second.startupBackfillTofSamples - 895.25) < 1e-9
+              && std::abs(second.startupBackfillSnrDb - 14.0) < 1e-9
+              && std::abs(second.startupBackfillPeakVoltage - 1.25) < 1e-9,
+          "second-frame certification must backfill first frame's own TOF/SNR/voltage");
+    check(!startup.process(parabolicFrame(897.0)).hasStartupBackfill,
+          "a completed cold startup must not repeatedly backfill old frames");
+
+    Parabolic mismatch;
+    check(!mismatch.process(parabolicFrame(850.0)).available,
+          "incorrect first candidate remains pending");
+    const auto newSeed = mismatch.process(parabolicFrame(895.0));
+    check(!newSeed.available && !newSeed.hasStartupBackfill,
+          "inconsistent second-frame candidate cannot certify or backfill old peak");
+    const auto recovered = mismatch.process(parabolicFrame(896.0));
+    check(recovered.available && recovered.hasStartupBackfill
+              && std::abs(recovered.startupBackfillTofSamples - 895.0) < 1e-9,
+          "a later matching pair may recover only its own previous candidate");
+
+    Parabolic gap;
+    gap.process(parabolicFrame(895.0));
+    Parabolic::Frame missing;
+    missing.thickWallRangeOnly = true;
+    missing.referenceTofSamples = 900.0;
+    check(!gap.process(missing).available, "missing second frame cannot certify startup");
+    const auto afterGap = gap.process(parabolicFrame(895.5));
+    check(!afterGap.hasStartupBackfill,
+          "startup backfill must never target a missing intervening frame");
+
+    Parabolic reset;
+    reset.process(parabolicFrame(895.0));
+    reset.reset();
+    check(!reset.process(parabolicFrame(910.0)).available,
+          "new acquisition must restart the two-frame confirmation");
+    const auto resetConfirmed = reset.process(parabolicFrame(911.0));
+    check(resetConfirmed.available && resetConfirmed.hasStartupBackfill
+              && std::abs(resetConfirmed.startupBackfillTofSamples - 910.0) < 1e-9,
+          "reset must discard stale cold-start candidate metadata");
 
     // Thin (<15mm) second-echo mode: its primary ordinal/period tracking
     // stays intact. Only the same independent packet-net SNR and adaptive

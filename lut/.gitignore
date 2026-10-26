@@ -68,6 +68,10 @@ CMakeLists.txt.user*
 # Python byte code
 *.pyc
 
+# Runtime/test artifacts (not source or engineering notes)
+*.log
+*.tmp
+
 # Binaries
 # --------
 *.dll

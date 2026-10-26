@@ -15,6 +15,7 @@ public:
     void paint(QPainter *painter) override;
 
     Q_INVOKABLE void addThickness(double thickness);
+    Q_INVOKABLE void replaceRecentThickness(int framesAgo, double thickness);
     Q_INVOKABLE void clear();
 
 private:

@@ -445,15 +445,15 @@ void DataController::saveWorkerLoop()
         QFile file(job.fileName);
         if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream out(&file);
-            out << "Index,Original,Filtered,Thickness\n";
-            const QString thickStr = std::isnan(job.thickness)
-                ? QStringLiteral("NaN") : QString::number(job.thickness, 'f', 6);
+            out << "Index,Original,Filtered,TOF(samples)\n";
+            const QString tofStr = std::isfinite(job.tofSamples)
+                ? QString::number(job.tofSamples, 'f', 6) : QStringLiteral("NaN");
             const int count = static_cast<int>((std::min)(job.original.size(), job.filtered.size()));
             for (int i = 0; i < count; ++i) {
                 out << i << ","
                     << job.original[static_cast<size_t>(i)] << ","
                     << job.filtered[static_cast<size_t>(i)] << ","
-                    << thickStr << "\n";
+                    << tofStr << "\n";
             }
             file.close();
         } else {
@@ -1332,6 +1332,9 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
                 }
 
                 if (backfillApplied) {
+                    // Inform the plot about the corrected historical point
+                    // before appending the new frame; do not append twice.
+                    emit thicknessHistoryBackfilled(backfillFramesAgo, backfillThickness);
                     // PENDING帧原本必为无效值；回填只补齐一次有效统计，不改变尝试总数。
                     if (!std::isfinite(replacedThickness)) {
                         ++m_validDetections;
@@ -1384,10 +1387,13 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
         if (!commitQueued)
             m_pendingResultCommits.fetch_sub(1, std::memory_order_release);
 
-        // 写盘延迟一个完整帧：若当前帧确认重锁，可先把上一帧PENDING厚度回填后再入队。
+        // 写盘延迟一个完整帧：若当前帧确认重锁，先回填上一帧的真实TOF再入队。
         if (m_hasPendingFrameSave) {
-            if (hasBackfill && backfillFramesAgo == 1 && std::isfinite(backfillThickness))
-                m_pendingFrameSave.thickness = backfillThickness;
+            if (hasBackfill && backfillFramesAgo == 1 && std::isfinite(backfillThickness)) {
+                m_pendingFrameSave.tofSamples = std::isfinite(thicknessResult.backfillPeakTimeSec)
+                    ? thicknessResult.backfillPeakTimeSec * cfg.clockRatePerChan
+                    : std::numeric_limits<double>::quiet_NaN();
+            }
             flushPendingFrameSave();
         }
 
@@ -1395,7 +1401,10 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
             m_pendingFrameSave.fileName = job.saveFileName;
             m_pendingFrameSave.original = std::move(job.original);
             m_pendingFrameSave.filtered.assign(filtered.begin(), filtered.end());
-            m_pendingFrameSave.thickness = thickness;
+            m_pendingFrameSave.tofSamples = thicknessResult.valid
+                && std::isfinite(thicknessResult.peakTimeSec)
+                ? thicknessResult.peakTimeSec * cfg.clockRatePerChan
+                : std::numeric_limits<double>::quiet_NaN();
             m_hasPendingFrameSave = true;
         }
     }

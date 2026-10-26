@@ -1022,6 +1022,11 @@ ScrollView {
                 graphItem.clearMarkers()
             }
         }
+        function onThicknessHistoryBackfilled(framesAgo, thickness) {
+            if (thicknessPlot) {
+                thicknessPlot.replaceRecentThickness(framesAgo, thickness)
+            }
+        }
         function onThicknessHistoryUpdated(thickness) {
             if (thicknessPlot) {
                 thicknessPlot.addThickness(thickness)
