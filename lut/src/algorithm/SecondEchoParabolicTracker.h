@@ -18,9 +18,13 @@ public:
     enum class FilteredPeakMode { Integer, Parabolic };
 
     struct Config {
-        int startupConfirmations = 2;
+        int startupConfirmations = 3;
         int startupWindowFrames = 3;
         double startupConsistencySamples = 12.0;
+        // First-ever lock only: noise peaks can have an apparently stable TOF.
+        // Do not authorize the initial 3-frame vote on local SNR alone.
+        double coldStartupMinNetSnrDb = 8.0;
+        double coldStartupMinShapeCorrelation = 0.75;
         int predictionHalfWidth = 16;
         int maxMissesBeforeGlobal = 3;
         // LOST后短时间保留冻结T2身份用于重捕获；若连续长时间仍无法恢复，
@@ -354,6 +358,7 @@ public:
         m_stage = Stage::GlobalSearch;
         m_history.clear();
         m_pendingCenters.clear();
+        m_coldStartupTemplate.clear();
         m_frameClock = 0;
         m_pendingStartupClock = 0;
         m_pendingStartupTof = nan();
@@ -975,6 +980,13 @@ private:
                     missReason = "T2_LOCK_NO_PREDICTION";
                 }
             }
+            if (!std::isfinite(m_lastPublishedTof)) {
+                // Cold votes must be three consecutive strong real packets;
+                // an intervening no-signal/no-candidate frame breaks the vote.
+                m_pendingCenters.clear();
+                m_coldStartupTemplate.clear();
+                m_stage = Stage::GlobalSearch;
+            }
             const bool coldRestarted = observeMiss();
             out.stage = m_stage;
             out.consecutiveMisses = m_stage == Stage::Locked ? m_misses : m_recoveryMisses;
@@ -1089,12 +1101,51 @@ private:
         applyEvidence(f, out);
 
         if (m_stage == Stage::GlobalSearch || m_stage == Stage::Warmup) {
+            // With no previously published echo, three close noise maxima
+            // must NOT self-certify the first pipe-head measurement. Require
+            // separately strong net packet SNR and cross-frame packet shape.
+            // This is a cold-start gate only: stable LOCK and LOST recovery
+            // retain their existing weak-signal policy.
+            if (!std::isfinite(m_lastPublishedTof)) {
+                if (!std::isfinite(selected->snrDb)
+                    || selected->snrDb < m_cfg.coldStartupMinNetSnrDb
+                    || selected->envelopeTemplate.size() < 8) {
+                    m_pendingCenters.clear();
+                    m_coldStartupTemplate.clear();
+                    m_stage = Stage::GlobalSearch;
+                    out.available = false;
+                    out.certified = false;
+                    out.reason = "T2_COLD_START_NOISE_VETO";
+                    return out;
+                }
+                if (!m_pendingCenters.empty()) {
+                    double corr = nan();
+                    for (int shift = -3; shift <= 3; ++shift) {
+                        const double c = correlationAtShift(
+                            m_coldStartupTemplate, selected->envelopeTemplate, shift);
+                        if (std::isfinite(c) && (!std::isfinite(corr) || c > corr))
+                            corr = c;
+                    }
+                    if (!std::isfinite(corr)
+                        || corr < m_cfg.coldStartupMinShapeCorrelation
+                        || std::abs(out.tofSamples - median(m_pendingCenters))
+                            > m_cfg.startupConsistencySamples) {
+                        // Restart at this observation; it is vote 1, not a
+                        // continuation of the old noise packet's vote sequence.
+                        m_pendingCenters.clear();
+                        m_stage = Stage::GlobalSearch;
+                    }
+                }
+                if (m_pendingCenters.empty())
+                    m_coldStartupTemplate = selected->envelopeTemplate;
+            }
             // 能找到可用候选说明真实信号已重新出现，长空窗计数从这里重新开始；
             // 是否正式建锁仍由下面的period或2-of-3启动确认决定。
             m_recoveryMisses = 0;
             // 当前帧若已有强DeltaT/T2-T3 ordinal证据，候选身份已经被独立序列证据
             // 直接认证，不必再等待2-of-3。注意：证据只决定“这是T2”，厚度仍只用T2 TOF。
-            const bool directIdentity = out.deltaTStrongSupport || out.t2T3Support;
+            const bool directIdentity = (out.deltaTStrongSupport || out.t2T3Support)
+                && std::isfinite(m_lastPublishedTof); // first cold startup always needs 3 frames
             bool confirmed = false;
             if (directIdentity) {
                 m_stage = Stage::Locked;
@@ -1172,6 +1223,7 @@ private:
             out.startupVotes = directIdentity ? 1 : static_cast<int>(m_pendingCenters.size());
             out.available = confirmed;
             if (confirmed) {
+                m_coldStartupTemplate.clear();
                 m_unpublishedAge = 0;
                 m_framesSincePublication = 0;
                 m_lastPublishedTof = out.tofSamples;
@@ -1993,6 +2045,7 @@ private:
     Stage m_stage = Stage::GlobalSearch;
     std::deque<double> m_history;
     std::deque<double> m_pendingCenters;
+    std::vector<double> m_coldStartupTemplate;
     std::uint64_t m_frameClock = 0;
     std::uint64_t m_pendingStartupClock = 0;
     double m_pendingStartupTof = nan();

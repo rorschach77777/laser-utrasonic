@@ -132,6 +132,16 @@ struct ThicknessAlgorithmParameters
     std::uint64_t revision = 0;
 };
 
+// A confirmed three-frame T2 cold start can restore BOTH preceding frames.
+// The existing single-frame backfill fields remain for other algorithms.
+struct ThicknessStartupBackfill {
+    int framesAgo = 0;
+    double thicknessMm = std::numeric_limits<double>::quiet_NaN();
+    double peakTimeSec = std::numeric_limits<double>::quiet_NaN();
+    double peakVoltage = std::numeric_limits<double>::quiet_NaN();
+    double snrDb = std::numeric_limits<double>::quiet_NaN();
+};
+
 struct ThicknessResult
 {
     bool valid = false;
@@ -183,6 +193,9 @@ struct ThicknessResult
     double finalPrimaryShadowBackfillThicknessMm = std::numeric_limits<double>::quiet_NaN();
     QString finalPrimaryShadowBackfillConfidenceClass;
     QString finalPrimaryShadowBackfillReason;
+
+    // 仅T2冷启动三帧确认：恢复之前两帧，按framesAgo=2,1顺序。
+    std::vector<ThicknessStartupBackfill> startupBackfills;
 
     // 与测试程序的延迟确认回填一致：当前帧完成重锁时，修正此前的PENDING帧。
     bool hasBackfill = false;

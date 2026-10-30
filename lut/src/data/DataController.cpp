@@ -1,6 +1,7 @@
 #include "DataController.h"
 #include "../algorithm/ThicknessProcessor.h"
 #include "bdaqctrl.h"
+#include "../communication/RadarHostClock.h"
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -36,8 +37,6 @@ DataController::DataController(QObject *parent)
     , m_waveformAiCtrl(nullptr)
     , m_scaledData(nullptr)
     , m_rawDataBufferLength(0)
-    , m_totalAttempts(0)
-    , m_validDetections(0)
     , m_isTriggerSupported(false)
     , m_filterOrder(50)
     , m_saveFrameCounter(0)
@@ -67,6 +66,52 @@ DataController::DataController(QObject *parent)
     m_configure.actualDelayCount = 0;
 
     //m_triggerEdgeList << "RisingEdge" << "FallingEdge";
+    m_radarPositionSidecar = new RadarPositionSidecar(this);
+    connect(m_radarPositionSidecar, &RadarPositionSidecar::axialPointReady,
+            this, &DataController::updateAxialPoint);
+    connect(m_radarPositionSidecar, &RadarPositionSidecar::axialTailPointReady,
+            this, [this](double x, double h) {
+        if (m_pipeFinalized || !std::isfinite(x) || !std::isfinite(h)) return;
+        m_tailFillPoints.append({x, h});
+        emit axialTailPointAdded(x, h);
+        emit tailFillPointsChanged();
+    });
+    connect(m_radarPositionSidecar, &RadarPositionSidecar::tailFillFinished,
+            this, [this](int count, double mm, const QString &decision) {
+        if (!decision.isEmpty())
+            m_tailFillStatus = decision;
+        else
+            m_tailFillStatus = QStringLiteral(
+                "管尾估算结果：%1点，设定长度%2mm").arg(count).arg(mm, 0, 'f', 1);
+        if (count > 0 && !m_tailFillPoints.isEmpty())
+            m_tailFillStatus += QStringLiteral("；末端坐标%1mm")
+                .arg(m_tailFillPoints.last().positionMm, 0, 'f', 2);
+        emit tailFillPointsChanged();
+        finalizeAxialPlotData();
+    });
+    connect(m_radarPositionSidecar, &RadarPositionSidecar::headStatusChanged,
+            this, [this](const QString &status) {
+        const bool urgent = status.contains(QStringLiteral("溢出")) ||
+            status.contains(QStringLiteral("失效")) ||
+            status.contains(QStringLiteral("不可用"));
+        if (m_laserHeadThicknessConfirmed && !urgent &&
+            !status.startsWith(QStringLiteral("三帧测厚已确认")) &&
+            !status.startsWith(QStringLiteral("三帧厚度已确认")))
+            return; // never hide current radar failure behind past thickness lock
+        if (m_axialOriginStatus == status) return;
+        m_axialOriginStatus = status;
+        emit axialOriginStatusChanged();
+    });
+    connect(m_radarPositionSidecar, &RadarPositionSidecar::statusMessage,
+            this, [this](const QString &message) {
+                qDebug().noquote() << "[RadarSidecar]" << message;
+                m_radarSidecarStatus = message;
+                emit radarSidecarStatusChanged();
+                if (message.contains(QStringLiteral("failed"), Qt::CaseInsensitive) ||
+                    message.contains(QStringLiteral("OVERFLOW")) ||
+                    message.contains(QStringLiteral("JOIN_CAPACITY_LIMIT")))
+                    emit errorOccurred(message);
+            });
 }
 
 DataController::~DataController()
@@ -78,7 +123,9 @@ DataController::~DataController()
     }
     stopProcessingWorker();
     flushPendingFrameSave();
-    flushPendingResultCommits();
+    flushPendingResultCommits(); // preserve final Frame ID/backfills for sidecar
+    if (m_radarPositionSidecar)
+        m_radarPositionSidecar->stopSession();
     stopSaveWorker();
 
     if (m_waveformAiCtrl) {
@@ -271,7 +318,25 @@ void DataController::setProfilePath(const QString &path)
 
 QString DataController::detectionRateText() const
 {
+    if (!m_dynamicDetectionRateCounter.hasResult())
+        return QStringLiteral("--");
     return QString("%1%").arg(m_detectionRate, 0, 'f', 1);
+}
+
+QString DataController::detectionRateStateText() const
+{
+    switch (m_dynamicDetectionRateCounter.phase()) {
+    case DynamicDetectionRateCounter::Phase::WaitingForThickness:
+        return QStringLiteral("等待3帧稳定厚度");
+    case DynamicDetectionRateCounter::Phase::Counting:
+        return QStringLiteral("统计中");
+    case DynamicDetectionRateCounter::Phase::Frozen:
+        return QStringLiteral("最近%1帧内%2个NaN（至少连续%3帧），从首个NaN截止")
+            .arg(DynamicDetectionRateCounter::WindowFrames)
+            .arg(DynamicDetectionRateCounter::RequiredMissingFrames)
+            .arg(DynamicDetectionRateCounter::RequiredConsecutiveMissingFrames);
+    }
+    return QString();
 }
 
 QString DataController::thicknessText() const
@@ -286,21 +351,40 @@ QString DataController::snrText() const
 
 QString DataController::maxThicknessText() const
 {
+    if (m_pipeFinalized)
+        return m_pipeFinalSummary.valid
+            ? QString("%1 mm").arg(m_pipeFinalSummary.maxMm, 0, 'f', 3)
+            : QStringLiteral("-- mm");
     if (m_thicknessCount == 0) return "-- mm";
     return QString("%1 mm").arg(m_thicknessMax, 0, 'f', 3);
 }
 
 QString DataController::minThicknessText() const
 {
+    if (m_pipeFinalized)
+        return m_pipeFinalSummary.valid
+            ? QString("%1 mm").arg(m_pipeFinalSummary.minMm, 0, 'f', 3)
+            : QStringLiteral("-- mm");
     if (m_thicknessCount == 0) return "-- mm";
     return QString("%1 mm").arg(m_thicknessMin, 0, 'f', 3);
 }
 
 QString DataController::avgThicknessText() const
 {
+    if (m_pipeFinalized)
+        return m_pipeFinalSummary.valid
+            ? QString("%1 mm").arg(m_pipeFinalSummary.meanMm, 0, 'f', 3)
+            : QStringLiteral("-- mm");
     if (m_thicknessCount == 0) return "-- mm";
     double avg = m_thicknessSum / m_thicknessCount;
     return QString("%1 mm").arg(avg, 0, 'f', 3);
+}
+
+QString DataController::pipeLengthText() const
+{
+    if (!m_pipeFinalized || !m_pipeFinalSummary.valid) return QStringLiteral("-- m");
+    // The axis starts at first effective radar motion, not a calibrated LB2 edge.
+    return QStringLiteral("%1 m").arg(m_pipeFinalSummary.lengthMm / 1000.0, 0, 'f', 3);
 }
 
 QString DataController::thicknessEchoMode() const
@@ -318,6 +402,8 @@ bool DataController::t2HighPrecisionDetectionEnabled() const
 
 double DataController::avgThickness() const
 {
+    if (m_pipeFinalized)
+        return m_pipeFinalSummary.valid ? m_pipeFinalSummary.meanMm : 0.0;
     if (m_thicknessCount == 0) return 0.0;
     return m_thicknessSum / m_thicknessCount;
 }
@@ -404,12 +490,11 @@ void DataController::drainSaveQueue()
 
 void DataController::flushPendingFrameSave()
 {
-    // 只在处理队列已排空或处理线程内部调用，避免与m_pendingFrameSave并发访问。
-    if (!m_hasPendingFrameSave)
-        return;
-    enqueueFrameSave(std::move(m_pendingFrameSave));
-    m_pendingFrameSave = FrameSaveJob{};
-    m_hasPendingFrameSave = false;
+    // Called by the processing thread or after its queue has drained.
+    while (!m_pendingFrameSaves.empty()) {
+        enqueueFrameSave(std::move(m_pendingFrameSaves.front()));
+        m_pendingFrameSaves.pop_front();
+    }
 }
 
 void DataController::stopSaveWorker()
@@ -924,6 +1009,123 @@ void DataController::checkError(int errorCode)
     }
 }
 
+void DataController::setSharedRadarSource(RadarUdpSharedService *source)
+{
+    if (m_radarPositionSidecar)
+        m_radarPositionSidecar->setSharedRadarSource(source);
+}
+
+void DataController::setRadarPositionSidecarEnabled(bool enabled)
+{
+    if (m_running) {
+        emit errorOccurred(tr("请先停止采集，再修改轴向壁厚曲线CSV保存设置。"));
+        return;
+    }
+    if (m_radarPositionSidecarEnabled == enabled)
+        return;
+    m_radarPositionSidecarEnabled = enabled;
+    m_radarSidecarStatus = enabled
+        ? QStringLiteral("下次采集将保存轴向位置、壁厚和SNR曲线CSV（实时曲线始终运行）")
+        : QStringLiteral("下次采集只显示实时轴向壁厚曲线，不保存CSV");
+    emit radarSidecarStatusChanged();
+    emit radarPositionSidecarEnabledChanged();
+}
+
+QVariantList DataController::axialThicknessProfile() const
+{
+    QVariantList result;
+    result.reserve(m_axialPoints.size());
+    for (const auto &p : m_axialPoints) {
+        QVariantMap point;
+        point.insert(QStringLiteral("x"), p.positionMm);
+        point.insert(QStringLiteral("y"), p.thicknessMm);
+        point.insert(QStringLiteral("frameId"), QVariant::fromValue(p.frameId));
+        result.append(point);
+    }
+    return result;
+}
+
+void DataController::updateAxialPoint(quint64 frameId, double positionMm,
+                                      double thicknessMm, const QString &quality)
+{
+    if (m_pipeFinalized ||
+        quality != QStringLiteral("RADAR_FIRST_MOTION_MINUS_DISTANCE_UNCALIBRATED") ||
+        !std::isfinite(positionMm) || positionMm < 0 ||
+        !std::isfinite(thicknessMm)) return;
+    bool replaced = false;
+    for (int i = static_cast<int>(m_axialPoints.size()) - 1; i >= 0; --i) {
+        if (m_axialPoints[i].frameId == frameId) {
+            m_axialPoints[i] = {frameId, positionMm, thicknessMm};
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        m_axialPoints.push_back({frameId, positionMm, thicknessMm});
+        if (m_axialPoints.size() > 2500) m_axialPoints.pop_front();
+    }
+    // Retain this pipe's real measured thicknesses across the entire run,
+    // independently of the bounded 2500-point live-display window.
+    const auto it = std::lower_bound(
+        m_pipeMeasuredPoints.begin(), m_pipeMeasuredPoints.end(), frameId,
+        [](const auto &p, quint64 id) { return p.frameId < id; });
+    const AxialPipeFinalizer::Point p{frameId, positionMm, thicknessMm, false};
+    if (it != m_pipeMeasuredPoints.end() && it->frameId == frameId)
+        *it = p;
+    else
+        m_pipeMeasuredPoints.insert(it, p);
+    // Transfer just one typed point; no 2500-entry QVariantMap conversion.
+    emit axialPointAdded(frameId, positionMm, thicknessMm);
+    const qint64 nowUs = RadarHostClock::nowUs();
+    if (m_lastAxialUiUs < 0 || nowUs - m_lastAxialUiUs >= 100000) {
+        m_lastAxialUiUs = nowUs;
+        emit axialThicknessProfileChanged();
+    }
+}
+
+void DataController::setRadarToLaserDistanceMm(double mm)
+{
+    // Physical radar -> laser installation distance. Frozen per acquisition:
+    // head-arrival gate, BDAQ-aligned axial x, CSV geometry, UI pipe-presence
+    // estimate, and the optional end-of-pipe extrapolation share one value.
+    // Raw UDP 0.1mm/count and ultrasonic TOF formula are separate calibrations.
+    if (m_running || !std::isfinite(mm) ||
+        mm <= RadarLaserGeometry::RadarToLb2Mm ||
+        mm > RadarLaserGeometry::MaximumRadarToLaserMm) return;
+    if (std::abs(mm - m_radarToLaserDistanceMm) < 1e-9) return;
+    m_radarToLaserDistanceMm = mm;
+    emit radarToLaserDistanceMmChanged();
+}
+
+void DataController::clearAxialPlotData()
+{
+    // Keep the controller and QQuickItem snapshots consistent. Clearing the
+    // GPU item alone would let an old 2500-point snapshot reappear on reopen.
+    m_axialPoints.clear();
+    m_pipeMeasuredPoints.clear();
+    m_pipeFinalSummary = {};
+    m_pipeFinalized = false;
+    emit thicknessStatsChanged();
+    m_tailFillPoints.clear();
+    m_tailFillStatus = QStringLiteral("等待雷达失效后仍有测厚，最近10帧内5个NaN且至少3帧连续后自动重绘");
+    emit tailFillPointsChanged();
+    m_lastAxialUiUs = -1;
+    emit axialProfileReset();
+    emit axialThicknessProfileChanged();
+}
+
+void DataController::finalizeAxialPlotData()
+{
+    std::vector<AxialPipeFinalizer::TailPoint> tail;
+    tail.reserve(static_cast<size_t>(m_tailFillPoints.size()));
+    for (const auto &p : m_tailFillPoints)
+        tail.push_back({p.positionMm, p.thicknessMm});
+    m_pipeFinalSummary = AxialPipeFinalizer::build(m_pipeMeasuredPoints, tail);
+    m_pipeFinalized = true;
+    emit thicknessStatsChanged();
+    emit axialProfileFinalized();
+}
+
 void DataController::startAcquisition()
 {
     qDebug() << "[DataController] startAcquisition() called";
@@ -947,6 +1149,27 @@ void DataController::startAcquisition()
     m_saveQueuePeak.store(0, std::memory_order_relaxed);
     m_processingQueuePeak.store(0, std::memory_order_relaxed);
     m_waveformFrameCounter.store(0, std::memory_order_relaxed);
+    m_acquiredFrameSerial.store(0, std::memory_order_relaxed);
+    clearAxialPlotData();
+    m_thicknessMax = -std::numeric_limits<double>::max();
+    m_thicknessMin = std::numeric_limits<double>::max();
+    m_thicknessSum = 0.0;
+    m_thicknessCount = 0;
+    emit thicknessStatsChanged();
+    m_dynamicDetectionRateCounter.reset();
+    updateDetectionRate();
+    emit measurementDisplayReset(); // also clear the ordinary thickness and waveform plots
+    m_laserHeadThicknessConfirmed = false;
+    emit laserHeadThicknessConfirmedChanged();
+    m_lastAxialUiUs = -1;
+    m_axialOriginStatus = QStringLiteral(
+        "新采集已开始：需三帧可靠测厚且首次雷达运动后前进%1mm才能绘制轴向曲线")
+        .arg(m_radarToLaserDistanceMm, 0, 'f', 1);
+    emit axialOriginStatusChanged();
+    // Real-time pipe-axis profile is mandatory during DAQ; this switch
+    // controls optional CSV persistence only.
+    if (m_radarPositionSidecar)
+        m_radarPositionSidecar->startSession(m_radarPositionSidecarEnabled, m_radarToLaserDistanceMm);
     // 新批次不能沿用上一批次的峰位、波包模板和噪声底。
     m_thicknessProcessor.reset();
     ensureProcessingWorkerStarted();
@@ -959,6 +1182,8 @@ void DataController::startAcquisition()
     //qDebug() << "[DataController] ctrl->Start() errorCode =" << Qt::hex << errorCode;
     if (BioFailed(errorCode)) {
         m_running = false;
+        if (m_radarPositionSidecar)
+            m_radarPositionSidecar->stopSession();
         emit runningChanged();
         emit errorOccurred(tr("Start failed! Error Code: 0x%1").arg(errorCode, 0, 16).toUpper());
         return;
@@ -1010,13 +1235,20 @@ void DataController::stopAcquisition()
 
     ErrorCode errorCode = ctrl->Stop();
     checkError(errorCode);
+    // Capture exactly the last radar UDP received by DAQ Stop(), rather than
+    // one arriving later while processing/backfill queues are being drained.
+    if (m_radarPositionSidecar)
+        m_radarPositionSidecar->markMeasurementStopped();
     m_running = false;
     m_paused = false;
 
     // DAQ已经停止后先排空处理队列；处理线程可能继续产生保存任务，因此随后再排空写盘队列。
     drainProcessingQueue();
     flushPendingFrameSave();
+    // Flush queued GUI thickness commits and T2 backfills before joined CSV closes.
     flushPendingResultCommits();
+    if (m_radarPositionSidecar)
+        m_radarPositionSidecar->stopSession();
     drainSaveQueue();
     const quint64 processingQueuePeak = m_processingQueuePeak.load(std::memory_order_relaxed);
     if (processingQueuePeak > 0)
@@ -1034,6 +1266,7 @@ void DataController::stopAcquisition()
     {
         QMutexLocker locker(&m_thicknessMutex);
         m_thicknessHistory.clear();
+        m_thicknessFrameIds.clear();
     }
 
     emit runningChanged();
@@ -1066,8 +1299,19 @@ void DataController::applyYRange(double yMin, double yMax)
 
 void DataController::resetDetectionRate()
 {
-    m_totalAttempts = 0;
-    m_validDetections = 0;
+    // The Reset button resets BOTH wall-thickness plots as well as their
+    // controller-side caches. When DAQ is running, this is DISPLAY-only for
+    // axial positioning: never silently alter the LB2 head origin mid-pipe.
+    clearAxialPlotData();
+    emit measurementDisplayReset();
+    if (!m_running) {
+        m_laserHeadThicknessConfirmed = false;
+        emit laserHeadThicknessConfirmedChanged();
+        m_axialOriginStatus = QStringLiteral(
+            "已重置；下次开始采集时重新建立管头候选零点");
+        emit axialOriginStatusChanged();
+    }
+    m_dynamicDetectionRateCounter.reset();
     m_detectionRate = 0.0;
     m_snr = 0.0;
     m_thicknessMax = -std::numeric_limits<double>::max();
@@ -1078,6 +1322,7 @@ void DataController::resetDetectionRate()
     {
         QMutexLocker locker(&m_thicknessMutex);
         m_thicknessHistory.clear();
+        m_thicknessFrameIds.clear();
     }
 
     emit detectionRateChanged();
@@ -1118,11 +1363,10 @@ void *DataController::waveformAiCtrl() const { return m_waveformAiCtrl; }
 
 void DataController::updateDetectionRate()
 {
-    double rate = 0.0;
-    if (m_totalAttempts > 0) {
-        rate = (double)m_validDetections / m_totalAttempts * 100.0;
-    }
-    m_detectionRate = rate;
+    // Only the active confirmed pipe segment contributes to this rate.
+    // Before the first stable triple show "--"; freeze at the first NaN
+    // of a confirmed 10-frame / 5-NaN / 3-consecutive-NaN end vote.
+    m_detectionRate = m_dynamicDetectionRateCounter.percent();
     emit detectionRateChanged();
 }
 
@@ -1301,12 +1545,14 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
 
     if (completeWaveform) {
         // 主程序只消费同源核心的厚度、峰值位置和SNR，不引入第二套寻峰或判定分支。
+        const quint64 frameId = job.frameId;
         const double thickness = thicknessResult.valid
             ? thicknessResult.thicknessMm
             : std::numeric_limits<double>::quiet_NaN();
         const double peakTimeSec = thicknessResult.peakTimeSec;
         const double peakVoltage = thicknessResult.peakVoltage;
         const double snr = thicknessResult.snrDb;
+        const auto startupBackfills = thicknessResult.startupBackfills;
         const bool hasBackfill = thicknessResult.hasBackfill;
         const int backfillFramesAgo = thicknessResult.backfillFramesAgo;
         const double backfillThickness = thicknessResult.backfillThicknessMm;
@@ -1314,12 +1560,14 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
 
         m_pendingResultCommits.fetch_add(1, std::memory_order_release);
         const bool commitQueued = QMetaObject::invokeMethod(this,
-            [this, thickness, peakTimeSec, peakVoltage, snr, refreshWaveform,
-             hasBackfill, backfillFramesAgo, backfillThickness, backfillSnr]() {
+            [this, frameId, thickness, peakTimeSec, peakVoltage, snr, refreshWaveform,
+             hasBackfill, backfillFramesAgo, backfillThickness, backfillSnr,
+             startupBackfills]() {
                 // 测试程序在下一帧确认重锁后，会把此前PENDING帧恢复为当时真实测量值。
                 // Qt对同一对象的排队调用保持顺序，因此此处目标帧已经写入历史、当前帧尚未追加。
                 bool backfillApplied = false;
                 double replacedThickness = std::numeric_limits<double>::quiet_NaN();
+                quint64 backfillTargetFrameId = 0;
                 if (hasBackfill && backfillFramesAgo > 0
                     && std::isfinite(backfillThickness)) {
                     QMutexLocker locker(&m_thicknessMutex);
@@ -1327,17 +1575,59 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
                     if (targetIndex >= 0 && targetIndex < m_thicknessHistory.size()) {
                         replacedThickness = m_thicknessHistory[targetIndex];
                         m_thicknessHistory[targetIndex] = backfillThickness;
+                        if (targetIndex < m_thicknessFrameIds.size())
+                            backfillTargetFrameId = m_thicknessFrameIds[targetIndex];
                         backfillApplied = true;
                     }
                 }
 
-                if (backfillApplied) {
+                // The T2 cold-start third frame confirms TWO earlier PENDING
+                // measurements. Restore each original Frame ID and historical
+                // position independently (oldest first), with no extra attempts.
+                for (const auto &old : startupBackfills) {
+                    if (old.framesAgo < 1 || old.framesAgo > 2 ||
+                        !std::isfinite(old.thicknessMm) || old.thicknessMm <= 0)
+                        continue;
+                    quint64 oldFrameId = 0;
+                    double oldThickness = std::numeric_limits<double>::quiet_NaN();
+                    {
+                        QMutexLocker locker(&m_thicknessMutex);
+                        const int index = m_thicknessHistory.size() - old.framesAgo;
+                        if (index < 0 || index >= m_thicknessHistory.size() ||
+                            index >= m_thicknessFrameIds.size() ||
+                            m_thicknessFrameIds[index] + quint64(old.framesAgo) != frameId)
+                            continue;
+                        oldFrameId = m_thicknessFrameIds[index];
+                        oldThickness = m_thicknessHistory[index];
+                        m_thicknessHistory[index] = old.thicknessMm;
+                    }
+                    if (m_radarPositionSidecar)
+                        m_radarPositionSidecar->submitBackfill(
+                            oldFrameId, old.thicknessMm, old.snrDb);
+                    emit thicknessHistoryBackfilled(old.framesAgo, old.thicknessMm);
+                    if (!std::isfinite(oldThickness)) {
+                        m_dynamicDetectionRateCounter.backfill(oldFrameId);
+                        ++m_thicknessCount;
+                        m_thicknessSum += old.thicknessMm;
+                    } else {
+                        m_thicknessSum += old.thicknessMm - oldThickness;
+                    }
+                    m_thicknessMax = (std::max)(m_thicknessMax, old.thicknessMm);
+                    m_thicknessMin = (std::min)(m_thicknessMin, old.thicknessMm);
+                    if (m_historyManager && m_historyManager->isSessionActive())
+                        m_historyManager->replaceRecentMeasurement(
+                            old.framesAgo, old.thicknessMm, old.snrDb, true);
+                }
+
+                if (backfillApplied) {                    if (backfillTargetFrameId && m_radarPositionSidecar)
+                        m_radarPositionSidecar->submitBackfill(
+                            backfillTargetFrameId, backfillThickness, backfillSnr);
                     // Inform the plot about the corrected historical point
                     // before appending the new frame; do not append twice.
                     emit thicknessHistoryBackfilled(backfillFramesAgo, backfillThickness);
                     // PENDING帧原本必为无效值；回填只补齐一次有效统计，不改变尝试总数。
                     if (!std::isfinite(replacedThickness)) {
-                        ++m_validDetections;
+                        m_dynamicDetectionRateCounter.backfill(backfillTargetFrameId);
                         m_thicknessSum += backfillThickness;
                         ++m_thicknessCount;
                     } else {
@@ -1354,10 +1644,7 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
 
                 m_thickness = thickness;
                 m_snr = snr;
-                ++m_totalAttempts;
-
-                if (!std::isnan(thickness)) {
-                    ++m_validDetections;
+                if (std::isfinite(thickness)) {
                     if (thickness > m_thicknessMax) m_thicknessMax = thickness;
                     if (thickness < m_thicknessMin) m_thicknessMin = thickness;
                     m_thicknessSum += thickness;
@@ -1367,7 +1654,40 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
                 {
                     QMutexLocker locker(&m_thicknessMutex);
                     m_thicknessHistory.append(thickness);
+                    m_thicknessFrameIds.append(frameId);
                 }
+
+                // The same confirmed 3-frame gate opens the dynamic rate.
+                // Re-evaluate it for every pipe (unlike the one-shot axial
+                // head anchor) so a later pipe can start a new rate segment.
+                bool stableThicknessTriple = false;
+                if (m_thicknessHistory.size() >= 3) {
+                    const int n = m_thicknessHistory.size();
+                    const double a = m_thicknessHistory[n-3];
+                    const double b = m_thicknessHistory[n-2];
+                    const double c = m_thicknessHistory[n-1];
+                    const bool consecutive = m_thicknessFrameIds[n-3] + 1 == m_thicknessFrameIds[n-2]
+                        && m_thicknessFrameIds[n-2] + 1 == m_thicknessFrameIds[n-1];
+                    const double gate = (std::max)(0.6, std::abs(c) * 0.05);
+                    stableThicknessTriple = consecutive && std::isfinite(a)
+                        && std::isfinite(b) && std::isfinite(c)
+                        && (std::max)({a,b,c}) - (std::min)({a,b,c}) <= gate;
+                    if (stableThicknessTriple && !m_laserHeadThicknessConfirmed) {
+                        // One-time conservative axial origin, NOT the
+                        // repeated dynamic-detection-rate segment gate.
+                        m_laserHeadThicknessConfirmed = true;
+                        emit laserHeadThicknessConfirmedChanged();
+                        const quint64 firstFrameId = m_thicknessFrameIds[n-3];
+                        m_axialOriginStatus = QStringLiteral(
+                            "连续3帧测厚确认（首帧Frame ID=%1）；轴向坐标按首次雷达运动后前进%2mm放行，未标定")
+                            .arg(firstFrameId).arg(m_radarToLaserDistanceMm, 0, 'f', 1);
+                        emit axialOriginStatusChanged();
+                        if (m_radarPositionSidecar)
+                            m_radarPositionSidecar->confirmLaserHeadFrame(firstFrameId);
+                    }
+                }
+                m_dynamicDetectionRateCounter.observe(frameId, thickness,
+                                                      stableThicknessTriple);
 
                 if (m_historyManager && m_historyManager->isSessionActive())
                     m_historyManager->appendMeasurement(thickness, snr, std::isfinite(thickness));
@@ -1380,6 +1700,10 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
                 emit snrChanged();
                 emit thicknessStatsChanged();
                 emit thicknessHistoryUpdated(thickness);
+                emit thicknessFrameIdCommitted(frameId, thickness, std::isfinite(thickness));
+                if (m_radarPositionSidecar)
+                    m_radarPositionSidecar->submitThickness(
+                        frameId, thickness, snr, std::isfinite(thickness));
                 updateDetectionRate();
                 m_pendingResultCommits.fetch_sub(1, std::memory_order_release);
             },
@@ -1387,25 +1711,41 @@ void DataController::processAcquiredFrame(AcquiredFrameJob job)
         if (!commitQueued)
             m_pendingResultCommits.fetch_sub(1, std::memory_order_release);
 
-        // 写盘延迟一个完整帧：若当前帧确认重锁，先回填上一帧的真实TOF再入队。
-        if (m_hasPendingFrameSave) {
-            if (hasBackfill && backfillFramesAgo == 1 && std::isfinite(backfillThickness)) {
-                m_pendingFrameSave.tofSamples = std::isfinite(thicknessResult.backfillPeakTimeSec)
-                    ? thicknessResult.backfillPeakTimeSec * cfg.clockRatePerChan
+        // The two uncommitted raw-frame files remain in FIFO until the
+        // third T2 startup vote; restore BOTH prior original TOFs before
+        // queueing them to the disk writer. Other one-frame recoveries remain.
+        auto patchPendingTof = [&](int framesAgo, double peakTimeSec) {
+            if (framesAgo <= 0 || frameId <= quint64(framesAgo))
+                return;
+            const quint64 targetFrame = frameId - quint64(framesAgo);
+            for (auto &saved : m_pendingFrameSaves) {
+                if (saved.frameId != targetFrame) continue;
+                saved.tofSamples = std::isfinite(peakTimeSec)
+                    ? peakTimeSec * cfg.clockRatePerChan
                     : std::numeric_limits<double>::quiet_NaN();
+                break;
             }
-            flushPendingFrameSave();
-        }
+        };
+        if (hasBackfill && std::isfinite(backfillThickness))
+            patchPendingTof(backfillFramesAgo, thicknessResult.backfillPeakTimeSec);
+        for (const auto &old : startupBackfills)
+            patchPendingTof(old.framesAgo, old.peakTimeSec);
 
         if (!job.saveFileName.isEmpty()) {
-            m_pendingFrameSave.fileName = job.saveFileName;
-            m_pendingFrameSave.original = std::move(job.original);
-            m_pendingFrameSave.filtered.assign(filtered.begin(), filtered.end());
-            m_pendingFrameSave.tofSamples = thicknessResult.valid
+            FrameSaveJob save;
+            save.frameId = frameId;
+            save.fileName = job.saveFileName;
+            save.original = std::move(job.original);
+            save.filtered.assign(filtered.begin(), filtered.end());
+            save.tofSamples = thicknessResult.valid
                 && std::isfinite(thicknessResult.peakTimeSec)
                 ? thicknessResult.peakTimeSec * cfg.clockRatePerChan
                 : std::numeric_limits<double>::quiet_NaN();
-            m_hasPendingFrameSave = true;
+            m_pendingFrameSaves.push_back(std::move(save));
+        }
+        while (m_pendingFrameSaves.size() > 2) {
+            enqueueFrameSave(std::move(m_pendingFrameSaves.front()));
+            m_pendingFrameSaves.pop_front();
         }
     }
 
@@ -1469,6 +1809,20 @@ void DataController::OnDataReadyEvent(void *sender, Automation::BDaq::BfdAiEvent
         const int pointsPerChan = returnedCount / frameConfigure.channelCount;
         if (pointsPerChan > 0) {
             AcquiredFrameJob job;
+            job.frameId = p->m_acquiredFrameSerial.fetch_add(1, std::memory_order_relaxed) + 1;
+            // Host monotonic + UTC sampled together after GetData. This
+            // callback observation is NOT the physical 100 Hz trigger time.
+            const auto clockPair = RadarHostClock::samplePair();
+            job.daqCallbackHostSteadyUs = clockPair.steadyUs;
+            job.daqCallbackUnixUs = clockPair.unixUs;
+            job.callbackClockPairSpreadUs = clockPair.spreadUs;
+            job.bdaqUnverifiedTimestamp = timeStamp;
+            if (pointsPerChan == frameConfigure.sectionLength
+                && p->m_radarPositionSidecar) {
+                p->m_radarPositionSidecar->submitFrame(job.frameId,
+                    job.daqCallbackHostSteadyUs, job.bdaqUnverifiedTimestamp,
+                    job.daqCallbackUnixUs, job.callbackClockPairSpreadUs);
+            }
             job.original.assign(p->m_scaledData, p->m_scaledData + pointsPerChan);
             // 同一DAQ回调内的所有帧共用入口快照，保证硬件帧长与算法参数严格对应。
             job.configure = frameConfigure;

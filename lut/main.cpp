@@ -3,6 +3,10 @@
 #include <QQmlContext>
 #include <QQuickStyle>
 #include <QDir>
+#include <QTimer>
+#include "communication/RadarHostClock.h"
+#include "communication/RadarUdpSharedService.h"
+#include "communication/PipePresenceStateController.h"
 
 #include "communication/DeviceComm.h"
 #include "communication/PollingService.h"
@@ -19,6 +23,7 @@
 #include "models/RegisterDefs.h"
 #include "data/DataController.h"
 #include "data/SimpleGraphItem.h"
+#include "data/AxialThicknessPlotItem.h"
 #include "data/ThicknessHistoryItem.h"
 #include "data/HistoryManager.h"
 #include "data/HistoryGraphItem.h"
@@ -32,6 +37,7 @@ int main(int argc, char *argv[])
 
     // Register custom QML types
     qmlRegisterType<SimpleGraphItem>("LST.Data", 1, 0, "SimpleGraphItem");
+    qmlRegisterType<AxialThicknessPlotItem>("LST.Data", 1, 0, "AxialThicknessPlotItem");
     qmlRegisterType<ThicknessHistoryItem>("LST.Data", 1, 0, "ThicknessHistoryItem");
     qmlRegisterType<HistoryGraphItem>("LST.Data", 1, 0, "HistoryGraphItem");
 
@@ -83,6 +89,35 @@ int main(int argc, char *argv[])
     auto *sysSetCtrl    = new SystemSettingsController(comm, &app);
     auto *cmdCtrl       = new CommandController(comm, &app);
     auto *dataCtrl      = new DataController(&app);
+    auto *radarUdpShared = new RadarUdpSharedService(&app);
+    auto *pipePresenceState = new PipePresenceStateController(&app);
+    // Single GUI-owned installation setting shared by the DAQ sidecar and
+    // the real-time pipe-presence estimate. Apply changes between acquisitions.
+    pipePresenceState->setRadarToLaserDistanceMm(dataCtrl->radarToLaserDistanceMm());
+    QObject::connect(dataCtrl, &DataController::radarToLaserDistanceMmChanged,
+                     pipePresenceState, [dataCtrl, pipePresenceState] {
+        pipePresenceState->setRadarToLaserDistanceMm(dataCtrl->radarToLaserDistanceMm());
+    });
+    dataCtrl->setSharedRadarSource(radarUdpShared);
+    // Direct callback only fills a mutex-protected 256-item ring. The existing
+    // 100ms GUI timer drains it; no per-UDP queued Qt MetaCall can pile up.
+    QObject::connect(radarUdpShared, &RadarUdpSharedService::sampleReceived,
+                     pipePresenceState, &PipePresenceStateController::enqueueRadarSample,
+                     Qt::DirectConnection);
+    QObject::connect(radarUdpShared, &RadarUdpSharedService::statusMessage,
+                     pipePresenceState, &PipePresenceStateController::reportRadarServiceStatus);
+    QObject::connect(radarUdpShared, &RadarUdpSharedService::statusMessage,
+                     &app, [](const QString &status) { qInfo().noquote() << "[RadarUDP]" << status; });
+    // No physical LB1/LB2 digital inputs are available. PipePresenceStateController
+    // infers both operating/not-operating solely from effective radar measurements;
+    // these labels are operational proxies, never actual digital-input readings.
+    auto *presenceClock = new QTimer(&app);
+    presenceClock->setInterval(100);
+    QObject::connect(presenceClock, &QTimer::timeout, pipePresenceState,
+                     [pipePresenceState] { pipePresenceState->tick(RadarHostClock::nowUs()); });
+    presenceClock->start();
+    radarUdpShared->start();
+
     auto *historyMgr    = new HistoryManager(&app);
     auto *processAnalyzer = new ProcessAnalyzer(&app);
     auto *healthMonitor = new HealthMonitor(&app);
@@ -138,6 +173,7 @@ int main(int argc, char *argv[])
     ctx->setContextProperty("systemSettingsController", sysSetCtrl);
     ctx->setContextProperty("commandController", cmdCtrl);
     ctx->setContextProperty("dataController", dataCtrl);
+    ctx->setContextProperty("pipePresenceState", pipePresenceState);
     ctx->setContextProperty("historyManager", historyMgr);
     ctx->setContextProperty("processAnalyzer", processAnalyzer);
     ctx->setContextProperty("healthMonitor", healthMonitor);

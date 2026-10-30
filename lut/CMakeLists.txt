@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Quick QuickControls2 SerialBus SerialPort Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Core Quick QuickControls2 SerialBus SerialPort Concurrent Network)
 
 qt_standard_project_setup(REQUIRES 6.5)
 
@@ -90,8 +90,13 @@ set(CONTROLLER_HEADERS
 # Data module sources
 set(DATA_SOURCES
     src/data/DataController.cpp
+    src/communication/RadarUdpReceiver.cpp
+    src/communication/RadarPositionSidecar.cpp
+    src/communication/RadarUdpSharedService.cpp
+    src/communication/PipePresenceStateController.cpp
     src/algorithm/ThicknessProcessor.cpp
     src/data/SimpleGraphItem.cpp
+    src/data/AxialThicknessPlotItem.cpp
     src/data/ThicknessHistoryItem.cpp
     src/data/HistoryManager.cpp
     src/data/HistoryGraphItem.cpp
@@ -100,6 +105,18 @@ set(DATA_SOURCES
 
 set(DATA_HEADERS
     src/data/DataController.h
+    src/data/DynamicDetectionRateCounter.h
+    src/communication/RadarHostClock.h
+    src/communication/BdaqHostTimeAligner.h
+    src/communication/PipeHeadAxialTracker.h
+    src/communication/RadarLaserGeometry.h
+    src/communication/LstDataExport.h
+    src/communication/RadarUdpReceiver.h
+    src/communication/RadarUdpProtocol.h
+    src/communication/RadarFrameMatcher.h
+    src/communication/RadarPositionSidecar.h
+    src/communication/RadarUdpSharedService.h
+    src/communication/PipePresenceStateController.h
     src/algorithm/ThicknessProcessor.h
     src/algorithm/EchoMeasurementModeRouter.h
     src/algorithm/SecondEchoSearchWindow.h
@@ -110,6 +127,8 @@ set(DATA_HEADERS
     src/algorithm/RecoveryTemporalConfirmTracker.h
     src/algorithm/PacketSpline.h
     src/data/SimpleGraphItem.h
+    src/data/AxialThicknessPlotItem.h
+    src/data/AxialPipeFinalizer.h
     src/data/ThicknessHistoryItem.h
     src/data/HistoryRecord.h
     src/data/HistoryManager.h
@@ -125,6 +144,14 @@ qt_add_library(lst_data SHARED
 set_target_properties(lst_data PROPERTIES
     WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
+# Explicit Q_OBJECT symbol import/export across DLL boundary.
+target_compile_definitions(lst_data PRIVATE LST_DATA_DLL_EXPORTS)
+target_compile_definitions(lst_data INTERFACE LST_DATA_DLL_IMPORTS)
+# GNU ld normally stops auto-exporting other classes once a few symbols
+# are explicitly dllexported; preserve the earlier DLL's full public ABI.
+if(MINGW)
+    target_link_options(lst_data PRIVATE "-Wl,--export-all-symbols")
+endif()
 
 target_include_directories(lst_data
     PUBLIC
@@ -134,6 +161,7 @@ target_include_directories(lst_data
 target_link_libraries(lst_data
     PUBLIC
         Qt6::Core
+        Qt6::Network
         Qt6::Quick
         Qt6::Concurrent
 )
@@ -169,6 +197,106 @@ target_link_libraries(IndustrialAlgorithmFileTest
     PRIVATE
         lst_data
 )
+
+# Optional field-only PROTON UDP probe; never launched by appLST.
+# Excluded from normal builds to keep production targets small.
+qt_add_executable(RadarUdpProbe
+    tools/RadarUdpProbe.cpp
+    src/communication/RadarUdpReceiver.h
+    src/communication/RadarUdpReceiver.cpp
+    src/communication/RadarUdpProtocol.h
+    src/communication/RadarUdpDiagnostics.h
+)
+target_include_directories(RadarUdpProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(RadarUdpProbe PRIVATE Qt6::Core Qt6::Network)
+set_target_properties(RadarUdpProbe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# Guard the previously fixed Windows DLL/Qt signal boundary.
+# Build explicitly when radar wiring is changed, not with appLST.
+qt_add_executable(PipePresenceDllWiringTest
+    tools/PipePresenceLiveWiringTest.cpp
+)
+target_include_directories(PipePresenceDllWiringTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(PipePresenceDllWiringTest PRIVATE lst_data Qt6::Core Qt6::Network)
+set_target_properties(PipePresenceDllWiringTest PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+qt_add_executable(PipePresenceStateTests
+    tools/PipePresenceStateTests.cpp
+    src/communication/PipePresenceStateController.cpp
+    src/communication/PipePresenceStateController.h
+)
+target_include_directories(PipePresenceStateTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(PipePresenceStateTests PRIVATE Qt6::Core)
+set_target_properties(PipePresenceStateTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# Isolated 100Hz radar/DAQ host-time sidecar matcher regression.
+qt_add_executable(RadarFrameMatcherTests
+    tools/RadarFrameMatcherTests.cpp
+    src/communication/RadarFrameMatcher.h
+    src/communication/RadarUdpProtocol.h
+)
+target_include_directories(RadarFrameMatcherTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(RadarFrameMatcherTests PRIVATE Qt6::Core)
+set_target_properties(RadarFrameMatcherTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# Incremental GPU axial plot; real-time 100Hz input, <=10Hz scene graph redraw.
+qt_add_executable(AxialThicknessPlotTests tools/AxialThicknessPlotTests.cpp)
+target_include_directories(AxialThicknessPlotTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AxialThicknessPlotTests PRIVATE lst_data Qt6::Core Qt6::Quick)
+set_target_properties(AxialThicknessPlotTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# Candidate LB2 pipe-head anchor, fail-closed after stop or mid-pipe startup.
+qt_add_executable(PipeHeadAxialTrackerTests
+    tools/PipeHeadAxialTrackerTests.cpp
+    src/communication/PipeHeadAxialTracker.h
+    src/communication/RadarFrameMatcher.h
+)
+target_include_directories(PipeHeadAxialTrackerTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(PipeHeadAxialTrackerTests PRIVATE Qt6::Core)
+set_target_properties(PipeHeadAxialTrackerTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# Optional BDAQ relative-clock / Frame ID thickness-position CSV regression.
+qt_add_executable(RadarBdaqJoinTests
+    tools/RadarBdaqJoinTests.cpp
+    src/communication/RadarPositionSidecar.cpp
+    src/communication/RadarPositionSidecar.h
+    src/communication/RadarUdpSharedService.cpp
+    src/communication/RadarUdpSharedService.h
+    src/communication/RadarUdpReceiver.cpp
+    src/communication/RadarUdpReceiver.h
+    src/communication/RadarFrameMatcher.h
+    src/communication/BdaqHostTimeAligner.h
+    src/communication/RadarHostClock.h
+    src/communication/RadarUdpProtocol.h
+)
+target_include_directories(RadarBdaqJoinTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(RadarBdaqJoinTests PRIVATE Qt6::Core Qt6::Network)
+set_target_properties(RadarBdaqJoinTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# Dynamic detection rate between stable thickness arrival and confirmed absence.
+qt_add_executable(DynamicDetectionRateTests tools/DynamicDetectionRateTests.cpp)
+target_include_directories(DynamicDetectionRateTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(DynamicDetectionRateTests PRIVATE Qt6::Core)
+set_target_properties(DynamicDetectionRateTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# Tail-only display/CSV interpolation; independent of physical 51mm geometry.
+qt_add_executable(AxialTailFillTests tools/AxialTailFillTests.cpp)
+target_include_directories(AxialTailFillTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AxialTailFillTests PRIVATE Qt6::Core)
+set_target_properties(AxialTailFillTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# One-shot final pipe profile: internal interpolation, measured-only stats
+# and candidate total length after the existing tail completion event.
+qt_add_executable(AxialPipeFinalizerTests tools/AxialPipeFinalizerTests.cpp)
+target_include_directories(AxialPipeFinalizerTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AxialPipeFinalizerTests PRIVATE Qt6::Core)
+set_target_properties(AxialPipeFinalizerTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# End-to-end T2 false-positive guard on synthetic no-pipe waveforms.
+qt_add_executable(T2NoiseOnlyRegressionTests tools/T2NoiseOnlyRegressionTests.cpp)
+target_include_directories(T2NoiseOnlyRegressionTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(T2NoiseOnlyRegressionTests PRIVATE lst_data Qt6::Core)
+set_target_properties(T2NoiseOnlyRegressionTests PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 # Header-only T2 tracker regression (shape changes must not lose LOCK).
 add_executable(SecondEchoThickWallTrackerTests

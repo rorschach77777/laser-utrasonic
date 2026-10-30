@@ -14,7 +14,11 @@
 #include <vector>
 #include "bdaqctrl.h"
 #include "HistoryManager.h"
+#include "DynamicDetectionRateCounter.h"
+#include "AxialPipeFinalizer.h"
+#include <QVariantList>
 #include "../algorithm/ThicknessProcessor.h"
+#include "../communication/RadarPositionSidecar.h"
 
 // 配置参数结构体
 struct ConfigureParameter
@@ -68,12 +72,17 @@ class DataController : public QObject
     Q_PROPERTY(QString maxThicknessText READ maxThicknessText NOTIFY thicknessStatsChanged)
     Q_PROPERTY(QString minThicknessText READ minThicknessText NOTIFY thicknessStatsChanged)
     Q_PROPERTY(QString avgThicknessText READ avgThicknessText NOTIFY thicknessStatsChanged)
+    Q_PROPERTY(QString pipeLengthText READ pipeLengthText NOTIFY thicknessStatsChanged)
+    Q_PROPERTY(bool pipeProfileFinalized READ pipeProfileFinalized NOTIFY thicknessStatsChanged)
+    Q_PROPERTY(bool pipeSummaryValid READ pipeSummaryValid NOTIFY thicknessStatsChanged)
+    Q_PROPERTY(double pipeAverageThicknessMm READ pipeAverageThicknessMm NOTIFY thicknessStatsChanged)
     Q_PROPERTY(bool autoScale READ autoScale WRITE setAutoScale NOTIFY autoScaleChanged)
     Q_PROPERTY(bool showOriginal READ showOriginal WRITE setShowOriginal NOTIFY showOriginalChanged)
     Q_PROPERTY(bool savePerFrame READ savePerFrame WRITE setSavePerFrame NOTIFY savePerFrameChanged)
     Q_PROPERTY(int waveformRefreshInterval READ waveformRefreshInterval WRITE setWaveformRefreshInterval NOTIFY waveformRefreshIntervalChanged)
     Q_PROPERTY(bool historyRecording READ historyRecording WRITE setHistoryRecording NOTIFY historyRecordingChanged)
     Q_PROPERTY(QString detectionRateText READ detectionRateText NOTIFY detectionRateChanged)
+    Q_PROPERTY(QString detectionRateStateText READ detectionRateStateText NOTIFY detectionRateChanged)
     Q_PROPERTY(QString thicknessText READ thicknessText NOTIFY thicknessChanged)
     Q_PROPERTY(QStringList deviceList READ deviceList NOTIFY deviceListChanged)
     Q_PROPERTY(QStringList triggerSourceList READ triggerSourceList NOTIFY triggerSourceListChanged)
@@ -81,8 +90,38 @@ class DataController : public QObject
     Q_PROPERTY(bool triggerSupported READ isTriggerSupported NOTIFY triggerSourceListChanged)
     Q_PROPERTY(QString thicknessEchoMode READ thicknessEchoMode NOTIFY thicknessEchoModeChanged)
     Q_PROPERTY(bool t2HighPrecisionDetectionEnabled READ t2HighPrecisionDetectionEnabled NOTIFY t2HighPrecisionDetectionEnabledChanged)
+    Q_PROPERTY(bool radarPositionSidecarEnabled READ radarPositionSidecarEnabled WRITE setRadarPositionSidecarEnabled NOTIFY radarPositionSidecarEnabledChanged)
+    Q_PROPERTY(QString radarSidecarStatus READ radarSidecarStatus NOTIFY radarSidecarStatusChanged)
+    Q_PROPERTY(QVariantList axialThicknessProfile READ axialThicknessProfile NOTIFY axialThicknessProfileChanged)
+    Q_PROPERTY(int axialThicknessPointCount READ axialThicknessPointCount NOTIFY axialThicknessProfileChanged)
+    Q_PROPERTY(QString axialOriginStatus READ axialOriginStatus NOTIFY axialOriginStatusChanged)
+    Q_PROPERTY(bool laserHeadThicknessConfirmed READ laserHeadThicknessConfirmed NOTIFY laserHeadThicknessConfirmedChanged)
+    Q_PROPERTY(double radarToLaserDistanceMm READ radarToLaserDistanceMm WRITE setRadarToLaserDistanceMm NOTIFY radarToLaserDistanceMmChanged)
+    Q_PROPERTY(double defaultRadarToLaserDistanceMm READ defaultRadarToLaserDistanceMm CONSTANT)
+    Q_PROPERTY(int minRadarToLaserInputMm READ minRadarToLaserInputMm CONSTANT)
+    Q_PROPERTY(int maxRadarToLaserInputMm READ maxRadarToLaserInputMm CONSTANT)
+    Q_PROPERTY(int tailFillPointCount READ tailFillPointCount NOTIFY tailFillPointsChanged)
+    Q_PROPERTY(QString tailFillStatus READ tailFillStatus NOTIFY tailFillPointsChanged)
 
 public:
+    struct AxialPoint { quint64 frameId; double positionMm; double thicknessMm;
+                        bool interpolated = false; };
+    struct TailPoint { double positionMm; double thicknessMm; };
+    QVector<TailPoint> axialTailSnapshot() const { return m_tailFillPoints; }
+    QVector<AxialPoint> axialFinalPointSnapshot() const {
+        QVector<AxialPoint> result;
+        result.reserve(static_cast<int>(m_pipeFinalSummary.curve.size()));
+        for (const auto &p : m_pipeFinalSummary.curve)
+            result.append({p.frameId, p.xMm, p.thicknessMm, p.interpolated});
+        return result; // only requested once after pipe measurement ends
+    }
+    QVector<AxialPoint> axialPointSnapshot() const {
+        QVector<AxialPoint> snapshot;
+        snapshot.reserve(static_cast<int>(m_axialPoints.size()));
+        for (const auto &point : m_axialPoints)
+            snapshot.append(point);
+        return snapshot; // once when a measurement page is opened
+    }
     explicit DataController(QObject *parent = nullptr);
     ~DataController();
 
@@ -127,8 +166,8 @@ public:
     double thickness() const { return m_thickness; }
     double detectionRate() const { return m_detectionRate; }
     double snr() const { return m_snr; }
-    double maxThickness() const { return m_thicknessMax; }
-    double minThickness() const { return m_thicknessMin; }
+    double maxThickness() const { return m_pipeFinalized ? (m_pipeFinalSummary.valid ? m_pipeFinalSummary.maxMm : 0.0) : m_thicknessMax; }
+    double minThickness() const { return m_pipeFinalized ? (m_pipeFinalSummary.valid ? m_pipeFinalSummary.minMm : 0.0) : m_thicknessMin; }
     double avgThickness() const;
     bool autoScale() const { return m_autoScale; }
     bool showOriginal() const { return m_showOriginal.load(std::memory_order_relaxed); }
@@ -136,13 +175,33 @@ public:
     int waveformRefreshInterval() const { return m_waveformRefreshInterval.load(std::memory_order_relaxed); }
     bool isTriggerSupported() const { return m_isTriggerSupported; }
     QString detectionRateText() const;
+    QString detectionRateStateText() const;
     QString thicknessText() const;
     QString snrText() const;
     QString maxThicknessText() const;
     QString minThicknessText() const;
     QString avgThicknessText() const;
+    QString pipeLengthText() const;
+    bool pipeProfileFinalized() const { return m_pipeFinalized; }
+    bool pipeSummaryValid() const { return m_pipeFinalSummary.valid; }
+    double pipeAverageThicknessMm() const { return m_pipeFinalSummary.meanMm; }
     QString thicknessEchoMode() const;
     bool t2HighPrecisionDetectionEnabled() const;
+    bool radarPositionSidecarEnabled() const { return m_radarPositionSidecarEnabled; }
+    void setSharedRadarSource(RadarUdpSharedService *source);
+    QString radarSidecarStatus() const { return m_radarSidecarStatus; }
+    QVariantList axialThicknessProfile() const;
+    int axialThicknessPointCount() const { return static_cast<int>(m_axialPoints.size()); }
+    QString axialOriginStatus() const { return m_axialOriginStatus; }
+    bool laserHeadThicknessConfirmed() const { return m_laserHeadThicknessConfirmed; }
+    Q_INVOKABLE void setRadarPositionSidecarEnabled(bool enabled);
+    double radarToLaserDistanceMm() const { return m_radarToLaserDistanceMm; }
+    double defaultRadarToLaserDistanceMm() const { return RadarLaserGeometry::DefaultRadarToLaserMm; }
+    int minRadarToLaserInputMm() const { return int(RadarLaserGeometry::MinimumRadarToLaserMm); }
+    int maxRadarToLaserInputMm() const { return int(RadarLaserGeometry::MaximumRadarToLaserMm); }
+    Q_INVOKABLE void setRadarToLaserDistanceMm(double mm);
+    int tailFillPointCount() const { return m_tailFillPoints.size(); }
+    QString tailFillStatus() const { return m_tailFillStatus; }
 
     Q_INVOKABLE void setAutoScale(bool enabled);
     Q_INVOKABLE void setShowOriginal(bool enabled);
@@ -193,6 +252,19 @@ signals:
     void waveformRefreshIntervalChanged();
     void thicknessEchoModeChanged();
     void t2HighPrecisionDetectionEnabledChanged();
+    void radarPositionSidecarEnabledChanged();
+    void radarSidecarStatusChanged();
+    void axialThicknessProfileChanged();
+    void axialPointAdded(quint64 frameId, double positionMm, double thicknessMm);
+    void axialProfileReset();
+    void axialProfileFinalized(); // one final redraw with internal gap interpolation
+    void measurementDisplayReset(); // reset waveform and thickness history graph
+    void radarToLaserDistanceMmChanged();
+    void tailFillPointsChanged();
+    void axialTailPointAdded(double positionMm, double estimatedThicknessMm);
+    void axialOriginStatusChanged();
+    void laserHeadThicknessConfirmedChanged();
+    void thicknessFrameIdCommitted(quint64 frameId, double thicknessMm, bool valid);
 
     // Data ready signal for graph update
     void dataReady(const QVector<double> &data, int plotCount, int pointsPerChan,
@@ -255,9 +327,9 @@ private:
     QStringList m_triggerSourceList;
     QStringList m_triggerEdgeList;
 
-    int m_totalAttempts;
-    int m_validDetections;
+    DynamicDetectionRateCounter m_dynamicDetectionRateCounter;
     QVector<double> m_thicknessHistory;
+    QVector<quint64> m_thicknessFrameIds; // identical indices for delayed T2 backfill
     QMutex m_thicknessMutex;
 
     bool m_isTriggerSupported;
@@ -266,6 +338,25 @@ private:
     // 工业实时测厚核心算法模块：测试程序算法迁移入口。
     // 仅输出厚度和峰值marker，不输出诊断文本和拟合显示数据。
     ThicknessProcessor m_thicknessProcessor;
+    // Optional axial-thickness curve CSV; live Frame ID/radar matching always runs.
+    RadarPositionSidecar *m_radarPositionSidecar = nullptr;
+    bool m_radarPositionSidecarEnabled = false;
+    QString m_radarSidecarStatus = QStringLiteral("轴向曲线自动更新；CSV默认关闭");
+    std::atomic<quint64> m_acquiredFrameSerial{0};
+    std::deque<AxialPoint> m_axialPoints; // bounded live plot cache
+    std::vector<AxialPipeFinalizer::Point> m_pipeMeasuredPoints; // full current pipe
+    AxialPipeFinalizer::Result m_pipeFinalSummary;
+    bool m_pipeFinalized = false;
+    double m_radarToLaserDistanceMm = PipeHeadAxialTracker::DefaultRadarToLaserMm; // shared session geometry
+    QVector<TailPoint> m_tailFillPoints;
+    QString m_tailFillStatus = QStringLiteral("等待测量结束后估算管尾");
+    QString m_axialOriginStatus = QStringLiteral("旁路未运行，未捕获管头候选事件");
+    bool m_laserHeadThicknessConfirmed = false;
+    qint64 m_lastAxialUiUs = -1;
+    void updateAxialPoint(quint64 frameId, double positionMm, double thicknessMm,
+                          const QString &quality);
+    void clearAxialPlotData(); // controller cache + GPU plot + public profile change
+    void finalizeAxialPlotData(); // after sidecar tail compensation is complete
 
     int m_saveFrameCounter;
     QString m_saveFolder;
@@ -273,6 +364,7 @@ private:
 
     // 逐帧CSV写盘与DAQ回调解耦。队列不主动丢帧，停止采集后排空再结束。
     struct FrameSaveJob {
+        quint64 frameId = 0;
         QString fileName;
         std::vector<double> original;
         std::vector<double> filtered;
@@ -287,12 +379,16 @@ private:
     bool m_saveWorkerStop = false;
     bool m_saveWorkerBusy = false;
     std::atomic<quint64> m_saveQueuePeak{0};
-    // 延迟一帧写盘，使重锁确认能按测试程序逻辑回填上一帧厚度。
-    bool m_hasPendingFrameSave = false;
-    FrameSaveJob m_pendingFrameSave;
+    // Two pending frames for three-frame T2 cold-start confirmation.
+    std::deque<FrameSaveJob> m_pendingFrameSaves;
 
     // DAQ回调与处理链解耦：回调只复制采集帧并固化参数，FIFO线程调用同源核心测厚。
     struct AcquiredFrameJob {
+        quint64 frameId = 0;
+        qint64 daqCallbackHostSteadyUs = 0;
+        qint64 daqCallbackUnixUs = 0;
+        qint64 callbackClockPairSpreadUs = -1;
+        double bdaqUnverifiedTimestamp = 0.0;
         std::vector<double> original;
         ConfigureParameter configure;
         QString saveFileName;

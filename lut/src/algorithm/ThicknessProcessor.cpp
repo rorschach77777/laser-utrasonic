@@ -7657,6 +7657,16 @@ struct ThicknessProcessor::Impl
     HighPrecisionHistory highPrecisionHistory;
     SecondEchoOnlyTracker secondEchoOnlyTracker;
     SecondEchoParabolicTracker secondEchoParabolicTracker;
+    // Previous two T2 WARMUP observations. These are their OWN measured
+    // values, not re-evaluations using the third frame's waveform.
+    struct T2StartupSample {
+        quint64 sequence = 0;
+        double tof = NaN;
+        double snr = NaN;
+        double voltage = NaN;
+    };
+    std::deque<T2StartupSample> t2StartupSamples;
+    quint64 t2StartupSequence = 0;
     SecondEchoRoiHilbert secondEchoRoiHilbert;
     // T2-only scratch lives with this processor instance, never in a shared
     // thread_local/global cache. Reuse capacity across 100-Hz frames.
@@ -7851,6 +7861,8 @@ ThicknessResult ThicknessProcessor::process(
         m_impl->highPrecisionHistory = HighPrecisionHistory{};
         m_impl->secondEchoOnlyTracker.reset();
         m_impl->secondEchoParabolicTracker.reset();
+        m_impl->t2StartupSamples.clear();
+        m_impl->t2StartupSequence = 0;
         m_impl->secondEchoPeriodTracker.reset();
         m_impl->secondEchoRawPhaseTracker.reset();
         m_impl->secondEchoWeakRawTemporalTracker.reset();
@@ -9220,12 +9232,8 @@ ThicknessResult ThicknessProcessor::process(
         // is enabled. Only the former integer-output branch is replaced by the
         // test program's full parabolic-crest tracker (including candidates,
         // prediction, identity and terminal single-peak fallback).
+        const quint64 t2Sequence = ++m_impl->t2StartupSequence;
         SecondEchoOnlyTracker::Decision t2Decision;
-        bool t2StartupBackfill = false;
-        int t2StartupBackfillFramesAgo = 0;
-        double t2StartupBackfillTof = NaN;
-        double t2StartupBackfillSnr = NaN;
-        double t2StartupBackfillVoltage = NaN;
         if (parameters.t2HighPrecisionDetectionEnabled) {
             m_impl->secondEchoOnlyTracker.setThinFinalSinglePeakFallbackEnabled(
                 thinT2FinalFallback);
@@ -9298,11 +9306,6 @@ ThicknessResult ThicknessProcessor::process(
             t2Decision.selectedSnrDb = parabolaDecision.selectedSnrDb;
             t2Decision.selectedEnvelopePeakIndex =
                 parabolaDecision.selectedEnvelopePeakIndex;
-            t2StartupBackfill = parabolaDecision.hasStartupBackfill;
-            t2StartupBackfillFramesAgo = parabolaDecision.startupBackfillFramesAgo;
-            t2StartupBackfillTof = parabolaDecision.startupBackfillTofSamples;
-            t2StartupBackfillSnr = parabolaDecision.startupBackfillSnrDb;
-            t2StartupBackfillVoltage = parabolaDecision.startupBackfillPeakVoltage;
         }
         result.t2OnlyStage = QString::fromLatin1(
             SecondEchoOnlyTracker::stageName(t2Decision.stage));
@@ -9345,40 +9348,71 @@ ThicknessResult ThicknessProcessor::process(
             }
         }
 
-        // T2-only never inherits T1 backfills. The parabolic tracker may
-        // confirm the previous cold-start candidate on the second frame;
-        // publish that PREVIOUS measured TOF only after normal LOCK, using
-        // the identical thickness formula as the current T2 publication.
-        result.hasBackfill = false;
-        if (t2Valid && t2StartupBackfill && t2StartupBackfillFramesAgo == 1
-            && std::isfinite(t2StartupBackfillTof)
-            && std::isfinite(t2StartupBackfillSnr)) {
-            const double k = p.longitudinalVelocityMps
-                / p.sampleRateHz * 0.5 * 1000.0;
-            double priorThickness = NaN;
-            if (k > 0.0) {
-                if (thickWallT2) {
-                    priorThickness = k * (t2StartupBackfillTof + p.delayCount)
-                        - CURRENT_FIXED_BIAS_MM;
-                } else {
-                    const double a = -static_cast<double>(p.delayCount)
-                        + (CURRENT_FIXED_BIAS_MM - parameters.echoPairBiasMm) / k;
-                    priorThickness = k * (t2StartupBackfillTof - a) / 2.0
-                        - parameters.echoPairBiasMm
-                        + parameters.secondEchoOrdinalCorrectionMm
-                        - parameters.secondEchoT50BiasMm;
+        // Initial T2-only WARMUP: three successive consistent actual TOFs.
+        // The third frame establishes LOCK; BOTH earlier frames retain their
+        // own measured TOF/SNR/voltage and are backfilled oldest-first.
+        // Neither recovery/backfill nor a strong period can bypass the first
+        // cold-start three-frame requirement.
+        result.hasBackfill = false; // T1's one-frame path never enters T2-only.
+        auto &startup = m_impl->t2StartupSamples;
+        if (t2Decision.reason &&
+            std::string_view(t2Decision.reason) == "T2_STARTUP_PENDING"
+            && std::isfinite(t2Decision.tofSamples)
+            && std::isfinite(t2Decision.selectedSnrDb)) {
+            if (!startup.empty() &&
+                (startup.back().sequence + 1 != t2Sequence ||
+                 std::abs(t2Decision.tofSamples - startup.front().tof) > 12.0))
+                startup.clear();
+            Impl::T2StartupSample entry;
+            entry.sequence = t2Sequence;
+            entry.tof = t2Decision.tofSamples;
+            entry.snr = t2Decision.selectedSnrDb;
+            const int pos = static_cast<int>(std::llround(entry.tof));
+            if (pos >= 0 && pos < static_cast<int>(t2Filtered.size()))
+                entry.voltage = t2Filtered[static_cast<size_t>(pos)];
+            startup.push_back(entry);
+            while (startup.size() > 2) startup.pop_front();
+        } else if (t2Valid) {
+            if (startup.size() == 2 &&
+                startup.front().sequence + 2 == t2Sequence &&
+                startup.back().sequence + 1 == t2Sequence &&
+                std::abs(publishedT2Tof - startup.front().tof) <= 12.0 &&
+                std::abs(publishedT2Tof - startup.back().tof) <= 12.0) {
+                const double k = p.longitudinalVelocityMps
+                    / p.sampleRateHz * 0.5 * 1000.0;
+                for (const auto &s : startup) {
+                    double backfilled = NaN;
+                    if (k > 0.0) {
+                        if (thickWallT2) {
+                            backfilled = k * (s.tof + p.delayCount)
+                                - CURRENT_FIXED_BIAS_MM;
+                        } else {
+                            const double a = -static_cast<double>(p.delayCount)
+                                + (CURRENT_FIXED_BIAS_MM - parameters.echoPairBiasMm) / k;
+                            backfilled = k * (s.tof - a) / 2.0
+                                - parameters.echoPairBiasMm
+                                + parameters.secondEchoOrdinalCorrectionMm
+                                - parameters.secondEchoT50BiasMm;
+                        }
+                    }
+                    if (std::isfinite(backfilled) && backfilled > 0.0) {
+                        ThicknessStartupBackfill old;
+                        old.framesAgo = static_cast<int>(t2Sequence - s.sequence);
+                        old.thicknessMm = backfilled;
+                        old.peakTimeSec = s.tof / p.sampleRateHz;
+                        old.peakVoltage = s.voltage;
+                        old.snrDb = s.snr;
+                        result.startupBackfills.push_back(old);
+                    }
                 }
+                // Either restore all two startup points or none; a partial
+                // startup reconstruction could shift the pipe-head origin.
+                if (result.startupBackfills.size() != 2)
+                    result.startupBackfills.clear();
             }
-            if (std::isfinite(priorThickness) && priorThickness > 0.0) {
-                result.hasBackfill = true;
-                result.backfillFramesAgo = 1;
-                result.backfillThicknessMm = priorThickness;
-                result.backfillPeakTimeSec = t2StartupBackfillTof / p.sampleRateHz;
-                result.backfillPeakVoltage = t2StartupBackfillVoltage;
-                result.backfillSnrDb = t2StartupBackfillSnr;
-                result.backfillPeakIndex =
-                    static_cast<int>(std::llround(t2StartupBackfillTof));
-            }
+            startup.clear();
+        } else {
+            startup.clear();
         }
         result.hasFinalPrimaryShadowBackfill = false;
         result.valid = t2Valid;

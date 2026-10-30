@@ -11,6 +11,16 @@ ScrollView {
     contentWidth: availableWidth
     clip: true
 
+    // One display-reset event covers both normal waveforms/history and the
+    // GPU axial curve (the latter also listens to axialProfileReset in C++).
+    Connections {
+        target: dataController
+        function onMeasurementDisplayReset() {
+            if (thicknessPlot) thicknessPlot.clear()
+            if (graphItem) graphItem.clear()
+        }
+    }
+
     ColumnLayout {
         width: root.availableWidth
         spacing: 8
@@ -25,7 +35,45 @@ ScrollView {
             Layout.topMargin: 12
         }
 
-        // Current pipe measurement task
+        // Keep only the measurement recording switch.
+        Pane {
+            Layout.fillWidth: true
+            Layout.leftMargin: 16
+            Layout.rightMargin: 16
+            padding: 6
+            Material.elevation: 2
+
+            Switch {
+                text: historyManager.sessionActive ? "停止记录" : "开始记录"
+                checked: historyManager.sessionActive
+                enabled: historyManager.sessionActive || (dataController && dataController.running)
+                onToggled: {
+                    if (checked && !historyManager.sessionActive)
+                        historyManager.startSession()
+                    else if (!checked && historyManager.sessionActive)
+                        historyManager.finishSession()
+                }
+            }
+        }
+
+        // Live axial curve is independent; this only saves its valid plotted data.
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.leftMargin: 16
+            Layout.rightMargin: 16
+            spacing: 10
+            CheckBox {
+                text: "保存轴向壁厚曲线数据（CSV）"
+                checked: dataController ? dataController.radarPositionSidecarEnabled : false
+                enabled: dataController && !dataController.running
+                onToggled: {
+                    if (dataController && !dataController.running)
+                        dataController.setRadarPositionSidecarEnabled(checked)
+                }
+            }
+        }
+
+        // LB1/LB2 are inferred from effective radar measurement output; no physical DI is wired.
         Pane {
             Layout.fillWidth: true
             Layout.leftMargin: 16
@@ -33,121 +81,80 @@ ScrollView {
             padding: 8
             Material.elevation: 2
 
-            RowLayout {
-                anchors.fill: parent
-                spacing: 8
+            ColumnLayout {
+                width: parent.width
+                spacing: 5
 
-                Label {
-                    text: "当前钢管"
-                    font.pixelSize: 14
-                    font.bold: true
-                    color: "#3F51B5"
-                }
-
-                Label { text: "编号:"; font.pixelSize: 12; color: "#424242" }
-                TextField {
-                    id: edtPipeId
-                    Layout.preferredWidth: 145
-                    placeholderText: "钢管编号"
-                    font.pixelSize: 12
-                    enabled: !historyManager.sessionActive
-                }
-
-                Label { text: "钢级:"; font.pixelSize: 12; color: "#424242" }
-                TextField {
-                    id: edtSteelGrade
-                    Layout.preferredWidth: 80
-                    placeholderText: "P110"
-                    font.pixelSize: 12
-                    enabled: !historyManager.sessionActive
-                }
-
-                Label { text: "公称壁厚:"; font.pixelSize: 12; color: "#424242" }
-                TextField {
-                    id: edtNominalThickness
-                    Layout.preferredWidth: 60
-                    text: "6.5"
-                    font.pixelSize: 12
-                    enabled: !historyManager.sessionActive
-                }
-                Label { text: "mm"; font.pixelSize: 11; color: "#757575" }
-
-                Label { text: "线速度:"; font.pixelSize: 12; color: "#424242" }
-                TextField {
-                    id: edtLineSpeed
-                    Layout.preferredWidth: 55
-                    text: "0"
-                    font.pixelSize: 12
-                    enabled: !historyManager.sessionActive
-                }
-                Label { text: "m/s"; font.pixelSize: 11; color: "#757575" }
-
-                Label { text: "测厚频率:"; font.pixelSize: 12; color: "#424242" }
-                TextField {
-                    id: edtThicknessRate
-                    Layout.preferredWidth: 55
-                    text: "100"
-                    font.pixelSize: 12
-                    enabled: !historyManager.sessionActive
-                }
-                Label { text: "Hz"; font.pixelSize: 11; color: "#757575" }
-
-                Item { Layout.fillWidth: true }
-
-                ColumnLayout {
-                    spacing: 0
+                RowLayout {
+                    Layout.fillWidth: true
+                    Label { text: "钢管实时状态"; font.pixelSize: 14; font.bold: true; color: "#3F51B5" }
                     Label {
-                        text: historyManager.sessionActive ? "记录中" : "未记录"
+                        text: pipePresenceState.phaseLabel
+                        font.pixelSize: 14
+                        font.bold: true
+                        color: pipePresenceState.radarPresent ? "#2E7D32" : "#795548"
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 18
+                    Label { text: "LB1（推定）：" + pipePresenceState.lb1Label; font.pixelSize: 12 }
+                    Label { text: "LB2（推定）：" + pipePresenceState.lb2Label; font.pixelSize: 12 }
+                    Label { text: "雷达：" + pipePresenceState.radarLabel; font.pixelSize: 12 }
+                    Label {
+                        text: "激发光测点：" + (dataController && dataController.laserHeadThicknessConfirmed
+                              ? "三帧厚度已确认" : "等待稳定厚度")
+                        font.pixelSize: 12
+                        color: dataController && dataController.laserHeadThicknessConfirmed
+                               ? "#2E7D32" : "#795548"
+                    }
+                    Label { text: "运动：" + pipePresenceState.motionLabel; font.pixelSize: 12 }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 18
+                    Label {
+                        text: "瞬时速度：" + (isFinite(pipePresenceState.speedMmS)
+                              ? pipePresenceState.speedMmS.toFixed(2) + " mm/s" : "--")
+                        font.pixelSize: 12
+                    }
+                    Label {
+                        text: "距激光：" + (isFinite(pipePresenceState.distanceToLaserMm)
+                              ? pipePresenceState.distanceToLaserMm.toFixed(2) + " mm（估计）" : "--")
+                        font.pixelSize: 12
+                    }
+                }
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 14
+                    Label {
+                        text: "UDP接收：" + pipePresenceState.receivedPacketCount + " 包"
                         font.pixelSize: 12
                         font.bold: true
-                        color: historyManager.sessionActive ? "#4CAF50" : "#757575"
+                        color: pipePresenceState.packetAgeMs >= 0 && pipePresenceState.packetAgeMs <= 100
+                               ? "#2E7D32" : "#C62828"
                     }
                     Label {
-                        text: historyManager.sessionActive
-                              ? ("点数 " + historyManager.sessionDataCount
-                                 + " / 位置 " + historyManager.sessionPositionM.toFixed(2) + " m")
-                              : ""
-                        font.pixelSize: 10
-                        color: "#757575"
+                        text: "瞬时速度原始值：" + (pipePresenceState.receivedPacketCount > 0
+                              ? pipePresenceState.lastRawInstantSpeed : "--")
+                        font.pixelSize: 12
                     }
-                }
-
-                Button {
-                    text: "开始本管"
-                    Layout.preferredWidth: 90
-                    Layout.preferredHeight: 44
-                    font.pixelSize: 12
-                    Material.background: "#4CAF50"
-                    Material.foreground: "white"
-                    enabled: dataController && dataController.running && !historyManager.sessionActive
-                    onClicked: {
-                        var nominal = parseFloat(edtNominalThickness.text)
-                        var speed = parseFloat(edtLineSpeed.text)
-                        var rate = parseFloat(edtThicknessRate.text)
-                        if (!isFinite(nominal) || nominal <= 0) nominal = 6.5
-                        if (!isFinite(speed) || speed < 0) speed = 0
-                        if (!isFinite(rate) || rate <= 0) rate = 100
-
-                        if (dataController)
-                            dataController.setThicknessStd(nominal)
-                        historyManager.startPipeSession(
-                            edtPipeId.text,
-                            edtSteelGrade.text,
-                            nominal,
-                            speed,
-                            rate)
+                    Label {
+                        text: "累计长度原始值：" + (pipePresenceState.receivedPacketCount > 0
+                              ? pipePresenceState.lastRawTotalLength : "--")
+                        font.pixelSize: 12
                     }
-                }
-
-                Button {
-                    text: "结束本管"
-                    Layout.preferredWidth: 90
-                    Layout.preferredHeight: 44
-                    font.pixelSize: 12
-                    Material.background: "#757575"
-                    Material.foreground: "white"
-                    enabled: historyManager.sessionActive
-                    onClicked: historyManager.finishSession()
+                    Label {
+                        text: "Good Reading：" + (pipePresenceState.receivedPacketCount > 0
+                              ? pipePresenceState.lastGoodReading : "--")
+                        font.pixelSize: 12
+                    }
+                    Label {
+                        text: "最新报文：" + (pipePresenceState.packetAgeMs >= 0
+                              ? pipePresenceState.packetAgeMs + " ms前" : "尚未收到")
+                        font.pixelSize: 12
+                    }
                 }
             }
         }
@@ -428,6 +435,27 @@ ScrollView {
                             font.bold: true
                             color: "#3F51B5"
                             Layout.fillWidth: true
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Label {
+                            text: "总长度:"
+                            font.pixelSize: 14
+                            color: "#757575"
+                            Layout.preferredWidth: 88
+                        }
+                        Label {
+                            text: dataController ? dataController.pipeLengthText : "-- m"
+                            font.pixelSize: 14
+                            font.bold: true
+                            color: "#009688"
+                            Layout.fillWidth: true
+                            ToolTip.visible: lengthHover.hovered
+                            //ToolTip.text: "由候选轴向终点计算，尚未进行实物长度标定"
+                            HoverHandler { id: lengthHover }
                         }
                     }
 
@@ -725,19 +753,19 @@ ScrollView {
                         }
                         Item { Layout.preferredWidth: 24 }
                         Label {
-                            text: "检出率："
+                            text: "动态检出率："
                             font.pixelSize: 14
                             font.bold: true
                             color: "#424242"
                         }
                         Label {
                             id: lblDetectionRate
-                            text: dataController ? dataController.detectionRateText : "0%"
+                            text: dataController ? dataController.detectionRateText : "--"
                             font.pixelSize: 20
                             font.bold: true
                             color: "#009688"
                         }
-                        Item { Layout.preferredWidth: 24 }
+                        Item { Layout.preferredWidth: 16 }
                         Label {
                             text: "信噪比:"
                             font.pixelSize: 14
@@ -769,6 +797,154 @@ ScrollView {
                     }
                 }
 
+                // Keep the distance control outside the graph so both plots
+                // have the same 300px drawing area and black background.
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label {
+                        text: "管头轴向壁厚曲线"
+                        font.pixelSize: 14
+                        font.bold: true
+                        color: "#3F51B5"
+                    }
+                    Item { Layout.fillWidth: true }
+                    Label {
+                        text: "雷达至激光距离（mm）："
+                        font.pixelSize: 12
+                    }
+                    SpinBox {
+                        id: radarToLaserDistanceInput
+                        from: dataController ? dataController.minRadarToLaserInputMm : 0
+                        to: dataController ? dataController.maxRadarToLaserInputMm : 0
+                        stepSize: 1
+                        editable: true
+                        value: dataController ? Math.round(dataController.radarToLaserDistanceMm) : 0
+                        enabled: dataController && !dataController.running
+                        Layout.preferredWidth: 140
+                        onValueModified: {
+                            if (dataController && !dataController.running)
+                                dataController.setRadarToLaserDistanceMm(value)
+                        }
+                    }
+                }
+
+                Pane {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 300
+                    padding: 0
+                    Material.elevation: 2
+
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: 1
+                        color: "black"
+                        clip: true
+
+                        Rectangle {
+                            x: 57
+                            y: 10
+                            width: 1
+                            height: Math.max(1, parent.height - 47)
+                            color: "white"
+                        }
+                        Rectangle {
+                            x: 57
+                            y: Math.max(10, parent.height - 37)
+                            width: Math.max(1, parent.width - 79)
+                            height: 1
+                            color: "white"
+                        }
+                        // The 100Hz curve is rendered on the scene graph thread
+                        // and its geometry is updated at about 10Hz.
+                        AxialThicknessPlotItem {
+                            id: axialThicknessPlot
+                            anchors.fill: parent
+                            anchors.leftMargin: 58
+                            anchors.rightMargin: 22
+                            anchors.topMargin: 11
+                            anchors.bottomMargin: 38
+                            source: dataController
+                        }
+                        // The final per-pipe mean is an overlay, never a real
+                        // measurement or an input to the ultrasound algorithm.
+                        Item {
+                            id: axialMeanGuide
+                            visible: dataController && dataController.pipeProfileFinalized &&
+                                     dataController.pipeSummaryValid &&
+                                     axialThicknessPlot.yMax > axialThicknessPlot.yMin
+                            x: 58
+                            width: Math.max(0, parent.width - 80)
+                            height: 1
+                            y: axialThicknessPlot.y + axialThicknessPlot.height *
+                               (axialThicknessPlot.yMax - (dataController ? dataController.pipeAverageThicknessMm : 0)) /
+                               Math.max(0.001, axialThicknessPlot.yMax - axialThicknessPlot.yMin)
+                            Repeater {
+                                model: axialMeanGuide.visible ? Math.ceil(axialMeanGuide.width / 12) : 0
+                                Rectangle {
+                                    x: index * 12
+                                    width: 7
+                                    height: 1
+                                    color: "#FFEB3B"
+                                }
+                            }
+                        }
+                        Label {
+                            visible: axialMeanGuide.visible
+                            x: 0
+                            width: 55
+                            horizontalAlignment: Text.AlignRight
+                            y: axialMeanGuide.y - 9
+                            text: "均" + (dataController ? dataController.pipeAverageThicknessMm.toFixed(2) : "--")
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: "#FFEB3B"
+                        }
+                        Label {
+                            x: 0
+                            y: 8
+                            text: axialThicknessPlot.yMax.toFixed(3) + " mm"
+                            font.pixelSize: 11
+                            color: "white"
+                        }
+                        Label {
+                            x: 0
+                            y: Math.max(8, parent.height - 52)
+                            text: axialThicknessPlot.yMin.toFixed(3) + " mm"
+                            font.pixelSize: 11
+                            color: "white"
+                        }
+                        Label {
+                            x: 54
+                            y: parent.height - 29
+                            text: axialThicknessPlot.xMin.toFixed(1)
+                            font.pixelSize: 11
+                            color: "white"
+                        }
+                        Label {
+                            x: parent.width - 65
+                            y: parent.height - 29
+                            text: axialThicknessPlot.xMax.toFixed(1)
+                            font.pixelSize: 11
+                            color: "white"
+                        }
+                        Label {
+                            anchors.bottom: parent.bottom
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: "轴向位置 / mm"
+                            font.pixelSize: 12
+                            color: "white"
+                        }
+                        Label {
+                            visible: axialThicknessPlot.pointCount === 0
+                            anchors.centerIn: parent
+                            text: "暂无轴向壁厚数据"
+                            font.pixelSize: 14
+                            color: "#9E9E9E"
+                        }
+                    }
+                }
+
                 // Bottom action bar
                 Pane {
                     Layout.fillWidth: true
@@ -791,8 +967,6 @@ ScrollView {
                             enabled: dataController != null
                             onClicked: {
                                 if (dataController) dataController.resetDetectionRate()
-                                if (thicknessPlot) thicknessPlot.clear()
-                                if (graphItem) graphItem.clear()
                             }
                         }
 
@@ -899,14 +1073,6 @@ ScrollView {
             ColumnLayout {
                 width: Math.max(0, thicknessAlgorithmDialog.width - 48)
                 spacing: 10
-
-                Label {
-                    Layout.fillWidth: true
-                    text: "仅可在停止采集时修改；修改后下一批采集将清空旧参数建立的峰位、模板和噪声底。"
-                    wrapMode: Text.WordWrap
-                    color: "#F57C00"
-                    font.pixelSize: 12
-                }
 
                 GroupBox {
                     title: "防误检、SNR与预测门控"
