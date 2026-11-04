@@ -8,6 +8,7 @@ import "../components" as Comp
 
 ScrollView {
     id: root
+    Material.theme: Material.Light
     contentWidth: availableWidth
     clip: true
 

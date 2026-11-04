@@ -323,6 +323,8 @@ qt_add_qml_module(appLST
         qml/components/ParamEditor.qml
         qml/components/SwitchControl.qml
         qml/components/CommandButton.qml
+        qml/components/EngineeringPlotFrame.qml
+        qml/components/EngineeringTrendPlot.qml
         qml/components/CardPanel.qml
         qml/components/NavigationRail.qml
         qml/components/ConnectionBar.qml

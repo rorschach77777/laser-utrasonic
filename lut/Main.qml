@@ -12,12 +12,15 @@ ApplicationWindow {
     visible: true
     title: "LUT 上位机 V1.11"
 
-    Material.theme: Material.Light
+    readonly property bool engineeringPageActive: stackLayout.currentIndex === 4
+    readonly property var engineeringIcons: ["○", "▤", "▣", "◈", "▥", "▦", "⌁", "⚙", "›"]
+
+    Material.theme: engineeringPageActive ? Material.Dark : Material.Light
     Material.primary: "#3F51B5"
     Material.accent: "#009688"
 
     header: ToolBar {
-        Material.background: "#3F51B5"
+        Material.background: window.engineeringPageActive ? "#1b1f25" : "#3F51B5"
         Material.foreground: "white"
 
         RowLayout {
@@ -56,10 +59,10 @@ ApplicationWindow {
         // Navigation Rail
         Pane {
             Layout.fillHeight: true
-            Layout.preferredWidth: 80
+            Layout.preferredWidth: window.engineeringPageActive ? 148 : 80
             padding: 0
             Material.elevation: 4
-            Material.background: "#FAFAFA"
+            Material.background: window.engineeringPageActive ? "#1b1f25" : "#FAFAFA"
 
             ColumnLayout {
                 anchors.fill: parent
@@ -84,22 +87,38 @@ ApplicationWindow {
                         highlighted: stackLayout.currentIndex === index
                         enabled: index === 0 || index === 4 || index === 5 || index === 6 || deviceComm.connected
 
-                        contentItem: ColumnLayout {
-                            spacing: 2
+                        background: Rectangle {
+                            color: window.engineeringPageActive
+                                   ? (parent.highlighted ? "#34302a" : "#1b1f25")
+                                   : (parent.highlighted ? "#E8EAF6" : "#FAFAFA")
+                            Rectangle {
+                                visible: window.engineeringPageActive && parent.parent.highlighted
+                                width: 3; height: parent.height
+                                color: "#ee9b45"
+                            }
+                        }
+                        contentItem: GridLayout {
+                            columns: window.engineeringPageActive ? 2 : 1
+                            columnSpacing: 10
+                            rowSpacing: 2
 
                             Label {
-                                text: model.icon
-                                font.pixelSize: 20
+                                text: window.engineeringPageActive ? window.engineeringIcons[index] : model.icon
+                                color: window.engineeringPageActive && parent.parent.highlighted ? "#ee9b45" : (window.engineeringPageActive ? "#a6b0ba" : "#212121")
+                                font.pixelSize: window.engineeringPageActive ? 18 : 20
                                 horizontalAlignment: Text.AlignHCenter
-                                Layout.fillWidth: true
+                                Layout.fillWidth: !window.engineeringPageActive
                             }
 
                             Label {
                                 text: model.label
-                                font.pixelSize: 10
-                                horizontalAlignment: Text.AlignHCenter
+                                Layout.leftMargin: window.engineeringPageActive ? 4 : 0
+                                font.pixelSize: window.engineeringPageActive ? 12 : 10
+                                horizontalAlignment: window.engineeringPageActive ? Text.AlignLeft : Text.AlignHCenter
                                 Layout.fillWidth: true
-                                color: parent.parent.highlighted ? "#3F51B5" : (parent.parent.enabled ? "#212121" : "#BDBDBD")
+                                color: window.engineeringPageActive
+                                       ? (parent.parent.highlighted ? "#ee9b45" : (parent.parent.enabled ? "#c0c8d0" : "#646e78"))
+                                       : (parent.parent.highlighted ? "#3F51B5" : (parent.parent.enabled ? "#212121" : "#BDBDBD"))
                             }
                         }
 
