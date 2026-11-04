@@ -336,6 +336,7 @@ qt_add_qml_module(appLST
         qml/pages/SystemSettingsPage.qml
         qml/pages/CommandPage.qml
         qml/pages/DataPage.qml
+        qml/pages/ExperimentDataPage.qml
         qml/pages/HistoryPage.qml
         qml/pages/ProcessAnalysisPage.qml
         SOURCES
